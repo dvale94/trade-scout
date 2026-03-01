@@ -1,36 +1,34 @@
 from datetime import datetime, timezone
 import pandas as pd
-from uuid import uuid4
-
-from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 from . import config
-from .strategy_profiles import PROFILES
+from . import strategy_profiles
 from . import market
-from .seed import seed_history
-from .strategy import Candidate, score_candidate, pick_tier, compute_entry_stop_targets
-from .notifier import discord_notify
+from . import seed
+from . import strategy
+from . import notifier
 from . import journal
-from .watch import Watch, WatchManager
+from . import watch
 
 
 class Cooldown:
     def __init__(self, minutes: int):
         from datetime import timedelta
         self.cooldown = timedelta(minutes=minutes)
-        self.last_alert: dict[str, datetime] = {}
+        self.last_alert: dict[tuple[str, str], datetime] = {}
 
-    def allowed(self, symbol: str, now: datetime) -> bool:
-        last = self.last_alert.get(symbol)
+    def allowed(self, symbol: str, tier: str, now: datetime) -> bool:
+        key = (symbol, tier)
+        last = self.last_alert.get(key)
         if not last:
             return True
         return (now - last) >= self.cooldown
 
-    def mark(self, symbol: str, now: datetime):
-        self.last_alert[symbol] = now
+    def mark(self, symbol: str, tier: str, now: datetime):
+        self.last_alert[(symbol, tier)] = now
 
 
-def format_alert(candidate: Candidate, tier: str) -> str:
+def format_alert(candidate: strategy.Candidate, tier: str) -> str:
     reasons = "\n".join([f"• {r}" for r in candidate.reasons][:6])
     news_line = ""
     if candidate.news_sentiment is not None:
@@ -52,7 +50,7 @@ def format_alert(candidate: Candidate, tier: str) -> str:
 
 
 def run():
-    profile = PROFILES.get(config.STRATEGY_PROFILE)
+    profile = strategy_profiles.PROFILES.get(config.STRATEGY_PROFILE)
     if profile is None:
         raise ValueError(f"Unknown STRATEGY_PROFILE: {config.STRATEGY_PROFILE}")
     
@@ -62,7 +60,7 @@ def run():
     print(f"MARKET_TYPE={config.MARKET_TYPE} PROFILE={profile.name} timeframe={profile.timeframe_min}m symbols={symbols_to_run}")
 
     print("Seeding history...")
-    data = seed_history(
+    data = seed.seed_history(
         symbols_to_run,
         timeframe_min=profile.timeframe_min,
         seed_minutes=profile.seed_minutes,
@@ -73,7 +71,7 @@ def run():
     anchor_state = {"symbol": anchor, "regime": None, "close": None, "ma50": None, "ma200": None}
 
     cooldown = Cooldown(profile.cooldown_min)
-    watch_mgr = WatchManager(timeout_minutes=profile.watch_timeout_min, max_active_per_symbol=1)
+    watch_mgr = watch.WatchManager(timeout_minutes=profile.watch_timeout_min, max_active_per_symbol=1)
 
     stream = market.make_stream()
 
@@ -110,7 +108,7 @@ def run():
         if len(df) < min_needed:
             return
 
-        score, reasons, computed = score_candidate(df, profile)
+        score, reasons, computed = strategy.score_candidate(df, profile)
 
         # If this symbol is an anchor, update anchor_state
         if symbol == anchor:
@@ -122,16 +120,16 @@ def run():
             if symbol not in config.SYMBOLS:
                 return
 
-        tier = pick_tier(score, df, profile, computed)
+        tier = strategy.pick_tier(score, df, profile, computed)
         if tier is None:
             return
 
         now = datetime.now(timezone.utc)
-        if not cooldown.allowed(symbol, now):
+        if not cooldown.allowed(symbol, tier, now):
             return
 
         try:
-            candidate = compute_entry_stop_targets(symbol, profile, computed, reasons, score)
+            candidate = strategy.compute_entry_stop_targets(symbol, profile, computed, reasons, score)
             if candidate is None:
                 return
  
@@ -140,10 +138,10 @@ def run():
                 return
 
             msg = format_alert(candidate, tier)
-            discord_notify(msg)
+            notifier.discord_notify(msg)
             journal.log_alert(candidate, computed, anchor_state, tier, config.STRATEGY_PROFILE)
 
-            watch_mgr.add(Watch(
+            watch_mgr.add(watch.Watch(
                 alert_id=candidate.alert_id,
                 symbol=symbol,
                 timeframe_min=profile.timeframe_min,
@@ -160,7 +158,7 @@ def run():
                 max_adverse=float(candidate.entry_high),
             ))
 
-            cooldown.mark(symbol, now)
+            cooldown.mark(symbol, tier, now)
             print(f"ALERT {symbol} tier={tier} score={score:.2f}")
 
         except Exception as e:
