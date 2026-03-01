@@ -29,8 +29,7 @@ ENV/
 # Logs & Runtime Files
 # ==========================
 *.log
-alerts.csv
-outcomes.csv
+logs/
 
 # ==========================
 # IDE / Editor
