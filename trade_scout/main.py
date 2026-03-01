@@ -95,6 +95,8 @@ def run():
 
     cooldown = Cooldown(profile.cooldown_min)
     watch_mgr = watch.WatchManager(timeout_minutes=profile.watch_timeout_min, max_active_per_symbol=1)
+    watch_mgr.load_state()
+    print(f"Restored active watches: {sum(len(v) for v in watch_mgr.active.values())}")
 
     # --- Telemetry (hourly) ---
     telemetry = TelemetryTracker(config.STRATEGY_PROFILE, profile.timeframe_min)

@@ -1,5 +1,6 @@
 import csv
 import os
+import json
 from datetime import timezone
 from typing import Any
 
@@ -23,6 +24,10 @@ def outcomes_path() -> str:
 
 def telemetry_path() -> str:
     return _path(f"{config.MARKET_TYPE}_telemetry.csv")
+
+
+def watches_state_path() -> str:
+    return _path(f"{config.MARKET_TYPE}_active_watches.json")
 
 
 def _write_row(path: str, row: dict[str, Any]):
@@ -95,3 +100,16 @@ def log_telemetry(row: dict[str, Any]):
     Keep this low-frequency to avoid noisy logs.
     """
     _write_row(telemetry_path(), row)
+
+
+def save_active_watches(payload: dict):
+    with open(watches_state_path(), "w") as f:
+        json.dump(payload, f, indent=2, default=str)
+
+
+def load_active_watches() -> dict | None:
+    path = watches_state_path()
+    if not os.path.exists(path):
+        return None
+    with open(path, "r") as f:
+        return json.load(f)    
