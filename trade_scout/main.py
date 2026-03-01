@@ -153,6 +153,7 @@ def run():
  
             # sanity: avoid ultra-tight stops
             if candidate.r / candidate.entry_high < 0.004:
+                telemetry.record_skipped_tight_stop()
                 return
 
             computed_for_log = anchor.inject_into_computed(computed)

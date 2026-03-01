@@ -22,6 +22,7 @@ class TelemetryTracker:
     indicator_missing: int = 0
     below_score: int = 0
     alerts_sent: int = 0
+    skipped_tight_stop: int = 0
 
     # score stats
     scores_n: int = 0
@@ -39,20 +40,25 @@ class TelemetryTracker:
     def __post_init__(self):
         self.next_flush = self.window_start + self.flush_every
 
+
     # ---- record helpers ----
     def record_bar(self, is_anchor: bool = False) -> None:
         self.bars_seen += 1
         if is_anchor:
             self.anchor_bars_seen += 1
 
+
     def record_insufficient_history(self) -> None:
         self.insufficient_history += 1
+
 
     def record_indicator_missing(self) -> None:
         self.indicator_missing += 1
 
+
     def record_below_score(self) -> None:
         self.below_score += 1
+
 
     def record_score(self, score: float) -> None:
         self.scores_n += 1
@@ -60,15 +66,23 @@ class TelemetryTracker:
         self.score_min = float(score) if self.score_min is None else min(self.score_min, float(score))
         self.score_max = float(score) if self.score_max is None else max(self.score_max, float(score))
 
+
     def record_tier_selected(self, tier: str) -> None:
         self.tier_selected[tier] += 1
+
 
     def record_cooldown_blocked(self, tier: str) -> None:
         self.cooldown_blocked[tier] += 1
 
+
     def record_alert_sent(self, tier: str) -> None:
         self.alerts_sent += 1
         self.alerts_by_tier[tier] += 1
+
+
+    def record_skipped_tight_stop(self) -> None:
+        self.skipped_tight_stop += 1
+
 
     # ---- flush ----
     def maybe_flush(self, now_utc: datetime) -> None:
@@ -89,6 +103,7 @@ class TelemetryTracker:
             "indicator_missing": self.indicator_missing,
             "below_score": self.below_score,
             "alerts_sent": self.alerts_sent,
+            "skipped_tight_stop": self.skipped_tight_stop,
 
             "scores_n": self.scores_n,
             "score_min": self.score_min,
@@ -111,6 +126,7 @@ class TelemetryTracker:
 
         self._reset_window()
 
+
     def _reset_window(self) -> None:
         # advance window
         self.window_start = self.next_flush
@@ -123,6 +139,7 @@ class TelemetryTracker:
         self.indicator_missing = 0
         self.below_score = 0
         self.alerts_sent = 0
+        self.skipped_tight_stop = 0
 
         self.scores_n = 0
         self.scores_sum = 0.0
