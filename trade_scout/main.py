@@ -1,5 +1,7 @@
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from collections import defaultdict
 import pandas as pd
+import json
 
 from . import config
 from . import strategy_profiles
@@ -73,9 +75,31 @@ def run():
     cooldown = Cooldown(profile.cooldown_min)
     watch_mgr = watch.WatchManager(timeout_minutes=profile.watch_timeout_min, max_active_per_symbol=1)
 
+    # --- Telemetry (hourly) ---
+    telemetry = {
+        "bars_seen": 0,
+        "anchor_bars_seen": 0,
+        "insufficient_history": 0,
+        "indicator_missing": 0,
+        "below_score": 0,
+        "alerts_sent": 0,
+        "scores_n": 0,
+        "scores_sum": 0.0,
+        "score_min": None,
+        "score_max": None,
+    }
+
+    tier_selected = defaultdict(int)       # tier -> count
+    cooldown_blocked = defaultdict(int)    # tier -> count
+    alerts_by_tier = defaultdict(int)      # tier -> count
+
+    telemetry_window_start = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    next_flush = telemetry_window_start + timedelta(hours=1)
+
     stream = market.make_stream()
 
     async def on_bar(bar):
+        telemetry["bars_seen"] += 1
         symbol = bar.symbol
         ts = pd.to_datetime(bar.timestamp, utc=True).to_pydatetime()
 
@@ -106,12 +130,24 @@ def run():
             profile.breakout_lookback + profile.persist_bars + 5,
         )
         if len(df) < min_needed:
+            telemetry["insufficient_history"] += 1
             return
 
         score, reasons, computed = strategy.score_candidate(df, profile)
 
+        telemetry["scores_n"] += 1
+        telemetry["scores_sum"] += float(score)
+        telemetry["score_min"] = float(score) if telemetry["score_min"] is None else min(telemetry["score_min"], float(score))
+        telemetry["score_max"] = float(score) if telemetry["score_max"] is None else max(telemetry["score_max"], float(score))
+
+        # If you rely on some indicators and they're not ready yet
+        if computed.get("ma200") is None or computed.get("atr") is None:
+            telemetry["indicator_missing"] += 1
+            return
+
         # If this symbol is an anchor, update anchor_state
         if symbol == anchor:
+            telemetry["anchor_bars_seen"] += 1
             anchor_state["close"] = computed.get("close")
             anchor_state["ma50"] = computed.get("ma50")
             anchor_state["ma200"] = computed.get("ma200")
@@ -122,10 +158,13 @@ def run():
 
         tier = strategy.pick_tier(score, df, profile, computed)
         if tier is None:
+            telemetry["below_score"] += 1
             return
+        tier_selected[tier] += 1
 
         now = datetime.now(timezone.utc)
         if not cooldown.allowed(symbol, tier, now):
+            cooldown_blocked[tier] += 1
             return
 
         try:
@@ -140,6 +179,9 @@ def run():
             msg = format_alert(candidate, tier)
             notifier.discord_notify(msg)
             journal.log_alert(candidate, computed, anchor_state, tier, config.STRATEGY_PROFILE)
+
+            telemetry["alerts_sent"] += 1
+            alerts_by_tier[tier] += 1
 
             watch_mgr.add(watch.Watch(
                 alert_id=candidate.alert_id,
@@ -163,6 +205,65 @@ def run():
 
         except Exception as e:
             print(f"ALERT ERROR for {symbol}: {e}")
+
+        now_utc = datetime.now(timezone.utc)
+        if now_utc >= next_flush:
+            avg_score = (telemetry["scores_sum"] / telemetry["scores_n"]) if telemetry["scores_n"] > 0 else None
+
+            row = {
+                "timestamp_utc": next_flush.astimezone(timezone.utc).isoformat(),
+                "market_type": config.MARKET_TYPE,
+                "strategy_profile": config.STRATEGY_PROFILE,
+                "timeframe_min": profile.timeframe_min,
+
+                "bars_seen": telemetry["bars_seen"],
+                "anchor_bars_seen": telemetry["anchor_bars_seen"],
+                "insufficient_history": telemetry["insufficient_history"],
+                "indicator_missing": telemetry["indicator_missing"],
+                "below_score": telemetry["below_score"],
+                "alerts_sent": telemetry["alerts_sent"],
+
+                "scores_n": telemetry["scores_n"],
+                "score_min": telemetry["score_min"],
+                "score_avg": avg_score,
+                "score_max": telemetry["score_max"],
+
+                # store dicts as JSON strings to keep CSV clean + schema-stable
+                "tier_selected": json.dumps(dict(tier_selected), separators=(",", ":")),
+                "cooldown_blocked": json.dumps(dict(cooldown_blocked), separators=(",", ":")),
+                "alerts_by_tier": json.dumps(dict(alerts_by_tier), separators=(",", ":")),
+            }
+
+            journal.log_telemetry(row)
+
+            # Optional: one-line console print (once per hour, not spammy)
+            print(
+                f"[TELEMETRY] bars={row['bars_seen']} alerts={row['alerts_sent']} "
+                f"below_score={row['below_score']} ind_missing={row['indicator_missing']} "
+                f"tiers={row['tier_selected']} cooldown={row['cooldown_blocked']}"
+            )
+
+            # reset hourly window
+            telemetry.clear()
+            telemetry.update({
+                "bars_seen": 0,
+                "anchor_bars_seen": 0,
+                "insufficient_history": 0,
+                "indicator_missing": 0,
+                "below_score": 0,
+                "alerts_sent": 0,
+                "scores_n": 0,
+                "scores_sum": 0.0,
+                "score_min": None,
+                "score_max": None,
+            })
+            tier_selected.clear()
+            cooldown_blocked.clear()
+            alerts_by_tier.clear()
+
+            # advance window
+            telemetry_window_start = next_flush
+            next_flush = telemetry_window_start + timedelta(hours=1)
 
     # Subscribe bars
     for sym in symbols_to_run:

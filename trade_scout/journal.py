@@ -12,11 +12,17 @@ def _path(name: str) -> str:
     os.makedirs(LOG_DIR, exist_ok=True)
     return os.path.join(LOG_DIR, name)
 
+
 def alerts_path() -> str:
     return _path(f"{config.MARKET_TYPE}_alerts.csv")
 
+
 def outcomes_path() -> str:
     return _path(f"{config.MARKET_TYPE}_outcomes.csv")
+
+
+def telemetry_path() -> str:
+    return _path(f"{config.MARKET_TYPE}_telemetry.csv")
 
 
 def _write_row(path: str, row: dict[str, Any]):
@@ -81,3 +87,11 @@ def log_outcome(outcome_row: dict[str, Any]):
     outcome_row should already contain all fields needed for outcomes.csv
     """
     _write_row(outcomes_path(), outcome_row)
+
+
+def log_telemetry(row: dict[str, Any]):
+    """
+    Writes a single aggregated telemetry snapshot (e.g., once per hour).
+    Keep this low-frequency to avoid noisy logs.
+    """
+    _write_row(telemetry_path(), row)
