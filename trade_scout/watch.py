@@ -63,6 +63,7 @@ class WatchManager:
         self.max_active_per_symbol = max_active_per_symbol
         self.active: dict[str, list[Watch]] = {}
 
+
     def add(self, w: Watch):
         arr = self.active.setdefault(w.symbol, [])
         # limit active watches per symbol
@@ -70,32 +71,35 @@ class WatchManager:
             return
         arr.append(w)
 
-    def update(self, symbol: str, price: float, ts: datetime):
+
+    def update(self, symbol: str, high: float, low: float, ts: datetime):
         if symbol not in self.active:
             return
 
         keep: list[Watch] = []
+
         for w in self.active[symbol]:
             if w.done:
                 continue
 
-            # update excursions
-            w.max_favorable = max(w.max_favorable, price)
-            w.max_adverse = min(w.max_adverse, price)
+            # Track excursions
+            w.max_favorable = max(w.max_favorable, high)
+            w.max_adverse = min(w.max_adverse, low)
 
-            # check stop
-            if price <= w.stop:
+            # Stop hit
+            if low <= w.stop:
                 w.done = True
                 w.done_reason = "STOP"
                 w.done_ts = ts
                 journal.log_outcome(w.as_outcome_row())
                 continue
 
-            # check targets
-            if (not w.hit_t1) and price >= w.t1:
+            # Target 1
+            if not w.hit_t1 and high >= w.t1:
                 w.hit_t1 = True
 
-            if (not w.hit_t2) and price >= w.t2:
+            # Target 2
+            if not w.hit_t2 and high >= w.t2:
                 w.hit_t2 = True
                 w.done = True
                 w.done_reason = "T2"
@@ -103,7 +107,7 @@ class WatchManager:
                 journal.log_outcome(w.as_outcome_row())
                 continue
 
-            # timeout
+            # Timeout
             if ts - w.created_ts >= self.timeout:
                 w.done = True
                 w.done_reason = "TIMEOUT"

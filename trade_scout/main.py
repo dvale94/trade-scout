@@ -80,7 +80,7 @@ def run():
         ts = pd.to_datetime(bar.timestamp, utc=True).to_pydatetime()
 
         # Update existing watches every bar
-        watch_mgr.update(symbol, float(bar.close), ts)
+        watch_mgr.update(symbol, float(bar.high), float(bar.low), ts)
 
         df = data.get(symbol)
         if df is None:
