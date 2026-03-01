@@ -6,7 +6,7 @@ from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 from . import config
 from .strategy_profiles import PROFILES
-from .market import make_stream
+from . import market
 from .seed import seed_history
 from .strategy import Candidate, score_candidate, pick_tier, compute_entry_stop_targets
 from .notifier import discord_notify
@@ -55,17 +55,27 @@ def run():
     profile = PROFILES.get(config.STRATEGY_PROFILE)
     if profile is None:
         raise ValueError(f"Unknown STRATEGY_PROFILE: {config.STRATEGY_PROFILE}")
+    
+    anchor = market.anchor_symbol()
+    symbols_to_run = list(dict.fromkeys(config.SYMBOLS + [anchor]))  # de-dupe, preserve order
 
-    print(f"MARKET_TYPE={config.MARKET_TYPE} PROFILE={profile.name} timeframe={profile.timeframe_min}m symbols={config.SYMBOLS}")
+    print(f"MARKET_TYPE={config.MARKET_TYPE} PROFILE={profile.name} timeframe={profile.timeframe_min}m symbols={symbols_to_run}")
 
     print("Seeding history...")
-    data = seed_history(config.SYMBOLS, timeframe_min=profile.timeframe_min, seed_minutes=profile.seed_minutes, lookback_bars=profile.lookback_bars)
+    data = seed_history(
+        symbols_to_run,
+        timeframe_min=profile.timeframe_min,
+        seed_minutes=profile.seed_minutes,
+        lookback_bars=profile.lookback_bars,
+    )
     print("Seed complete:", {k: len(v) for k, v in data.items()})
+
+    anchor_state = {"symbol": anchor, "regime": None, "close": None, "ma50": None, "ma200": None}
 
     cooldown = Cooldown(profile.cooldown_min)
     watch_mgr = WatchManager(timeout_minutes=profile.watch_timeout_min, max_active_per_symbol=1)
 
-    stream = make_stream()
+    stream = market.make_stream()
 
     async def on_bar(bar):
         symbol = bar.symbol
@@ -102,6 +112,16 @@ def run():
 
         score, reasons, computed = score_candidate(df, profile)
 
+        # If this symbol is an anchor, update anchor_state
+        if symbol == anchor:
+            anchor_state["close"] = computed.get("close")
+            anchor_state["ma50"] = computed.get("ma50")
+            anchor_state["ma200"] = computed.get("ma200")
+            anchor_state["regime"] = market.classify_anchor_regime(computed)
+            # skip alerting if anchor is not in configured symbols
+            if symbol not in config.SYMBOLS:
+                return
+
         tier = pick_tier(score, df, profile, computed)
         if tier is None:
             return
@@ -121,7 +141,7 @@ def run():
 
             msg = format_alert(candidate, tier)
             discord_notify(msg)
-            journal.log_alert(candidate, computed, tier, config.STRATEGY_PROFILE)
+            journal.log_alert(candidate, computed, anchor_state, tier, config.STRATEGY_PROFILE)
 
             watch_mgr.add(Watch(
                 alert_id=candidate.alert_id,
@@ -147,8 +167,7 @@ def run():
             print(f"ALERT ERROR for {symbol}: {e}")
 
     # Subscribe bars
-    tf = TimeFrame(profile.timeframe_min, TimeFrameUnit.Minute)
-    for sym in config.SYMBOLS:
+    for sym in symbols_to_run:
         stream.subscribe_bars(on_bar, sym)
 
     print("Trade Scout running...")

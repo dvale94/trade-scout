@@ -28,7 +28,7 @@ def _write_row(path: str, row: dict[str, Any]):
         writer.writerow(row)
 
 
-def log_alert(candidate: Candidate, computed: dict, tier: str, strategy_profile: str):
+def log_alert(candidate: Candidate, computed: dict, anchor: dict, tier: str, strategy_profile: str):
     """
     Logs a single alert event with full context.
     candidate: your Candidate dataclass instance
@@ -58,6 +58,11 @@ def log_alert(candidate: Candidate, computed: dict, tier: str, strategy_profile:
         "ma50": computed.get("ma50"),
         "ma200": computed.get("ma200"),
         "breakout_level": computed.get("breakout_level"),
+        "anchor_symbol": anchor.get("symbol"),
+        "anchor_regime": anchor.get("regime"),
+        "anchor_close": anchor.get("close"),
+        "anchor_ma50": anchor.get("ma50"),
+        "anchor_ma200": anchor.get("ma200"),
         "vol_z": computed.get("vol_z"),
         "extended_atr": computed.get("extended_atr"),
 
