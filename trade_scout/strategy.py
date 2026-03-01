@@ -3,12 +3,15 @@ from datetime import datetime, timezone
 import math
 import numpy as np
 import pandas as pd
+from uuid import uuid4
 
 from trade_scout.strategy_profiles import StrategyProfile
 
 @dataclass
 class Candidate:
+    alert_id: str
     symbol: str
+    timeframe_min: int
     score: float
     ts: datetime
     entry_low: float
@@ -193,7 +196,9 @@ def compute_entry_stop_targets(symbol: str, profile: StrategyProfile, computed: 
     news_sent, news_summary = get_news_sentiment_stub(symbol)
 
     return Candidate(
+        alert_id=str(uuid4()),
         symbol=symbol,
+        timeframe_min=profile.timeframe_min,
         score=score,
         ts=now,
         entry_low=float(entry_low),

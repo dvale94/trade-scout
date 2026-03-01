@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 import pandas as pd
+from uuid import uuid4
 
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
@@ -113,7 +114,7 @@ def run():
             candidate = compute_entry_stop_targets(symbol, profile, computed, reasons, score)
             if candidate is None:
                 return
-
+ 
             # sanity: avoid ultra-tight stops
             if candidate.r / candidate.entry_high < 0.004:
                 return
@@ -123,7 +124,9 @@ def run():
             journal.log_alert(candidate, computed, tier, config.STRATEGY_PROFILE)
 
             watch_mgr.add(Watch(
+                alert_id=candidate.alert_id,
                 symbol=symbol,
+                timeframe_min=profile.timeframe_min,
                 tier=tier,
                 created_ts=now,
                 entry_low=candidate.entry_low,

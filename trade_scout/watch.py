@@ -7,7 +7,9 @@ from . import journal
 
 @dataclass
 class Watch:
+    alert_id: str
     symbol: str
+    timeframe_min: int
     tier: str
     created_ts: datetime
 
@@ -31,7 +33,9 @@ class Watch:
 
     def as_outcome_row(self) -> dict[str, Any]:
         return {
+            "alert_id": self.alert_id,
             "symbol": self.symbol,
+            "timeframe_min": self.timeframe_min,
             "tier": self.tier,
             "alert_ts_utc": self.created_ts.astimezone(timezone.utc).isoformat(),
             "done_ts_utc": (self.done_ts.astimezone(timezone.utc).isoformat() if self.done_ts else None),

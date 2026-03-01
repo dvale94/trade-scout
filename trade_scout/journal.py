@@ -36,8 +36,10 @@ def log_alert(candidate: Candidate, computed: dict, tier: str, strategy_profile:
     tier: "A_PLUS_RETEST" or "A_CONTINUATION"
     """
     row = {
+        "alert_id": candidate.alert_id,
         "market_type": config.MARKET_TYPE,
         "strategy_profile": strategy_profile,
+        "timeframe_min": candidate.timeframe_min,
         "timestamp_utc": candidate.ts.astimezone(timezone.utc).isoformat(),
         "symbol": candidate.symbol,
         "tier": tier,
