@@ -3,8 +3,20 @@ import os
 from datetime import timezone
 from typing import Any
 
-ALERTS_CSV = os.getenv("ALERTS_CSV", "alerts.csv")
-OUTCOMES_CSV = os.getenv("OUTCOMES_CSV", "outcomes.csv")
+from . import config
+from .strategy import Candidate
+
+LOG_DIR = config.LOG_DIR
+
+def _path(name: str) -> str:
+    os.makedirs(LOG_DIR, exist_ok=True)
+    return os.path.join(LOG_DIR, name)
+
+def alerts_path() -> str:
+    return _path(f"{config.MARKET_TYPE}_alerts.csv")
+
+def outcomes_path() -> str:
+    return _path(f"{config.MARKET_TYPE}_outcomes.csv")
 
 
 def _write_row(path: str, row: dict[str, Any]):
@@ -16,7 +28,7 @@ def _write_row(path: str, row: dict[str, Any]):
         writer.writerow(row)
 
 
-def log_alert(candidate, computed: dict, tier: str):
+def log_alert(candidate: Candidate, computed: dict, tier: str, strategy_profile: str):
     """
     Logs a single alert event with full context.
     candidate: your Candidate dataclass instance
@@ -24,6 +36,8 @@ def log_alert(candidate, computed: dict, tier: str):
     tier: "A_PLUS_RETEST" or "A_CONTINUATION"
     """
     row = {
+        "market_type": config.MARKET_TYPE,
+        "strategy_profile": strategy_profile,
         "timestamp_utc": candidate.ts.astimezone(timezone.utc).isoformat(),
         "symbol": candidate.symbol,
         "tier": tier,
@@ -52,11 +66,11 @@ def log_alert(candidate, computed: dict, tier: str):
         # human-readable reasons
         "reasons": " | ".join(candidate.reasons),
     }
-    _write_row(ALERTS_CSV, row)
+    _write_row(alerts_path(), row)
 
 
 def log_outcome(outcome_row: dict[str, Any]):
     """
     outcome_row should already contain all fields needed for outcomes.csv
     """
-    _write_row(OUTCOMES_CSV, outcome_row)
+    _write_row(outcomes_path(), outcome_row)

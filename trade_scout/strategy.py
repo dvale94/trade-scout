@@ -3,7 +3,8 @@ from datetime import datetime, timezone
 import math
 import numpy as np
 import pandas as pd
-from . import config
+
+from trade_scout.strategy_profiles import StrategyProfile
 
 @dataclass
 class Candidate:
@@ -38,22 +39,22 @@ def compute_atr(df: pd.DataFrame, period: int) -> float | None:
     return float(atr) if not math.isnan(atr) else None
 
 
-def score_candidate(df: pd.DataFrame) -> tuple[float, list[str], dict]:
+def score_candidate(df: pd.DataFrame, profile: StrategyProfile) -> tuple[float, list[str], dict]:
     reasons: list[str] = []
     score = 0.0
 
     close = float(df["close"].iloc[-1])
     vol = float(df["volume"].iloc[-1])
 
-    ma20 = df["close"].rolling(config.MA_FAST).mean()
-    ma50 = df["close"].rolling(config.MA_MID).mean()
-    ma200 = df["close"].rolling(config.MA_SLOW).mean()
+    ma20 = df["close"].rolling(profile.ma_fast).mean()
+    ma50 = df["close"].rolling(profile.ma_mid).mean()
+    ma200 = df["close"].rolling(profile.ma_slow).mean()
 
     ma20_last = float(ma20.iloc[-1]) if not np.isnan(ma20.iloc[-1]) else np.nan
     ma50_last = float(ma50.iloc[-1]) if not np.isnan(ma50.iloc[-1]) else np.nan
     ma200_last = float(ma200.iloc[-1]) if not np.isnan(ma200.iloc[-1]) else np.nan
 
-    atr = compute_atr(df, config.ATR_PERIOD)
+    atr = compute_atr(df, profile.atr_period)
 
     # Trend (0–4)
     if not np.isnan(ma50_last) and close > ma50_last:
@@ -67,8 +68,8 @@ def score_candidate(df: pd.DataFrame) -> tuple[float, list[str], dict]:
         reasons.append("MA20 > MA50 (uptrend acceleration)")
 
     # Breakout + persistence (0–3.5)
-    lb = config.BREAKOUT_LOOKBACK
-    persist = config.PERSIST_BARS
+    lb = profile.breakout_lookback
+    persist = profile.persist_bars
     breakout_level = None
     breakout_ok = False
     if len(df) >= lb + persist + 2:
@@ -83,16 +84,16 @@ def score_candidate(df: pd.DataFrame) -> tuple[float, list[str], dict]:
 
     # Volume z-score (0–1.5)
     vol_z = None
-    vz_lb = config.VOL_LOOKBACK
+    vz_lb = profile.vol_lookback
     if len(df) >= vz_lb + 2:
         vols = df["volume"].iloc[-(vz_lb + 1):-1]
         mu = float(vols.mean())
         sigma = float(vols.std(ddof=0))
         if sigma > 0:
             vol_z = (vol - mu) / sigma
-            if vol_z >= config.VOLUME_Z:
+            if vol_z >= profile.volume_z:
                 score += 1.5
-                reasons.append(f"Volume z-score {vol_z:.2f} ≥ {config.VOLUME_Z:.2f}")
+                reasons.append(f"Volume z-score {vol_z:.2f} ≥ {profile.volume_z:.2f}")
             else:
                 reasons.append(f"Volume z-score {vol_z:.2f} (below threshold)")
         else:
@@ -102,20 +103,20 @@ def score_candidate(df: pd.DataFrame) -> tuple[float, list[str], dict]:
     extended_atr = None
     if atr is not None and not np.isnan(ma20_last) and atr > 0:
         extended_atr = (close - ma20_last) / atr
-        if extended_atr > config.EXTENDED_ATR_MAX:
-            penalty = min(2.0, (extended_atr - config.EXTENDED_ATR_MAX) * 1.0)
+        if extended_atr > profile.extended_atr_max:
+            penalty = min(2.0, (extended_atr - profile.extended_atr_max) * 1.0)
             score -= penalty
             reasons.append(f"Too extended: {extended_atr:.2f} ATR above MA20 (penalty -{penalty:.1f})")
 
     # ATR bonus
     if atr is not None:
         score += 0.5
-        reasons.append(f"ATR({config.ATR_PERIOD})={atr:.2f}")
+        reasons.append(f"ATR({profile.atr_period})={atr:.2f}")
 
     # Stops for risk engine
-    swing_lb = config.SWING_LOW_LOOKBACK
+    swing_lb = profile.swing_low_lookback
     structure_stop = float(df["low"].iloc[-swing_lb:].min()) if len(df) >= swing_lb else float(df["low"].min())
-    atr_stop = (close - config.ATR_K * atr) if (atr is not None) else None
+    atr_stop = (close - profile.atr_k * atr) if (atr is not None) else None
 
     computed = {
         "close": close,
@@ -133,19 +134,19 @@ def score_candidate(df: pd.DataFrame) -> tuple[float, list[str], dict]:
     return score, reasons, computed
 
 
-def is_retest_setup(df: pd.DataFrame, computed: dict) -> bool:
+def is_retest_setup(df: pd.DataFrame, profile: StrategyProfile, computed: dict) -> bool:
     breakout = computed.get("breakout_level")
     atr = computed.get("atr")
     close = computed.get("close")
     if breakout is None or atr is None or atr <= 0 or close is None:
         return False
 
-    band = config.RETEST_ATR_BAND * atr
+    band = profile.retest_atr_band * atr
     # near breakout (not far above it)
     if close > breakout + band:
         return False
 
-    hold = config.RETEST_HOLD_BARS
+    hold = profile.retest_hold_bars
     if len(df) < hold:
         return False
 
@@ -153,10 +154,10 @@ def is_retest_setup(df: pd.DataFrame, computed: dict) -> bool:
     return bool((last_closes > breakout).all())
 
 
-def pick_tier(score: float, df: pd.DataFrame, computed: dict) -> str | None:
-    if score >= config.A_PLUS_THRESHOLD and is_retest_setup(df, computed):
+def pick_tier(score: float, df: pd.DataFrame, profile: StrategyProfile, computed: dict) -> str | None:
+    if score >= profile.a_plus_threshold and is_retest_setup(df, profile, computed):
         return "A_PLUS_RETEST"
-    if score >= config.A_THRESHOLD:
+    if score >= profile.a_threshold:
         return "A_CONTINUATION"
     return None
 
@@ -165,14 +166,14 @@ def get_news_sentiment_stub(symbol: str):
     return None, None
 
 
-def compute_entry_stop_targets(symbol: str, df: pd.DataFrame, computed: dict, reasons: list[str], score: float) -> Candidate | None:
+def compute_entry_stop_targets(symbol: str, profile: StrategyProfile, computed: dict, reasons: list[str], score: float) -> Candidate | None:
     now = datetime.now(timezone.utc)
 
     close = computed["close"]
     structure_stop = computed["structure_stop"]
     atr_stop = computed["atr_stop"]
 
-    buf = close * config.ENTRY_BUFFER_PCT
+    buf = close * profile.entry_buffer_pct
     entry_low = close - buf
     entry_high = close + buf
 

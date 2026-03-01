@@ -4,9 +4,10 @@ import pandas as pd
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 from . import config
+from .strategy_profiles import PROFILES
 from .market import make_stream
 from .seed import seed_history
-from .strategy import score_candidate, pick_tier, compute_entry_stop_targets
+from .strategy import Candidate, score_candidate, pick_tier, compute_entry_stop_targets
 from .notifier import discord_notify
 from . import journal
 from .watch import Watch, WatchManager
@@ -28,7 +29,7 @@ class Cooldown:
         self.last_alert[symbol] = now
 
 
-def format_alert(candidate, tier: str) -> str:
+def format_alert(candidate: Candidate, tier: str) -> str:
     reasons = "\n".join([f"• {r}" for r in candidate.reasons][:6])
     news_line = ""
     if candidate.news_sentiment is not None:
@@ -50,15 +51,18 @@ def format_alert(candidate, tier: str) -> str:
 
 
 def run():
-    symbols = config.SYMBOLS
-    print(f"MARKET_TYPE={config.MARKET_TYPE} timeframe={config.BAR_TIMEFRAME_MIN}m symbols={symbols}")
+    profile = PROFILES.get(config.STRATEGY_PROFILE)
+    if profile is None:
+        raise ValueError(f"Unknown STRATEGY_PROFILE: {config.STRATEGY_PROFILE}")
+
+    print(f"MARKET_TYPE={config.MARKET_TYPE} PROFILE={profile.name} timeframe={profile.timeframe_min}m symbols={config.SYMBOLS}")
 
     print("Seeding history...")
-    data = seed_history(symbols)
+    data = seed_history(config.SYMBOLS, timeframe_min=profile.timeframe_min, seed_minutes=profile.seed_minutes, lookback_bars=profile.lookback_bars)
     print("Seed complete:", {k: len(v) for k, v in data.items()})
 
-    cooldown = Cooldown(config.COOLDOWN_MIN)
-    watch_mgr = WatchManager(timeout_minutes=config.WATCH_TIMEOUT_MIN, max_active_per_symbol=1)
+    cooldown = Cooldown(profile.cooldown_min)
+    watch_mgr = WatchManager(timeout_minutes=profile.watch_timeout_min, max_active_per_symbol=1)
 
     stream = make_stream()
 
@@ -82,17 +86,22 @@ def run():
             "volume": float(bar.volume),
         }
         df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-        if len(df) > config.LOOKBACK_BARS:
-            df = df.iloc[-config.LOOKBACK_BARS:].reset_index(drop=True)
+        if len(df) > profile.lookback_bars:
+            df = df.iloc[-profile.lookback_bars:].reset_index(drop=True)
         data[symbol] = df
 
         # Need minimum bars for indicators
-        if len(df) < max(config.MA_MID + 5, config.ATR_PERIOD + 5, config.BREAKOUT_LOOKBACK + config.PERSIST_BARS + 5):
+        min_needed = max(
+            profile.ma_mid + 5,
+            profile.atr_period + 5,
+            profile.breakout_lookback + profile.persist_bars + 5,
+        )
+        if len(df) < min_needed:
             return
 
-        score, reasons, computed = score_candidate(df)
+        score, reasons, computed = score_candidate(df, profile)
 
-        tier = pick_tier(score, df, computed)
+        tier = pick_tier(score, df, profile, computed)
         if tier is None:
             return
 
@@ -101,7 +110,7 @@ def run():
             return
 
         try:
-            candidate = compute_entry_stop_targets(symbol, df, computed, reasons, score)
+            candidate = compute_entry_stop_targets(symbol, profile, computed, reasons, score)
             if candidate is None:
                 return
 
@@ -111,7 +120,7 @@ def run():
 
             msg = format_alert(candidate, tier)
             discord_notify(msg)
-            journal.log_alert(candidate, computed, tier)
+            journal.log_alert(candidate, computed, tier, config.STRATEGY_PROFILE)
 
             watch_mgr.add(Watch(
                 symbol=symbol,
@@ -135,8 +144,8 @@ def run():
             print(f"ALERT ERROR for {symbol}: {e}")
 
     # Subscribe bars
-    tf = TimeFrame(config.BAR_TIMEFRAME_MIN, TimeFrameUnit.Minute)
-    for sym in symbols:
+    tf = TimeFrame(profile.timeframe_min, TimeFrameUnit.Minute)
+    for sym in config.SYMBOLS:
         stream.subscribe_bars(on_bar, sym)
 
     print("Trade Scout running...")

@@ -8,15 +8,15 @@ from alpaca.data.requests import CryptoBarsRequest, StockBarsRequest
 from . import config
 
 
-def seed_history(symbols: list[str]) -> dict[str, pd.DataFrame]:
+def seed_history(symbols: list[str], timeframe_min: int, seed_minutes: int, lookback_bars: int) -> dict[str, pd.DataFrame]:
     end = datetime.now(timezone.utc)
-    start = end - timedelta(minutes=config.SEED_MINUTES)
+    start = end - timedelta(minutes=seed_minutes)
 
     if config.MARKET_TYPE == "crypto":
         client = CryptoHistoricalDataClient(config.ALPACA_API_KEY, config.ALPACA_SECRET_KEY)
         req = CryptoBarsRequest(
             symbol_or_symbols=symbols,
-            timeframe=TimeFrame(config.BAR_TIMEFRAME_MIN, TimeFrameUnit.Minute),
+            timeframe=TimeFrame(timeframe_min, TimeFrameUnit.Minute),
             start=start,
             end=end,
         )
@@ -26,7 +26,7 @@ def seed_history(symbols: list[str]) -> dict[str, pd.DataFrame]:
         client = StockHistoricalDataClient(config.ALPACA_API_KEY, config.ALPACA_SECRET_KEY)
         req = StockBarsRequest(
             symbol_or_symbols=symbols,
-            timeframe=TimeFrame(config.BAR_TIMEFRAME_MIN, TimeFrameUnit.Minute),
+            timeframe=TimeFrame(timeframe_min, TimeFrameUnit.Minute),
             start=start,
             end=end,
         )
@@ -53,6 +53,6 @@ def seed_history(symbols: list[str]) -> dict[str, pd.DataFrame]:
         sdf = sdf[["ts", "open", "high", "low", "close", "volume"]].copy()
         sdf["ts"] = pd.to_datetime(sdf["ts"], utc=True)
 
-        out[sym_u] = sdf.tail(config.LOOKBACK_BARS).reset_index(drop=True)
+        out[sym_u] = sdf.tail(lookback_bars).reset_index(drop=True)
 
     return out
