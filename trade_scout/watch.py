@@ -111,6 +111,10 @@ class Watch:
             "t1_ts": _dt_to_iso(self.t1_ts),
             "t2_ts": _dt_to_iso(self.t2_ts),
             "stop_ts": _dt_to_iso(self.stop_ts),
+
+            "done": self.done,
+            "done_reason": self.done_reason,
+            "done_ts": _dt_to_iso(self.done_ts),
         }
 
 
@@ -148,6 +152,10 @@ class Watch:
             t1_ts=_dt_from_iso(d.get("t1_ts")),
             t2_ts=_dt_from_iso(d.get("t2_ts")),
             stop_ts=_dt_from_iso(d.get("stop_ts")),
+
+            done=bool(d.get("done", False)),
+            done_reason=d.get("done_reason"),
+            done_ts=_dt_from_iso(d.get("done_ts")),
         )
     
 
@@ -343,8 +351,12 @@ class WatchManager:
                 journal.log_execution(w._exec_row("EXIT_TIMEOUT", ts, exit_px, "bar_close_timeout"))
                 out = w.as_outcome_v2_row()
                 out["exit_px"] = exit_px
+                if w.entry_px is not None and w.R > 0:
+                    out["pnl_R"] = round((exit_px - w.entry_px) / w.R, 4)
                 journal.log_outcome_v2(out)
                 continue
+
+            keep.append(w)            
 
         self.active[symbol] = keep
         if not self.active[symbol]:
