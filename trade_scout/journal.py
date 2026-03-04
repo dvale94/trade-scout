@@ -39,7 +39,7 @@ def executions_path() -> str:
 
 
 def outcomes_v2_path() -> str:
-    return _path(f"{config.MARKET_TYPE}__outcomes_v2.csv")
+    return _path(f"{config.MARKET_TYPE}_soutcomes_v2.csv")
 
 
 def _write_row(path: str, row: dict[str, Any]):
