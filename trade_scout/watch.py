@@ -207,7 +207,7 @@ class Watch:
             elif self.done_reason == "T2":
                 pnl_R = 2.5
             elif self.done_reason == "TIMEOUT":
-                # conservative: assume flat at entry (until we add close-based timeout fills)
+                # TIMEOUT pnl_R is overridden at finalize using exit_px
                 pnl_R = 0.0
 
         return {
