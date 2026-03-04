@@ -199,7 +199,7 @@ def run():
 
         telemetry.record_bar(is_anchor=anchor.is_anchor(symbol))
         # update outcomes for active watches
-        watch_mgr.update(symbol, float(bar.high), float(bar.low), ts)
+        watch_mgr.update(symbol, float(bar.high), float(bar.low), float(bar.close), ts)
 
         df = data.get(symbol)
         if df is None:
@@ -324,6 +324,10 @@ def run():
                 score=candidate.score,
                 max_favorable=float(candidate.entry_high),
                 max_adverse=float(candidate.entry_high),
+                strategy_profile=config.STRATEGY_PROFILE,
+                strategy_version=strategy_version,
+                config_hash=config_hash,
+                side="LONG",                
             ))
 
             cooldown.mark(symbol, tier, now)

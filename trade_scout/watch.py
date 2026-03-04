@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import Any
+from uuid import uuid4
 
 from . import journal
 
@@ -37,6 +38,21 @@ class Watch:
     done: bool = False
     done_reason: str | None = None
     done_ts: datetime | None = None
+
+    # strategy metadata (so outcomes_v2 can join cleanly)
+    strategy_profile: str | None = None
+    strategy_version: str | None = None
+    config_hash: str | None = None
+    side: str = "LONG"
+
+    # execution simulation state
+    entered: bool = False
+    entry_ts: datetime | None = None
+    entry_px: float | None = None
+
+    t1_ts: datetime | None = None
+    t2_ts: datetime | None = None
+    stop_ts: datetime | None = None
 
 
     def as_outcome_row(self) -> dict[str, Any]:
@@ -82,6 +98,19 @@ class Watch:
             "max_adverse": self.max_adverse,
             "hit_t1": self.hit_t1,
             "hit_t2": self.hit_t2,
+
+            "strategy_profile": self.strategy_profile,
+            "strategy_version": self.strategy_version,
+            "config_hash": self.config_hash,
+            "side": self.side,
+
+            "entered": self.entered,
+            "entry_ts": _dt_to_iso(self.entry_ts),
+            "entry_px": self.entry_px,
+
+            "t1_ts": _dt_to_iso(self.t1_ts),
+            "t2_ts": _dt_to_iso(self.t2_ts),
+            "stop_ts": _dt_to_iso(self.stop_ts),
         }
 
 
@@ -106,7 +135,113 @@ class Watch:
             max_adverse=float(d.get("max_adverse", d["entry_high"])),
             hit_t1=bool(d.get("hit_t1", False)),
             hit_t2=bool(d.get("hit_t2", False)),
+
+            strategy_profile=d.get("strategy_profile"),
+            strategy_version=d.get("strategy_version"),
+            config_hash=d.get("config_hash"),
+            side=d.get("side", "LONG"),
+
+            entered=bool(d.get("entered", False)),
+            entry_ts=_dt_from_iso(d.get("entry_ts")),
+            entry_px=(float(d["entry_px"]) if d.get("entry_px") is not None else None),
+
+            t1_ts=_dt_from_iso(d.get("t1_ts")),
+            t2_ts=_dt_from_iso(d.get("t2_ts")),
+            stop_ts=_dt_from_iso(d.get("stop_ts")),
         )
+    
+
+    def _exec_row(self, exec_type: str, ts: datetime, px: float, px_source: str) -> dict[str, Any]:
+        latency_ms = None
+        try:
+            latency_ms = int((ts - self.created_ts).total_seconds() * 1000)
+        except Exception:
+            pass
+
+        return {
+            "exec_id": str(uuid4()),
+            "alert_id": self.alert_id,
+            "symbol": self.symbol,
+            "side": self.side,
+            "exec_type": exec_type,
+            "exec_ts_utc": ts.astimezone(timezone.utc).isoformat(),
+            "exec_px": float(px),
+            "exec_px_source": px_source,
+            "qty": None,  # placeholder for now
+            "fee_estimate": None,
+            "slippage_bps_estimate": None,
+            "latency_ms": latency_ms,
+        }
+
+
+    def as_outcome_v2_row(self) -> dict[str, Any]:
+        # Touch flags
+        t1_touched = self.t1_ts is not None
+        t2_touched = self.t2_ts is not None
+        stop_touched = self.stop_ts is not None
+
+        # Time metrics
+        def _dt_diff_s(a: datetime | None, b: datetime | None) -> int | None:
+            if not a or not b:
+                return None
+            return int((b - a).total_seconds())
+
+        entry_ts = self.entry_ts
+        exit_ts = self.done_ts
+
+        time_in_trade_s = _dt_diff_s(entry_ts, exit_ts) if self.entered else None
+
+        # R-based PnL
+        pnl_R = None
+        if self.entered and self.entry_px is not None and self.done_reason and self.R > 0:
+            if self.done_reason == "STOP":
+                pnl_R = -1.0
+            elif self.done_reason == "T2":
+                pnl_R = 2.5
+            elif self.done_reason == "TIMEOUT":
+                # conservative: assume flat at entry (until we add close-based timeout fills)
+                pnl_R = 0.0
+
+        return {
+            "alert_id": self.alert_id,
+            "symbol": self.symbol,
+            "side": self.side,
+
+            "strategy_profile": self.strategy_profile,
+            "strategy_version": self.strategy_version,
+            "config_hash": self.config_hash,
+
+            "entry_ts_utc": _dt_to_iso(self.entry_ts),
+            "entry_px": self.entry_px,
+
+            "exit_ts_utc": _dt_to_iso(self.done_ts),
+            "exit_px": None,  # we’ll fill with actual exit px once we store it (see update logic below)
+            "exit_reason": self.done_reason,
+
+            "pnl_R": pnl_R,
+            "pnl_usd_est": None,
+
+            "t1_touched": t1_touched,
+            "t1_ts_utc": _dt_to_iso(self.t1_ts),
+            "t2_touched": t2_touched,
+            "t2_ts_utc": _dt_to_iso(self.t2_ts),
+            "stop_touched": stop_touched,
+            "stop_ts_utc": _dt_to_iso(self.stop_ts),
+
+            "mfe_R": round((self.max_favorable - self.entry_high) / self.R, 4) if self.R > 0 else None,
+            "mae_R": round((self.entry_high - self.max_adverse) / self.R, 4) if self.R > 0 else None,
+
+            "time_in_trade_s": time_in_trade_s,
+            "time_to_t1_s": _dt_diff_s(self.entry_ts, self.t1_ts) if self.entered else None,
+            "time_to_t2_s": _dt_diff_s(self.entry_ts, self.t2_ts) if self.entered else None,
+            "time_to_stop_s": _dt_diff_s(self.entry_ts, self.stop_ts) if self.entered else None,
+
+            "max_spread_bps_seen": None,
+            "avg_spread_bps_seen": None,
+
+            # useful to distinguish “watch existed” vs “trade existed”
+            "entered": self.entered,
+        }
 
 
 class WatchManager:
@@ -128,7 +263,7 @@ class WatchManager:
         self.save_state()
 
 
-    def update(self, symbol: str, high: float, low: float, ts: datetime):
+    def update(self, symbol: str, high: float, low: float, close: float, ts: datetime):
         if symbol not in self.active:
             return
 
@@ -142,36 +277,74 @@ class WatchManager:
             w.max_favorable = max(w.max_favorable, high)
             w.max_adverse = min(w.max_adverse, low)
 
-            # Stop hit
+            # ENTRY simulation (only once)
+            if not w.entered:
+                zone_touched = (low <= w.entry_high) and (high >= w.entry_low)
+                if zone_touched:
+                    w.entered = True
+                    w.entry_ts = ts
+                    w.entry_px = float(w.entry_high)  # conservative worst fill in zone
+                    journal.log_execution(w._exec_row("ENTRY", ts, w.entry_px, "zone_touch_entry_high"))
+
+            if not w.entered:
+                if ts - w.created_ts >= self.timeout:
+                    w.done = True
+                    w.done_reason = "NO_ENTRY_FILL"
+                    w.done_ts = ts
+                    # No execution rows (because no fills happened)
+                    journal.log_outcome_v2(w.as_outcome_v2_row())
+                    continue
+
+                keep.append(w)
+                continue
+
+            # STOP (worst-case priority)
             if low <= w.stop:
                 w.done = True
                 w.done_reason = "STOP"
                 w.done_ts = ts
-                journal.log_outcome(w.as_outcome_row())
+                w.stop_ts = ts
+
+                exit_px = float(w.stop)
+                journal.log_execution(w._exec_row("EXIT_STOP", ts, exit_px, "bar_touch_stop"))
+                out = w.as_outcome_v2_row()
+                out["exit_px"] = exit_px
+                journal.log_outcome_v2(out)
                 continue
 
-            # Target 1
+            # T1 touch (log execution once)
             if not w.hit_t1 and high >= w.t1:
                 w.hit_t1 = True
+                w.t1_ts = ts
+                journal.log_execution(w._exec_row("EXIT_T1", ts, float(w.t1), "bar_touch_t1"))
 
-            # Target 2
+            # T2 = final exit
             if not w.hit_t2 and high >= w.t2:
                 w.hit_t2 = True
+                w.t2_ts = ts
                 w.done = True
                 w.done_reason = "T2"
                 w.done_ts = ts
-                journal.log_outcome(w.as_outcome_row())
+
+                exit_px = float(w.t2)
+                journal.log_execution(w._exec_row("EXIT_T2", ts, exit_px, "bar_touch_t2"))
+                out = w.as_outcome_v2_row()
+                out["exit_px"] = exit_px
+                journal.log_outcome_v2(out)
                 continue
 
-            # Timeout
+            # TIMEOUT (entered but no stop/t2)
             if ts - w.created_ts >= self.timeout:
                 w.done = True
                 w.done_reason = "TIMEOUT"
                 w.done_ts = ts
-                journal.log_outcome(w.as_outcome_row())
-                continue
 
-            keep.append(w)
+                exit_px = float(close)  # best available from bar stream
+                journal.log_execution(w._exec_row("EXIT_TIMEOUT", ts, exit_px, "bar_close_timeout"))
+                out = w.as_outcome_v2_row()
+                out["exit_px"] = exit_px
+                journal.log_outcome_v2(out)
+                continue
 
         self.active[symbol] = keep
         if not self.active[symbol]:
