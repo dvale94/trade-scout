@@ -1,4 +1,7 @@
-from datetime import datetime, timezone
+import json
+import hashlib
+from uuid import uuid4
+from datetime import datetime, timezone, timedelta
 import pandas as pd
 
 from .telemetry import TelemetryTracker
@@ -67,10 +70,93 @@ def append_bar_to_df(df: pd.DataFrame, bar, max_keep: int) -> pd.DataFrame:
     return df
 
 
+def compute_config_hash(profile) -> str:
+    """
+    Stable hash of strategy + config + profile knobs.
+    Keep this deterministic; only include things you consider part of the 'experiment configuration'.
+    """
+    payload = {
+        "market_type": config.MARKET_TYPE,
+        "strategy_profile": config.STRATEGY_PROFILE,
+        "alpaca_stock_feed": config.ALPACA_STOCK_FEED,
+        "symbols": list(config.SYMBOLS),
+
+        # profile parameters (dataclass -> dict)
+        "profile": profile.__dict__,
+    }
+    s = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
+
+
+def make_intent_base(
+    *,
+    alert_id: str,
+    symbol: str,
+    tier: str,
+    now: datetime,
+    bar_ts: datetime,
+    timeframe_min: int,
+    score: float,
+    computed_for_log: dict,
+    config_hash: str,
+    strategy_version: str,
+) -> dict:
+    bar_end = bar_ts
+    bar_start = bar_ts - timedelta(minutes=timeframe_min)
+
+    row = {
+        # identifiers
+        "alert_id": alert_id,
+        "symbol": symbol,
+        "side": "LONG",
+        "market_type": config.MARKET_TYPE,
+        "strategy_profile": config.STRATEGY_PROFILE,
+        "strategy_version": strategy_version,
+        "config_hash": config_hash,
+        "tier": tier,
+
+        # timestamps
+        "signal_ts_utc": now.astimezone(timezone.utc).isoformat(),
+        "bar_start_ts_utc": bar_start.astimezone(timezone.utc).isoformat(),
+        "bar_end_ts_utc": bar_end.astimezone(timezone.utc).isoformat(),
+        "timeframe_min": timeframe_min,
+
+        # signal price (what we scored on)
+        "signal_px": float(computed_for_log.get("close")) if computed_for_log.get("close") is not None else None,
+        "signal_px_type": "bar_close",
+
+        # status (filled later)
+        "alert_status": None,
+        "skip_reason": None,
+        "error_message": None,
+
+        # quick context
+        "score": round(float(score), 4),
+
+        # carry forward your computed snapshot fields (anchor injected)
+        "atr": computed_for_log.get("atr"),
+        "ma20": computed_for_log.get("ma20"),
+        "ma50": computed_for_log.get("ma50"),
+        "ma200": computed_for_log.get("ma200"),
+        "breakout_level": computed_for_log.get("breakout_level"),
+        "anchor_symbol": computed_for_log.get("anchor_symbol"),
+        "anchor_regime": computed_for_log.get("anchor_regime"),
+        "anchor_close": computed_for_log.get("anchor_close"),
+        "anchor_ma50": computed_for_log.get("anchor_ma50"),
+        "anchor_ma200": computed_for_log.get("anchor_ma200"),
+        "vol_z": computed_for_log.get("vol_z"),
+        "extended_atr": computed_for_log.get("extended_atr"),
+    }
+    return row
+
+
 def run():
     profile = strategy_profiles.PROFILES.get(config.STRATEGY_PROFILE)
     if profile is None:
         raise ValueError(f"Unknown STRATEGY_PROFILE: {config.STRATEGY_PROFILE}")
+    
+    strategy_version = "v2_sprint1"
+    config_hash = compute_config_hash(profile)
     
     min_needed = max(
         profile.ma_mid + 5,
@@ -82,7 +168,10 @@ def run():
     anchor = anchors.AnchorTracker()
     symbols_to_run = list(dict.fromkeys(config.SYMBOLS + [anchor.anchor_symbol]))  # de-dupe, preserve order
 
-    print(f"MARKET_TYPE={config.MARKET_TYPE} PROFILE={profile.name} timeframe={profile.timeframe_min}m symbols={symbols_to_run}")
+    print(
+        f"MARKET_TYPE={config.MARKET_TYPE} PROFILE={profile.name} timeframe={profile.timeframe_min}m "
+        f"symbols={symbols_to_run} config_hash={config_hash} strat_ver={strategy_version}"
+    )
 
     print("Seeding history...")
     data = seed.seed_history(
@@ -94,7 +183,7 @@ def run():
     print("Seed complete:", {k: len(v) for k, v in data.items()})
 
     cooldown = Cooldown(profile.cooldown_min)
-    watch_mgr = watch.WatchManager(timeout_minutes=profile.watch_timeout_min, max_active_per_symbol=1)
+    watch_mgr = watch.WatchManager(timeout_minutes=profile.watch_timeout_min, max_active_per_symbol=50)
     watch_mgr.load_state()
     print(f"Restored active watches: {sum(len(v) for v in watch_mgr.active.values())}")
 
@@ -144,26 +233,81 @@ def run():
             return
         telemetry.record_tier_selected(tier)
 
+        computed_for_log = anchor.inject_into_computed(computed)
+
+        # Create a "provisional" alert_id for intent tracking; if we create an alert, we'll overwrite with candidate.alert_id
+        provisional_alert_id = str(uuid4())
+
+        intent_row = make_intent_base(
+            alert_id=provisional_alert_id,
+            symbol=symbol,
+            tier=tier,
+            now=now,
+            bar_ts=ts,
+            timeframe_min=profile.timeframe_min,
+            score=score,
+            computed_for_log=computed_for_log,
+            config_hash=config_hash,
+            strategy_version=strategy_version,
+        )
+
         if not cooldown.allowed(symbol, tier, now):
             telemetry.record_cooldown_blocked(tier)
+
+            intent_row["alert_status"] = "SKIPPED_COOLDOWN"
+            intent_row["skip_reason"] = "COOLDOWN"
+            journal.log_alert_intent(intent_row)
+
             return
 
         try:
             candidate = strategy.compute_entry_stop_targets(symbol, profile, computed, reasons, score)
             if candidate is None:
+                intent_row["alert_status"] = "SKIPPED_INVALID_STOP"
+                intent_row["skip_reason"] = "CANDIDATE_NONE"
+                intent_row["reasons"] = " | ".join(reasons) if reasons else None
+                journal.log_alert_intent(intent_row)
                 return
- 
+
+            # attach planned levels now that we have them
+            intent_row["alert_id"] = candidate.alert_id
+            intent_row["entry_low"] = round(candidate.entry_low, 6)
+            intent_row["entry_high"] = round(candidate.entry_high, 6)
+            intent_row["stop_px"] = round(candidate.stop, 6)
+            intent_row["t1_px"] = round(candidate.t1, 6)
+            intent_row["t2_px"] = round(candidate.t2, 6)
+            intent_row["timeout_seconds"] = int(profile.watch_timeout_min * 60)
+
+            intent_row["stop_distance"] = round(candidate.r, 6)
+            intent_row["t1_R"] = 1.5
+            intent_row["t2_R"] = 2.5
+
+            # optional placeholders for sizing intent (keep stable columns)
+            intent_row["risk_model"] = "fixed_usd"
+            intent_row["risk_usd"] = None
+            intent_row["qty_model"] = None
+            intent_row["qty"] = None
+
             # sanity: avoid ultra-tight stops
             if candidate.r / candidate.entry_high < 0.004:
                 telemetry.record_skipped_tight_stop()
+
+                intent_row["alert_status"] = "SKIPPED_TIGHT_STOP"
+                intent_row["skip_reason"] = "TIGHT_STOP"
+                intent_row["reasons"] = " | ".join(candidate.reasons) if candidate.reasons else None
+                journal.log_alert_intent(intent_row)
                 return
 
-            computed_for_log = anchor.inject_into_computed(computed)
-
+            # Log legacy alert + send Discord
             journal.log_alert(candidate, computed_for_log, tier, config.STRATEGY_PROFILE)
             notifier.discord_notify(format_alert(candidate, tier))
 
             telemetry.record_alert_sent(tier)
+
+            # Log intent as CREATED (this is the “audit truth” for Sprint 1)
+            intent_row["alert_status"] = "ALERT_CREATED"
+            intent_row["reasons"] = " | ".join(candidate.reasons) if candidate.reasons else None
+            journal.log_alert_intent(intent_row)
 
             watch_mgr.add(watch.Watch(
                 alert_id=candidate.alert_id,
@@ -187,6 +331,10 @@ def run():
 
         except Exception as e:
             print(f"ALERT ERROR for {symbol}: {e}")
+
+            intent_row["alert_status"] = "ERROR_ALERT_PIPELINE"
+            intent_row["error_message"] = str(e)
+            journal.log_alert_intent(intent_row)
 
         telemetry.maybe_flush(now)
 
