@@ -112,3 +112,27 @@ def score_buckets(trades: pd.DataFrame, buckets: int = 10) -> pd.DataFrame:
 
     df["score_bucket"] = pd.qcut(df["score"], q=buckets, duplicates="drop")
     return breakdown_expectancy(df, by="score_bucket")
+
+
+def threshold_sweep(trades: pd.DataFrame, thresholds: list[float]) -> pd.DataFrame:
+    if trades.empty or "score" not in trades.columns or "pnl_R" not in trades.columns:
+        return pd.DataFrame()
+
+    df = trades[trades["pnl_R"].notna()].copy()
+    df["score"] = pd.to_numeric(df["score"], errors="coerce")
+    df["pnl_R"] = pd.to_numeric(df["pnl_R"], errors="coerce")
+    df = df.dropna(subset=["score", "pnl_R"])
+
+    rows = []
+    for t in thresholds:
+        sub = df[df["score"] >= t]
+        if sub.empty:
+            rows.append({"threshold": t, "trades": 0, "expectancy_R": None, "avg_R": None})
+            continue
+        rows.append({
+            "threshold": t,
+            "trades": int(len(sub)),
+            "expectancy_R": float(core_metrics(sub)["expectancy_R"]) if core_metrics(sub)["expectancy_R"] is not None else None,
+            "avg_R": float(sub["pnl_R"].mean()),
+        })
+    return pd.DataFrame(rows).sort_values("threshold")
