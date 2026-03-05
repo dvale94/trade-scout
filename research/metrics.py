@@ -70,3 +70,45 @@ def pretty_print_core(metrics: dict) -> str:
         f"Expectancy: {num(metrics['expectancy_R'])}R\n"
         f"Profit factor: {num(metrics['profit_factor'])}\n"
     )
+
+
+def breakdown_expectancy(trades: pd.DataFrame, by: str) -> pd.DataFrame:
+    """
+    Returns expectancy by group (tier, symbol, anchor_regime, etc.)
+    """
+    if trades.empty or "pnl_R" not in trades.columns or by not in trades.columns:
+        return pd.DataFrame()
+
+    df = trades[trades["pnl_R"].notna()].copy()
+    df["pnl_R"] = df["pnl_R"].astype(float)
+
+    def _exp(g: pd.Series) -> float:
+        wins = g[g > 0]
+        losses = g[g < 0]
+        if len(g) == 0:
+            return float("nan")
+        win_rate = len(wins) / len(g)
+        avg_win = wins.mean() if len(wins) else 0.0
+        avg_loss = abs(losses.mean()) if len(losses) else 0.0
+        return float((win_rate * avg_win) - ((1 - win_rate) * avg_loss))
+
+    out = (
+        df.groupby(by)["pnl_R"]
+        .agg(trades="count", avg="mean", med="median", expectancy=_exp)
+        .reset_index()
+        .sort_values(["expectancy", "trades"], ascending=[False, False])
+    )
+    return out
+
+
+def score_buckets(trades: pd.DataFrame, buckets: int = 10) -> pd.DataFrame:
+    if trades.empty or "score" not in trades.columns or "pnl_R" not in trades.columns:
+        return pd.DataFrame()
+
+    df = trades[trades["pnl_R"].notna()].copy()
+    df["score"] = pd.to_numeric(df["score"], errors="coerce")
+    df["pnl_R"] = pd.to_numeric(df["pnl_R"], errors="coerce")
+    df = df.dropna(subset=["score", "pnl_R"])
+
+    df["score_bucket"] = pd.qcut(df["score"], q=buckets, duplicates="drop")
+    return breakdown_expectancy(df, by="score_bucket")
