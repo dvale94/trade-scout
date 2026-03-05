@@ -93,7 +93,7 @@ def breakdown_expectancy(trades: pd.DataFrame, by: str) -> pd.DataFrame:
         return float((win_rate * avg_win) - ((1 - win_rate) * avg_loss))
 
     out = (
-        df.groupby(by)["pnl_R"]
+        df.groupby(by, observed=False)["pnl_R"]
         .agg(trades="count", avg="mean", med="median", expectancy=_exp)
         .reset_index()
         .sort_values(["expectancy", "trades"], ascending=[False, False])
