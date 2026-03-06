@@ -59,7 +59,7 @@ def build_trades_dataframe(
     i = intents.copy()
     o = outcomes_v2.copy()
 
-    # Keep only created alerts in intents (the "audit truth" from Sprint 1)
+    # Keep only created alerts in intents
     if "alert_status" in i.columns:
         i = i[i["alert_status"] == "ALERT_CREATED"].copy()
 
@@ -72,33 +72,29 @@ def build_trades_dataframe(
     # Merge (left join = keep all created alerts, even if outcome not yet present)
     trades = i.merge(o, on="alert_id", how="left", suffixes=("_intent", "_outcome"))
 
-    # Normalize a few commonly used columns into consistent names
-    # (Prefer outcomes_v2 for entry/exit px because it represents the simulated fills)
-    rename_map = {
-        "entry_px": "entry_px",
-        "exit_px": "exit_px",
-        "exit_reason": "exit_reason",
-        "pnl_R": "pnl_R",
-        "mfe_R": "mfe_R",
-        "mae_R": "mae_R",
-        "time_in_trade_s": "time_in_trade_s",
-        "t1_touched": "t1_touched",
-        "t2_touched": "t2_touched",
-        "stop_touched": "stop_touched",
-    }
-    # These already exist in outcomes_v2 per watch.py :contentReference[oaicite:1]{index=1}
+    # Normalize shared columns that may have been suffixed by the merge
+    if "symbol" not in trades.columns:
+        if "symbol_intent" in trades.columns:
+            trades["symbol"] = trades["symbol_intent"]
+        elif "symbol_outcome" in trades.columns:
+            trades["symbol"] = trades["symbol_outcome"]
+
+    if "tier" not in trades.columns:
+        if "tier_intent" in trades.columns:
+            trades["tier"] = trades["tier_intent"]
+        elif "tier_outcome" in trades.columns:
+            trades["tier"] = trades["tier_outcome"]
 
     # Ensure booleans not strings
     for bcol in ["t1_touched", "t2_touched", "stop_touched", "entered"]:
         if bcol in trades.columns:
             trades[bcol] = trades[bcol].astype("boolean")
 
-    # If pnl_R is missing (not exited yet), leave NaN
-    # Add convenience: time_in_trade (minutes)
+    # Convenience column
     if "time_in_trade_s" in trades.columns:
         trades["time_in_trade_min"] = trades["time_in_trade_s"] / 60.0
 
-    # Keep a practical column subset (but don’t drop others—research evolves)
+    # Keep a practical column subset (but don’t drop others)
     preferred = [
         "alert_id",
         "symbol",
