@@ -51,7 +51,7 @@ def seed_history(symbols: list[str], timeframe_min: int, seed_minutes: int, look
 
         sdf = sdf.rename(columns={"timestamp": "ts"})
         sdf = sdf[["ts", "open", "high", "low", "close", "volume"]].copy()
-        sdf["ts"] = pd.to_datetime(sdf["ts"], utc=True)
+        sdf.loc[:, "ts"] = pd.to_datetime(sdf["ts"], utc=True)
 
         out[sym_u] = sdf.tail(lookback_bars).reset_index(drop=True)
 
