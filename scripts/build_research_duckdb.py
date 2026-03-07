@@ -12,7 +12,7 @@ CSV_MAP = {
     f"{MARKET_TYPE}_alerts.csv": "alerts",
     f"{MARKET_TYPE}_alerts_intents.csv": "alerts_intents",
     f"{MARKET_TYPE}_executions.csv": "executions",
-    f"{MARKET_TYPE}_outcomes_v2.csv": "outcomes_v2",
+    f"{MARKET_TYPE}_outcomes.csv": "outcomes",
     f"{MARKET_TYPE}_telemetry.csv": "telemetry",
 }
 
@@ -29,8 +29,6 @@ def existing_csvs() -> dict[str, Path]:
 def main() -> None:
     DUCKDB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = duckdb.connect(str(DUCKDB_PATH))
-    con.execute("INSTALL httpfs;")
-    con.execute("LOAD httpfs;")
 
     csvs = existing_csvs()
     for table, path in csvs.items():
@@ -40,7 +38,7 @@ def main() -> None:
             [str(path)],
         )
 
-    if "alerts_intents" in csvs and "outcomes_v2" in csvs:
+    if "alerts_intents" in csvs and "outcomes" in csvs:
         con.execute("DROP VIEW IF EXISTS trades")
         con.execute(
             """
@@ -82,7 +80,7 @@ def main() -> None:
               o.t2_touched,
               o.stop_touched
             FROM alerts_intents i
-            LEFT JOIN outcomes_v2 o USING (alert_id)
+            LEFT JOIN outcomes o USING (alert_id)
             WHERE i.alert_status = 'ALERT_CREATED'
             """
         )

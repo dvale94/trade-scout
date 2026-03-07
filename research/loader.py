@@ -9,7 +9,7 @@ import pandas as pd
 class DatasetPaths:
     alerts_intents: Path
     executions: Path
-    outcomes_v2: Path
+    outcomes: Path
 
 
 def default_paths(log_dir: str | Path, market_type: str = "crypto") -> DatasetPaths:
@@ -17,13 +17,13 @@ def default_paths(log_dir: str | Path, market_type: str = "crypto") -> DatasetPa
     Matches journal.py naming:
       {market_type}_alerts_intents.csv
       {market_type}_executions.csv
-      {market_type}_outcomes_v2.csv
+      {market_type}_outcomes.csv
     """
     log_dir = Path(log_dir)
     return DatasetPaths(
         alerts_intents=log_dir / f"{market_type}_alerts_intents.csv",
         executions=log_dir / f"{market_type}_executions.csv",
-        outcomes_v2=log_dir / f"{market_type}_outcomes_v2.csv",
+        outcomes=log_dir / f"{market_type}_outcomes.csv",
     )
 
 
@@ -37,27 +37,27 @@ def _read_csv(path: Path) -> pd.DataFrame:
 def load_datasets(paths: DatasetPaths) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     intents = _read_csv(paths.alerts_intents)
     execs = _read_csv(paths.executions)
-    outcomes = _read_csv(paths.outcomes_v2)
+    outcomes = _read_csv(paths.outcomes)
     return intents, execs, outcomes
 
 
 def build_trades_dataframe(
     intents: pd.DataFrame,
-    outcomes_v2: pd.DataFrame,
+    outcomes: pd.DataFrame,
 ) -> pd.DataFrame:
     """
     Core join:
-      alerts_intents JOIN outcomes_v2 ON alert_id
+      alerts_intents JOIN outcomes ON alert_id
 
     Notes:
     - alerts_intents includes *attempts* (skips/errors). We want the created alerts.
-    - outcomes_v2 includes exits for watches that entered and ended (STOP/T2/TIMEOUT/NO_ENTRY_FILL).
+    - outcomes includes exits for watches that entered and ended (STOP/T2/TIMEOUT/NO_ENTRY_FILL).
     """
-    if intents.empty and outcomes_v2.empty:
+    if intents.empty and outcomes.empty:
         return pd.DataFrame()
 
     i = intents.copy()
-    o = outcomes_v2.copy()
+    o = outcomes.copy()
 
     # Keep only created alerts in intents
     if "alert_status" in i.columns:
