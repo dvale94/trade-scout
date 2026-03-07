@@ -4,6 +4,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
+*.pyc
 
 # Distribution / packaging
 build/
@@ -44,3 +45,9 @@ logs/
 # macOS
 # ==========================
 .DS_Store
+
+# ==========================
+# Other
+# ==========================
+*.duckdb
+*.json

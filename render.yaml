@@ -1,0 +1,42 @@
+services:
+  - type: worker
+    name: trade-scout-worker
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m trade_scout.main
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.8
+      - key: LOG_DIR
+        value: /var/data/trade-scout/logs
+      - key: DUCKDB_PATH
+        value: /var/data/trade-scout/analytics/research.duckdb
+      - key: BACKUP_STATE_DIR
+        value: /var/data/trade-scout/backups
+      - key: R2_ENDPOINT_URL
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET
+        sync: false
+      - key: R2_PREFIX
+        value: trade-scout
+      - key: BACKUP_RETENTION_DAYS
+        value: "30"
+      - key: MARKET_TYPE
+        sync: false
+      - key: STRATEGY_PROFILE
+        sync: false
+      - key: ALPACA_API_KEY
+        sync: false
+      - key: ALPACA_SECRET_KEY
+        sync: false
+      - key: ALPACA_STOCK_FEED
+        sync: false
+      - key: DISCORD_WEBHOOK_URL
+        sync: false
+      - key: SYMBOLS
+        sync: false
