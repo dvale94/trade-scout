@@ -29,8 +29,10 @@ ENV/
 # ==========================
 # Logs & Runtime Files
 # ==========================
-*.log
 logs/
+*.duckdb
+*.db
+*.sqlite
 
 # ==========================
 # IDE / Editor
@@ -39,7 +41,6 @@ logs/
 .idea/
 *.swp
 *.swo
-.ipynb_checkpoints/
 
 # ==========================
 # macOS
@@ -47,7 +48,7 @@ logs/
 .DS_Store
 
 # ==========================
-# Other
+# notebooks / research outputs
 # ==========================
-*.duckdb
-*.json
+.ipynb_checkpoints/
+*.ipynb
