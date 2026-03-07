@@ -39,7 +39,7 @@ class Watch:
     done_reason: str | None = None
     done_ts: datetime | None = None
 
-    # strategy metadata (so outcomes_v2 can join cleanly)
+    # strategy metadata (so outcomes can join cleanly)
     strategy_profile: str | None = None
     strategy_version: str | None = None
     config_hash: str | None = None
