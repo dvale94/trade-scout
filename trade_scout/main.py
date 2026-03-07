@@ -226,158 +226,143 @@ def run():
     async def on_bar(bar):
         nonlocal reconnect_attempt
 
-        if reconnect_attempt > 0:
-            print(f"Websocket stabilized after reconnect attempt {reconnect_attempt}; resetting backoff.")
-            reconnect_attempt = 0
-
-        symbol = bar.symbol
-        ts = pd.to_datetime(bar.timestamp, utc=True).to_pydatetime()
         now = datetime.now(timezone.utc)
 
-        telemetry.record_bar(is_anchor=anchor.is_anchor(symbol))
-        # update outcomes for active watches
-        watch_mgr.update(symbol, float(bar.high), float(bar.low), float(bar.close), ts)
+        try:
+            if reconnect_attempt > 0:
+                print(f"Websocket stabilized after reconnect attempt {reconnect_attempt}; resetting backoff.")
+                reconnect_attempt = 0
 
-        df = data.get(symbol)
-        if df is None:
-            return
-        df = append_bar_to_df(df, bar, max_keep)
-        data[symbol] = df
+            symbol = bar.symbol
+            ts = pd.to_datetime(bar.timestamp, utc=True).to_pydatetime()
 
-        if len(df) < min_needed:
-            telemetry.record_insufficient_history()
-            return
+            telemetry.record_bar(is_anchor=anchor.is_anchor(symbol))
+            watch_mgr.update(symbol, float(bar.high), float(bar.low), float(bar.close), ts)
 
-        score, reasons, computed = strategy.score_candidate(df, profile)
-
-        telemetry.record_score(score)
-
-        # If you rely on some indicators and they're not ready yet
-        if computed.get("ma200") is None or computed.get("atr") is None:
-            telemetry.record_indicator_missing()
-            return
-
-        # If this symbol is an anchor, update anchor_state
-        if anchor.is_anchor(symbol):
-            anchor.update_from_computed(computed, ts)
-            # skip alerting if anchor is not in configured symbols
-            if symbol not in config.SYMBOLS:
+            df = data.get(symbol)
+            if df is None:
                 return
 
-        tier = strategy.pick_tier(score, df, profile, computed)
-        if tier is None:
-            telemetry.record_below_score()
-            return
-        telemetry.record_tier_selected(tier)
+            df = append_bar_to_df(df, bar, max_keep)
+            data[symbol] = df
 
-        computed_for_log = anchor.inject_into_computed(computed)
+            if len(df) < min_needed:
+                telemetry.record_insufficient_history()
+                return
 
-        # Create a "provisional" alert_id for intent tracking; if we create an alert, we'll overwrite with candidate.alert_id
-        provisional_alert_id = str(uuid4())
+            score, reasons, computed = strategy.score_candidate(df, profile)
+            telemetry.record_score(score)
 
-        intent_row = make_intent_base(
-            alert_id=provisional_alert_id,
-            symbol=symbol,
-            tier=tier,
-            now=now,
-            bar_ts=ts,
-            timeframe_min=profile.timeframe_min,
-            score=score,
-            computed_for_log=computed_for_log,
-            config_hash=config_hash,
-            strategy_version=strategy_version,
-        )
+            if computed.get("ma200") is None or computed.get("atr") is None:
+                telemetry.record_indicator_missing()
+                return
 
-        if not cooldown.allowed(symbol, tier, now):
-            telemetry.record_cooldown_blocked(tier)
+            if anchor.is_anchor(symbol):
+                anchor.update_from_computed(computed, ts)
+                if symbol not in config.SYMBOLS:
+                    return
 
-            intent_row["alert_status"] = "SKIPPED_COOLDOWN"
-            intent_row["skip_reason"] = "COOLDOWN"
-            journal.log_alert_intent(intent_row)
+            tier = strategy.pick_tier(score, df, profile, computed)
+            if tier is None:
+                telemetry.record_below_score()
+                return
+            telemetry.record_tier_selected(tier)
 
-            return
+            computed_for_log = anchor.inject_into_computed(computed)
+            provisional_alert_id = str(uuid4())
 
-        try:
-            candidate = strategy.compute_entry_stop_targets(symbol, profile, computed, reasons, score)
-            if candidate is None:
-                intent_row["alert_status"] = "SKIPPED_INVALID_STOP"
-                intent_row["skip_reason"] = "CANDIDATE_NONE"
-                intent_row["reasons"] = " | ".join(reasons) if reasons else None
+            intent_row = make_intent_base(
+                alert_id=provisional_alert_id,
+                symbol=symbol,
+                tier=tier,
+                now=now,
+                bar_ts=ts,
+                timeframe_min=profile.timeframe_min,
+                score=score,
+                computed_for_log=computed_for_log,
+                config_hash=config_hash,
+                strategy_version=strategy_version,
+            )
+
+            if not cooldown.allowed(symbol, tier, now):
+                telemetry.record_cooldown_blocked(tier)
+                intent_row["alert_status"] = "SKIPPED_COOLDOWN"
+                intent_row["skip_reason"] = "COOLDOWN"
                 journal.log_alert_intent(intent_row)
                 return
 
-            # attach planned levels now that we have them
-            intent_row["alert_id"] = candidate.alert_id
-            intent_row["entry_low"] = round(candidate.entry_low, 6)
-            intent_row["entry_high"] = round(candidate.entry_high, 6)
-            intent_row["stop_px"] = round(candidate.stop, 6)
-            intent_row["t1_px"] = round(candidate.t1, 6)
-            intent_row["t2_px"] = round(candidate.t2, 6)
-            intent_row["timeout_seconds"] = int(profile.watch_timeout_min * 60)
+            try:
+                candidate = strategy.compute_entry_stop_targets(symbol, profile, computed, reasons, score)
+                if candidate is None:
+                    intent_row["alert_status"] = "SKIPPED_INVALID_STOP"
+                    intent_row["skip_reason"] = "CANDIDATE_NONE"
+                    intent_row["reasons"] = " | ".join(reasons) if reasons else None
+                    journal.log_alert_intent(intent_row)
+                    return
 
-            intent_row["stop_distance"] = round(candidate.r, 6)
-            intent_row["t1_R"] = 1.5
-            intent_row["t2_R"] = 2.5
+                intent_row["alert_id"] = candidate.alert_id
+                intent_row["entry_low"] = round(candidate.entry_low, 6)
+                intent_row["entry_high"] = round(candidate.entry_high, 6)
+                intent_row["stop_px"] = round(candidate.stop, 6)
+                intent_row["t1_px"] = round(candidate.t1, 6)
+                intent_row["t2_px"] = round(candidate.t2, 6)
+                intent_row["timeout_seconds"] = int(profile.watch_timeout_min * 60)
+                intent_row["stop_distance"] = round(candidate.r, 6)
+                intent_row["t1_R"] = 1.5
+                intent_row["t2_R"] = 2.5
+                intent_row["risk_model"] = "fixed_usd"
+                intent_row["risk_usd"] = None
+                intent_row["qty_model"] = None
+                intent_row["qty"] = None
 
-            # optional placeholders for sizing intent (keep stable columns)
-            intent_row["risk_model"] = "fixed_usd"
-            intent_row["risk_usd"] = None
-            intent_row["qty_model"] = None
-            intent_row["qty"] = None
+                if candidate.r / candidate.entry_high < 0.004:
+                    telemetry.record_skipped_tight_stop()
+                    intent_row["alert_status"] = "SKIPPED_TIGHT_STOP"
+                    intent_row["skip_reason"] = "TIGHT_STOP"
+                    intent_row["reasons"] = " | ".join(candidate.reasons) if candidate.reasons else None
+                    journal.log_alert_intent(intent_row)
+                    return
 
-            # sanity: avoid ultra-tight stops
-            if candidate.r / candidate.entry_high < 0.004:
-                telemetry.record_skipped_tight_stop()
+                journal.log_alert(candidate, computed_for_log, tier, config.STRATEGY_PROFILE)
+                notifier.discord_notify(format_alert(candidate, tier))
+                telemetry.record_alert_sent(tier)
 
-                intent_row["alert_status"] = "SKIPPED_TIGHT_STOP"
-                intent_row["skip_reason"] = "TIGHT_STOP"
+                intent_row["alert_status"] = "ALERT_CREATED"
                 intent_row["reasons"] = " | ".join(candidate.reasons) if candidate.reasons else None
                 journal.log_alert_intent(intent_row)
-                return
 
-            # Log legacy alert + send Discord
-            journal.log_alert(candidate, computed_for_log, tier, config.STRATEGY_PROFILE)
-            notifier.discord_notify(format_alert(candidate, tier))
+                watch_mgr.add(watch.Watch(
+                    alert_id=candidate.alert_id,
+                    symbol=symbol,
+                    timeframe_min=profile.timeframe_min,
+                    tier=tier,
+                    created_ts=now,
+                    entry_low=candidate.entry_low,
+                    entry_high=candidate.entry_high,
+                    stop=candidate.stop,
+                    t1=candidate.t1,
+                    t2=candidate.t2,
+                    R=candidate.r,
+                    score=candidate.score,
+                    max_favorable=float(candidate.entry_high),
+                    max_adverse=float(candidate.entry_high),
+                    strategy_profile=config.STRATEGY_PROFILE,
+                    strategy_version=strategy_version,
+                    config_hash=config_hash,
+                    side="LONG",
+                ))
 
-            telemetry.record_alert_sent(tier)
+                cooldown.mark(symbol, tier, now)
+                print(f"ALERT {symbol} tier={tier} score={score:.2f}")
 
-            # Log intent as CREATED (this is the “audit truth” for Sprint 1)
-            intent_row["alert_status"] = "ALERT_CREATED"
-            intent_row["reasons"] = " | ".join(candidate.reasons) if candidate.reasons else None
-            journal.log_alert_intent(intent_row)
+            except Exception as e:
+                print(f"ALERT ERROR for {symbol}: {e}")
+                intent_row["alert_status"] = "ERROR_ALERT_PIPELINE"
+                intent_row["error_message"] = str(e)
+                journal.log_alert_intent(intent_row)
 
-            watch_mgr.add(watch.Watch(
-                alert_id=candidate.alert_id,
-                symbol=symbol,
-                timeframe_min=profile.timeframe_min,
-                tier=tier,
-                created_ts=now,
-                entry_low=candidate.entry_low,
-                entry_high=candidate.entry_high,
-                stop=candidate.stop,
-                t1=candidate.t1,
-                t2=candidate.t2,
-                R=candidate.r,
-                score=candidate.score,
-                max_favorable=float(candidate.entry_high),
-                max_adverse=float(candidate.entry_high),
-                strategy_profile=config.STRATEGY_PROFILE,
-                strategy_version=strategy_version,
-                config_hash=config_hash,
-                side="LONG",                
-            ))
-
-            cooldown.mark(symbol, tier, now)
-            print(f"ALERT {symbol} tier={tier} score={score:.2f}")
-
-        except Exception as e:
-            print(f"ALERT ERROR for {symbol}: {e}")
-
-            intent_row["alert_status"] = "ERROR_ALERT_PIPELINE"
-            intent_row["error_message"] = str(e)
-            journal.log_alert_intent(intent_row)
-
-        telemetry.maybe_flush(now)
+        finally:
+            telemetry.maybe_flush(datetime.now(timezone.utc))
 
     reconnect_attempt = 0
 
