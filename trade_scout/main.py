@@ -366,6 +366,7 @@ def run():
     reconnect_attempt = 0
 
     while True:
+        stream = None
         try:
             stream = market.make_stream()
 
@@ -399,6 +400,15 @@ def run():
 
             delay = websocket_backoff(reconnect_attempt)
             print(f"Retrying websocket in {delay:.1f}s...")
+
+        finally:
+            if stream is not None:
+                try:
+                    close_fn = getattr(stream, "close", None)
+                    if callable(close_fn):
+                        close_fn()
+                except Exception as close_err:
+                    print(f"Error while closing websocket stream: {close_err}")
 
 
 if __name__ == "__main__":
