@@ -148,6 +148,22 @@ def make_intent_base(
         "anchor_ma200": computed_for_log.get("anchor_ma200"),
         "vol_z": computed_for_log.get("vol_z"),
         "extended_atr": computed_for_log.get("extended_atr"),
+
+        # planned levels / sizing placeholders (keep alerts_intents schema stable)
+        "entry_low": None,
+        "entry_high": None,
+        "stop_px": None,
+        "t1_px": None,
+        "t2_px": None,
+        "timeout_seconds": None,
+        "stop_distance": None,
+        "t1_R": None,
+        "t2_R": None,
+        "risk_model": None,
+        "risk_usd": None,
+        "qty_model": None,
+        "qty": None,
+        "reasons": None,
     }
     return row
 

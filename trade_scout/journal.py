@@ -9,6 +9,55 @@ from .strategy import Candidate
 
 LOG_DIR = config.LOG_DIR
 
+
+ALERT_INTENT_FIELDS = [
+    "alert_id",
+    "symbol",
+    "side",
+    "market_type",
+    "strategy_profile",
+    "strategy_version",
+    "config_hash",
+    "tier",
+    "signal_ts_utc",
+    "bar_start_ts_utc",
+    "bar_end_ts_utc",
+    "timeframe_min",
+    "signal_px",
+    "signal_px_type",
+    "alert_status",
+    "skip_reason",
+    "error_message",
+    "score",
+    "atr",
+    "ma20",
+    "ma50",
+    "ma200",
+    "breakout_level",
+    "anchor_symbol",
+    "anchor_regime",
+    "anchor_close",
+    "anchor_ma50",
+    "anchor_ma200",
+    "vol_z",
+    "extended_atr",
+    "entry_low",
+    "entry_high",
+    "stop_px",
+    "t1_px",
+    "t2_px",
+    "timeout_seconds",
+    "stop_distance",
+    "t1_R",
+    "t2_R",
+    "risk_model",
+    "risk_usd",
+    "qty_model",
+    "qty",
+    "reasons",
+]
+
+
 def _path(name: str) -> str:
     os.makedirs(LOG_DIR, exist_ok=True)
     return os.path.join(LOG_DIR, name)
@@ -47,13 +96,17 @@ def _write_row(path: str, row: dict[str, Any]):
         writer.writerow(row)
 
 
+def _write_row_with_schema(path: str, row: dict[str, Any], fieldnames: list[str]):
+    file_exists = os.path.isfile(path)
+    normalized = {k: row.get(k) for k in fieldnames}
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(normalized)
+
+
 def log_alert(candidate: Candidate, computed: dict, tier: str, strategy_profile: str):
-    """
-    Logs a single alert event with full context.
-    candidate: your Candidate dataclass instance
-    computed: dict from score_candidate()
-    tier: "A_PLUS_RETEST" or "A_CONTINUATION"
-    """
     row = {
         "alert_id": candidate.alert_id,
         "market_type": config.MARKET_TYPE,
@@ -70,8 +123,6 @@ def log_alert(candidate: Candidate, computed: dict, tier: str, strategy_profile:
         "t2": round(candidate.t2, 6),
         "R": round(candidate.r, 6),
         "risk_pct": round((candidate.r / candidate.entry_high) * 100.0, 4),
-
-        # context features
         "atr": computed.get("atr"),
         "ma20": computed.get("ma20"),
         "ma50": computed.get("ma50"),
@@ -84,34 +135,23 @@ def log_alert(candidate: Candidate, computed: dict, tier: str, strategy_profile:
         "anchor_ma200": computed.get("anchor_ma200"),
         "vol_z": computed.get("vol_z"),
         "extended_atr": computed.get("extended_atr"),
-
-        # news hooks (future)
         "news_sentiment": candidate.news_sentiment,
         "news_summary": candidate.news_summary,
-
-        # human-readable reasons
         "reasons": " | ".join(candidate.reasons),
     }
     _write_row(alerts_path(), row)
 
 
 def log_outcome(outcome_row: dict[str, Any]):
-    """
-    outcome_row should already contain all fields needed for outcomes.csv
-    """
     _write_row(outcomes_path(), outcome_row)
 
 
 def log_telemetry(row: dict[str, Any]):
-    """
-    Writes a single aggregated telemetry snapshot (e.g., once per hour).
-    Keep this low-frequency to avoid noisy logs.
-    """
     _write_row(telemetry_path(), row)
 
 
 def log_alert_intent(row: dict[str, Any]):
-    _write_row(alerts_intents_path(), row)
+    _write_row_with_schema(alerts_intents_path(), row, ALERT_INTENT_FIELDS)
 
 
 def log_execution(row: dict[str, Any]):
@@ -128,4 +168,4 @@ def load_active_watches() -> dict | None:
     if not os.path.exists(path):
         return None
     with open(path, "r") as f:
-        return json.load(f)    
+        return json.load(f)
