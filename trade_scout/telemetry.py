@@ -121,6 +121,7 @@ class TelemetryTracker:
         print(
             f"[TELEMETRY] bars={row['bars_seen']} alerts={row['alerts_sent']} "
             f"below_score={row['below_score']} ind_missing={row['indicator_missing']} "
+            f"score_min={row['score_min']} score_avg={row['score_avg']} score_max={row['score_max']} "
             f"tiers={row['tier_selected']} cooldown={row['cooldown_blocked']}"
         )
 
