@@ -3,6 +3,9 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import duckdb
+from dotenv import load_dotenv
+
+load_dotenv()
 
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
 DUCKDB_PATH = Path(os.getenv("DUCKDB_PATH", LOG_DIR / "research.duckdb"))

@@ -30,6 +30,8 @@ ENV/
 # Logs & Runtime Files
 # ==========================
 logs/
+backups/
+analytics/
 *.duckdb
 *.db
 *.sqlite

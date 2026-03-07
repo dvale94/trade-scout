@@ -5,8 +5,10 @@ import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-
 import boto3
+from dotenv import load_dotenv
+
+load_dotenv()
 
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
 DUCKDB_PATH = Path(os.getenv("DUCKDB_PATH", LOG_DIR / "research.duckdb"))
