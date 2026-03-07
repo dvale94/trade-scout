@@ -55,29 +55,6 @@ class Watch:
     stop_ts: datetime | None = None
 
 
-    def as_outcome_row(self) -> dict[str, Any]:
-        return {
-            "alert_id": self.alert_id,
-            "symbol": self.symbol,
-            "timeframe_min": self.timeframe_min,
-            "tier": self.tier,
-            "alert_ts_utc": self.created_ts.astimezone(timezone.utc).isoformat(),
-            "done_ts_utc": (self.done_ts.astimezone(timezone.utc).isoformat() if self.done_ts else None),
-            "done_reason": self.done_reason,
-            "score": round(self.score, 4),
-            "entry_low": self.entry_low,
-            "entry_high": self.entry_high,
-            "stop": self.stop,
-            "t1": self.t1,
-            "t2": self.t2,
-            "R": self.R,
-            "max_favorable": self.max_favorable,
-            "max_adverse": self.max_adverse,
-            "mfe_R": round((self.max_favorable - self.entry_high) / self.R, 4) if self.R > 0 else None,
-            "mae_R": round((self.entry_high - self.max_adverse) / self.R, 4) if self.R > 0 else None,
-        }
-    
-
     def to_dict(self) -> dict[str, Any]:
         return {
             "alert_id": self.alert_id,
@@ -182,7 +159,7 @@ class Watch:
         }
 
 
-    def as_outcome_v2_row(self) -> dict[str, Any]:
+    def as_outcome_row(self) -> dict[str, Any]:
         # Touch flags
         t1_touched = self.t1_ts is not None
         t2_touched = self.t2_ts is not None
@@ -300,7 +277,7 @@ class WatchManager:
                     w.done_reason = "NO_ENTRY_FILL"
                     w.done_ts = ts
                     # No execution rows (because no fills happened)
-                    journal.log_outcome_v2(w.as_outcome_v2_row())
+                    journal.log_outcome(w.as_outcome_row())
                     continue
 
                 keep.append(w)
@@ -315,9 +292,9 @@ class WatchManager:
 
                 exit_px = float(w.stop)
                 journal.log_execution(w._exec_row("EXIT_STOP", ts, exit_px, "bar_touch_stop"))
-                out = w.as_outcome_v2_row()
+                out = w.as_outcome_row()
                 out["exit_px"] = exit_px
-                journal.log_outcome_v2(out)
+                journal.log_outcome(out)
                 continue
 
             # T1 touch (log execution once)
@@ -336,9 +313,9 @@ class WatchManager:
 
                 exit_px = float(w.t2)
                 journal.log_execution(w._exec_row("EXIT_T2", ts, exit_px, "bar_touch_t2"))
-                out = w.as_outcome_v2_row()
+                out = w.as_outcome_row()
                 out["exit_px"] = exit_px
-                journal.log_outcome_v2(out)
+                journal.log_outcome(out)
                 continue
 
             # TIMEOUT (entered but no stop/t2)
@@ -349,11 +326,11 @@ class WatchManager:
 
                 exit_px = float(close)  # best available from bar stream
                 journal.log_execution(w._exec_row("EXIT_TIMEOUT", ts, exit_px, "bar_close_timeout"))
-                out = w.as_outcome_v2_row()
+                out = w.as_outcome_row()
                 out["exit_px"] = exit_px
                 if w.entry_px is not None and w.R > 0:
                     out["pnl_R"] = round((exit_px - w.entry_px) / w.R, 4)
-                journal.log_outcome_v2(out)
+                journal.log_outcome(out)
                 continue
 
             keep.append(w)            
