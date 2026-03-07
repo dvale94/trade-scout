@@ -1,5 +1,7 @@
 import json
 import hashlib
+import time
+import random
 from uuid import uuid4
 from datetime import datetime, timezone, timedelta
 import pandas as pd
@@ -150,6 +152,21 @@ def make_intent_base(
     return row
 
 
+def websocket_backoff(attempt: int, base: float = 5.0, cap: float = 120.0) -> float:
+    """
+    Exponential backoff with jitter.
+    attempt=1 -> ~5s
+    attempt=2 -> ~10s
+    attempt=3 -> ~20s
+    capped at 120s
+    """
+    delay = min(cap, base * (2 ** (attempt - 1)))
+    jitter = random.uniform(0, delay * 0.25)
+    sleep_for = delay + jitter
+    time.sleep(sleep_for)
+    return sleep_for
+
+
 def run():
     profile = strategy_profiles.PROFILES.get(config.STRATEGY_PROFILE)
     if profile is None:
@@ -190,9 +207,13 @@ def run():
     # --- Telemetry (hourly) ---
     telemetry = TelemetryTracker(config.STRATEGY_PROFILE, profile.timeframe_min)
 
-    stream = market.make_stream()
-
     async def on_bar(bar):
+        nonlocal reconnect_attempt
+
+        if reconnect_attempt > 0:
+            print(f"Websocket stabilized after reconnect attempt {reconnect_attempt}; resetting backoff.")
+            reconnect_attempt = 0
+
         symbol = bar.symbol
         ts = pd.to_datetime(bar.timestamp, utc=True).to_pydatetime()
         now = datetime.now(timezone.utc)
@@ -342,12 +363,42 @@ def run():
 
         telemetry.maybe_flush(now)
 
-    # Subscribe bars
-    for sym in symbols_to_run:
-        stream.subscribe_bars(on_bar, sym)
+    reconnect_attempt = 0
 
-    print("Trade Scout running...")
-    stream.run()
+    while True:
+        try:
+            stream = market.make_stream()
+
+            for sym in symbols_to_run:
+                stream.subscribe_bars(on_bar, sym)
+
+            if reconnect_attempt == 0:
+                print("Trade Scout running...")
+            else:
+                print(f"Trade Scout reconnecting (attempt {reconnect_attempt})...")
+
+            stream.run()
+
+            # If run() exits without exception treat as disconnect
+            reconnect_attempt += 1
+            delay = websocket_backoff(reconnect_attempt)
+            print(f"Websocket stopped. Reconnecting in {delay:.1f}s...")
+
+        except KeyboardInterrupt:
+            print("Shutting down Trade Scout.")
+            raise
+
+        except Exception as e:
+            reconnect_attempt += 1
+            msg = str(e).lower()
+
+            if "429" in msg or "connection limit exceeded" in msg:
+                print(f"Websocket rate limit / connection cap hit: {e}")
+            else:
+                print(f"Websocket error: {e}")
+
+            delay = websocket_backoff(reconnect_attempt)
+            print(f"Retrying websocket in {delay:.1f}s...")
 
 
 if __name__ == "__main__":
