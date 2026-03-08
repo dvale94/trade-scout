@@ -31,6 +31,7 @@ def existing_csvs() -> dict[str, Path]:
 
 
 def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
+    # 1) trades + 2) trades_enriched
     if "alerts_intents" in csvs and "outcomes" in csvs:
         con.execute("DROP VIEW IF EXISTS trades")
         con.execute(
@@ -50,6 +51,7 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
               i.bar_end_ts_utc,
               i.timeframe_min,
               i.score,
+              i.anchor_symbol,
               i.anchor_regime,
               i.vol_z,
               i.signal_px,
@@ -74,104 +76,198 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
               o.time_to_stop_s,
               o.t1_touched,
               o.t2_touched,
-              o.stop_touched,
-              (o.time_in_trade_s / 60.0) AS time_in_trade_min
+              o.stop_touched
             FROM alerts_intents i
             LEFT JOIN outcomes o USING (alert_id)
             WHERE i.alert_status = 'ALERT_CREATED'
             """
         )
 
-        con.execute("DROP VIEW IF EXISTS edge_report")
+        con.execute("DROP VIEW IF EXISTS trades_enriched")
         con.execute(
             """
-            CREATE VIEW edge_report AS
+            CREATE VIEW trades_enriched AS
             SELECT
-              market_type,
-              strategy_profile,
-              tier,
-              anchor_regime,
-              COUNT(*) AS alerts_created,
-              SUM(CASE WHEN entered THEN 1 ELSE 0 END) AS entered_count,
-              SUM(CASE WHEN pnl_R IS NOT NULL THEN 1 ELSE 0 END) AS closed_count,
-              AVG(CASE WHEN pnl_R IS NOT NULL THEN pnl_R END) AS avg_R,
-              AVG(CASE WHEN pnl_R IS NOT NULL AND pnl_R > 0 THEN pnl_R END) AS avg_win_R,
-              AVG(CASE WHEN pnl_R IS NOT NULL AND pnl_R < 0 THEN pnl_R END) AS avg_loss_R,
-              SUM(CASE WHEN pnl_R IS NOT NULL AND pnl_R > 0 THEN 1 ELSE 0 END)::DOUBLE
-                / NULLIF(SUM(CASE WHEN pnl_R IS NOT NULL THEN 1 ELSE 0 END), 0) AS win_rate,
-              AVG(mfe_R) AS avg_mfe_R,
-              AVG(mae_R) AS avg_mae_R,
-              AVG(time_in_trade_s) AS avg_time_in_trade_s
-            FROM trades
-            GROUP BY 1,2,3,4
-            ORDER BY 1,2,3,4
+              t.*,
+              TRY_CAST(t.signal_ts_utc AS TIMESTAMP) AS signal_ts,
+              CAST(TRY_CAST(t.signal_ts_utc AS TIMESTAMP) AS DATE) AS signal_date,
+              EXTRACT(HOUR FROM TRY_CAST(t.signal_ts_utc AS TIMESTAMP)) AS signal_hour_utc,
+              EXTRACT(DOW FROM TRY_CAST(t.signal_ts_utc AS TIMESTAMP)) AS signal_dow_utc,
+              CASE WHEN t.pnl_R IS NOT NULL THEN TRUE ELSE FALSE END AS closed_trade,
+              CASE WHEN t.pnl_R > 0 THEN TRUE ELSE FALSE END AS winner,
+              CASE WHEN t.pnl_R < 0 THEN TRUE ELSE FALSE END AS loser,
+              CASE WHEN t.exit_reason = 'TIMEOUT' THEN TRUE ELSE FALSE END AS timeout_trade,
+              CASE WHEN t.exit_reason = 'NO_ENTRY_FILL' THEN TRUE ELSE FALSE END AS no_entry_fill,
+              CASE WHEN t.exit_reason = 'STOP' THEN TRUE ELSE FALSE END AS stop_exit,
+              CASE WHEN t.exit_reason = 'T2' THEN TRUE ELSE FALSE END AS t2_exit,
+              CASE
+                WHEN COALESCE(t.t1_touched, FALSE) = TRUE AND COALESCE(t.t2_touched, FALSE) = FALSE
+                  THEN TRUE
+                ELSE FALSE
+              END AS hit_t1_only,
+              CASE
+                WHEN t.entry_high > 0 AND t.stop_px IS NOT NULL
+                  THEN (t.entry_high - t.stop_px) / t.entry_high
+                ELSE NULL
+              END AS risk_pct
+            FROM trades t
             """
         )
 
-    if "alerts_intents" in csvs and "executions" in csvs:
+    # 3) executions_enriched
+    if "executions" in csvs:
         con.execute("DROP VIEW IF EXISTS executions_enriched")
         con.execute(
             """
             CREATE VIEW executions_enriched AS
             SELECT
-              e.exec_id,
-              e.alert_id,
-              i.symbol,
-              i.market_type,
-              i.strategy_profile,
-              i.strategy_version,
-              i.tier,
-              i.anchor_regime,
-              e.side,
-              e.exec_type,
-              e.exec_ts_utc,
-              e.exec_px,
-              e.exec_px_source,
-              e.qty,
-              e.fee_estimate,
-              e.slippage_bps_estimate,
-              e.latency_ms
+              e.*,
+              TRY_CAST(e.exec_ts_utc AS TIMESTAMP) AS exec_ts,
+              CAST(TRY_CAST(e.exec_ts_utc AS TIMESTAMP) AS DATE) AS exec_date,
+              EXTRACT(HOUR FROM TRY_CAST(e.exec_ts_utc AS TIMESTAMP)) AS exec_hour_utc,
+              CASE WHEN e.exec_type = 'ENTRY' THEN TRUE ELSE FALSE END AS is_entry,
+              CASE WHEN e.exec_type <> 'ENTRY' THEN TRUE ELSE FALSE END AS is_exit
             FROM executions e
-            LEFT JOIN alerts_intents i USING (alert_id)
             """
         )
 
+    # 4) strategy_summary (real status values only)
     if "alerts_intents" in csvs:
         con.execute("DROP VIEW IF EXISTS strategy_summary")
         con.execute(
             """
             CREATE VIEW strategy_summary AS
             SELECT
-              market_type,
               strategy_profile,
               tier,
+              COUNT(*) AS intents_total,
               COUNT(*) FILTER (WHERE alert_status = 'ALERT_CREATED') AS alerts_created,
-              AVG(CASE WHEN alert_status = 'ALERT_CREATED' THEN score END) AS avg_score,
-              COUNT(*) FILTER (WHERE alert_status <> 'ALERT_CREATED') AS not_created,
-              COUNT(*) FILTER (WHERE alert_status = 'ALERT_SKIPPED') AS skipped,
-              COUNT(*) FILTER (WHERE alert_status = 'ALERT_ERROR') AS errors
+              COUNT(*) FILTER (WHERE alert_status = 'SKIPPED_COOLDOWN') AS skipped_cooldown,
+              COUNT(*) FILTER (WHERE alert_status = 'SKIPPED_INVALID_STOP') AS skipped_invalid_stop,
+              COUNT(*) FILTER (WHERE alert_status = 'SKIPPED_TIGHT_STOP') AS skipped_tight_stop,
+              COUNT(*) FILTER (WHERE alert_status = 'ERROR_ALERT_PIPELINE') AS pipeline_errors,
+              AVG(score) AS avg_score
             FROM alerts_intents
+            GROUP BY 1,2
+            ORDER BY 1,2
+            """
+        )
+
+    # 5) alert_funnel (intent-stage only; no pre-threshold claims)
+    if "alerts_intents" in csvs and "outcomes" in csvs:
+        con.execute("DROP VIEW IF EXISTS alert_funnel")
+        con.execute(
+            """
+            CREATE VIEW alert_funnel AS
+            WITH intent_rollup AS (
+              SELECT
+                i.strategy_profile,
+                i.tier,
+                COUNT(*) AS total_intent_rows,
+                COUNT(*) FILTER (WHERE i.alert_status = 'ALERT_CREATED') AS alerts_created,
+                COUNT(*) FILTER (WHERE i.alert_status = 'SKIPPED_COOLDOWN') AS skipped_cooldown,
+                COUNT(*) FILTER (WHERE i.alert_status = 'SKIPPED_INVALID_STOP') AS skipped_invalid_stop,
+                COUNT(*) FILTER (WHERE i.alert_status = 'SKIPPED_TIGHT_STOP') AS skipped_tight_stop,
+                COUNT(*) FILTER (WHERE i.alert_status = 'ERROR_ALERT_PIPELINE') AS pipeline_errors
+              FROM alerts_intents i
+              GROUP BY 1,2
+            ),
+            created_outcomes AS (
+              SELECT
+                i.strategy_profile,
+                i.tier,
+                COUNT(*) FILTER (WHERE COALESCE(o.entered, FALSE)) AS entered_count,
+                COUNT(*) FILTER (WHERE o.pnl_R IS NOT NULL) AS closed_trade_count,
+                COUNT(*) FILTER (WHERE o.exit_reason = 'NO_ENTRY_FILL') AS no_entry_fill_count,
+                COUNT(*) FILTER (WHERE o.exit_reason = 'STOP') AS stop_exit_count,
+                COUNT(*) FILTER (WHERE o.exit_reason = 'TIMEOUT') AS timeout_exit_count,
+                COUNT(*) FILTER (WHERE o.exit_reason = 'T2') AS t2_exit_count
+              FROM alerts_intents i
+              LEFT JOIN outcomes o USING (alert_id)
+              WHERE i.alert_status = 'ALERT_CREATED'
+              GROUP BY 1,2
+            )
+            SELECT
+              ir.strategy_profile,
+              ir.tier,
+              ir.total_intent_rows,
+              ir.alerts_created,
+              ir.skipped_cooldown,
+              ir.skipped_invalid_stop,
+              ir.skipped_tight_stop,
+              ir.pipeline_errors,
+              COALESCE(co.entered_count, 0) AS entered_count,
+              COALESCE(co.closed_trade_count, 0) AS closed_trade_count,
+              COALESCE(co.no_entry_fill_count, 0) AS no_entry_fill_count,
+              COALESCE(co.stop_exit_count, 0) AS stop_exit_count,
+              COALESCE(co.timeout_exit_count, 0) AS timeout_exit_count,
+              COALESCE(co.t2_exit_count, 0) AS t2_exit_count
+            FROM intent_rollup ir
+            LEFT JOIN created_outcomes co
+              ON ir.strategy_profile = co.strategy_profile
+             AND ir.tier = co.tier
+            ORDER BY 1,2
+            """
+        )
+
+    # 6) symbol_regime_summary
+    if "alerts_intents" in csvs and "outcomes" in csvs:
+        con.execute("DROP VIEW IF EXISTS symbol_regime_summary")
+        con.execute(
+            """
+            CREATE VIEW symbol_regime_summary AS
+            SELECT
+              te.symbol,
+              te.anchor_regime,
+              te.tier,
+              COUNT(*) AS trades,
+              SUM(CASE WHEN COALESCE(te.entered, FALSE) THEN 1 ELSE 0 END) AS entered_count,
+              SUM(CASE WHEN te.closed_trade THEN 1 ELSE 0 END) AS closed_trades,
+              SUM(CASE WHEN te.winner THEN 1 ELSE 0 END) AS wins,
+              SUM(CASE WHEN te.loser THEN 1 ELSE 0 END) AS losses,
+              AVG(CASE WHEN te.closed_trade THEN te.pnl_R END) AS avg_pnl_R,
+              MEDIAN(CASE WHEN te.closed_trade THEN te.pnl_R END) AS median_pnl_R,
+              AVG(CASE WHEN te.closed_trade THEN te.pnl_R END) AS expectancy_proxy,
+              SUM(CASE WHEN te.winner THEN 1 ELSE 0 END)::DOUBLE
+                / NULLIF(SUM(CASE WHEN te.closed_trade THEN 1 ELSE 0 END), 0) AS win_rate
+            FROM trades_enriched te
             GROUP BY 1,2,3
             ORDER BY 1,2,3
             """
         )
 
-        con.execute("DROP VIEW IF EXISTS alerts_funnel")
-        con.execute(
-            """
-            CREATE VIEW alerts_funnel AS
-            SELECT
-              market_type,
-              strategy_profile,
-              tier,
-              alert_status,
-              skip_reason,
-              COUNT(*) AS rows_count
-            FROM alerts_intents
-            GROUP BY 1,2,3,4,5
-            ORDER BY 1,2,3,4,5
-            """
-        )
+    # 7) optional telemetry_summary
+    if "telemetry" in csvs:
+        telemetry_cols = {
+            row[1] for row in con.execute("PRAGMA table_info('telemetry')").fetchall()
+        }
+        if "hour_start_utc" in telemetry_cols:
+            ts_col = "hour_start_utc"
+        elif "timestamp_utc" in telemetry_cols:
+            ts_col = "timestamp_utc"
+        else:
+            ts_col = None
+
+        con.execute("DROP VIEW IF EXISTS telemetry_summary")
+        if ts_col:
+            con.execute(
+                f"""
+                CREATE VIEW telemetry_summary AS
+                SELECT
+                  t.*,
+                  TRY_CAST(t.{ts_col} AS TIMESTAMP) AS hour_start_ts,
+                  CAST(TRY_CAST(t.{ts_col} AS TIMESTAMP) AS DATE) AS hour_date_utc,
+                  EXTRACT(HOUR FROM TRY_CAST(t.{ts_col} AS TIMESTAMP)) AS hour_utc
+                FROM telemetry t
+                """
+            )
+        else:
+            con.execute(
+                """
+                CREATE VIEW telemetry_summary AS
+                SELECT * FROM telemetry
+                """
+            )
 
 
 def main() -> None:
@@ -182,7 +278,7 @@ def main() -> None:
     for table, path in csvs.items():
         con.execute(f"DROP TABLE IF EXISTS {table}")
         con.execute(
-            f"CREATE TABLE {table} AS SELECT * FROM read_csv_auto(?, header=True, ignore_errors=True)",
+            "CREATE TABLE " + table + " AS SELECT * FROM read_csv_auto(?, header=True, ignore_errors=True)",
             [str(path)],
         )
 
