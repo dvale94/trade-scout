@@ -17,6 +17,7 @@ from . import notifier
 from . import journal
 from . import watch
 from . import anchors
+from . import scheduler_tasks
 
 
 class Cooldown:
@@ -222,6 +223,9 @@ def run():
 
     # --- Telemetry (hourly) ---
     telemetry = TelemetryTracker(config.STRATEGY_PROFILE, profile.timeframe_min)
+
+    scheduler_tasks.start_scheduler()
+    print("Maintenance scheduler started (UTC): 6h backups, daily snapshot, nightly DuckDB, monthly archive")
 
     async def on_bar(bar):
         nonlocal reconnect_attempt

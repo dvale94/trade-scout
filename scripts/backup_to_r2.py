@@ -4,8 +4,7 @@ import argparse
 import hashlib
 import json
 import os
-from collections import defaultdict
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
