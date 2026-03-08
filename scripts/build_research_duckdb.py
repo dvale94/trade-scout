@@ -161,6 +161,7 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
             CREATE VIEW alert_funnel AS
             WITH intent_rollup AS (
               SELECT
+                i.market_type,
                 i.strategy_profile,
                 i.tier,
                 COUNT(*) AS total_intent_rows,
@@ -170,10 +171,11 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
                 COUNT(*) FILTER (WHERE i.alert_status = 'SKIPPED_TIGHT_STOP') AS skipped_tight_stop,
                 COUNT(*) FILTER (WHERE i.alert_status = 'ERROR_ALERT_PIPELINE') AS pipeline_errors
               FROM alerts_intents i
-              GROUP BY 1,2
+              GROUP BY 1,2,3
             ),
             created_outcomes AS (
               SELECT
+                i.market_type,
                 i.strategy_profile,
                 i.tier,
                 COUNT(*) FILTER (WHERE COALESCE(o.entered, FALSE)) AS entered_count,
@@ -185,9 +187,10 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
               FROM alerts_intents i
               LEFT JOIN outcomes o USING (alert_id)
               WHERE i.alert_status = 'ALERT_CREATED'
-              GROUP BY 1,2
+              GROUP BY 1,2,3
             )
             SELECT
+              ir.market_type,
               ir.strategy_profile,
               ir.tier,
               ir.total_intent_rows,
@@ -204,9 +207,10 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
               COALESCE(co.t2_exit_count, 0) AS t2_exit_count
             FROM intent_rollup ir
             LEFT JOIN created_outcomes co
-              ON ir.strategy_profile = co.strategy_profile
+              ON ir.market_type = co.market_type
+             AND ir.strategy_profile = co.strategy_profile
              AND ir.tier = co.tier
-            ORDER BY 1,2
+            ORDER BY 1,2,3
             """
         )
 
@@ -217,6 +221,7 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
             """
             CREATE VIEW symbol_regime_summary AS
             SELECT
+              te.market_type,
               te.symbol,
               te.anchor_regime,
               te.tier,
@@ -231,8 +236,8 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
               SUM(CASE WHEN te.winner THEN 1 ELSE 0 END)::DOUBLE
                 / NULLIF(SUM(CASE WHEN te.closed_trade THEN 1 ELSE 0 END), 0) AS win_rate
             FROM trades_enriched te
-            GROUP BY 1,2,3
-            ORDER BY 1,2,3
+            GROUP BY 1,2,3,4
+            ORDER BY 1,2,3,4
             """
         )
 

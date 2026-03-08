@@ -173,6 +173,7 @@ def load_strategy_summary_sql(
 
 def load_alert_funnel_sql(
     duckdb_path: str | Path | None = None,
+    market_type: str | None = _DEFAULT_MARKET_TYPE,
     limit: int | None = None,
 ) -> pd.DataFrame:
     return _safe_select(
@@ -180,11 +181,13 @@ def load_alert_funnel_sql(
         duckdb_path=duckdb_path,
         order_by="strategy_profile, tier",
         limit=limit,
+        market_type=market_type,
     )
 
 
 def load_symbol_regime_summary_sql(
     duckdb_path: str | Path | None = None,
+    market_type: str | None = _DEFAULT_MARKET_TYPE,
     limit: int | None = None,
 ) -> pd.DataFrame:
     return _safe_select(
@@ -192,4 +195,5 @@ def load_symbol_regime_summary_sql(
         duckdb_path=duckdb_path,
         order_by="symbol, anchor_regime, tier",
         limit=limit,
+        market_type=market_type,
     )
