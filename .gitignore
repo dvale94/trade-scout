@@ -43,6 +43,9 @@ analytics/
 .idea/
 *.swp
 *.swo
+CODEX.md
+RESEARCH_GUIDE.md
+ARCHITECTURE.md
 
 # ==========================
 # macOS

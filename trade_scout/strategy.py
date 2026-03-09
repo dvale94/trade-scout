@@ -48,6 +48,8 @@ def score_candidate(df: pd.DataFrame, profile: StrategyProfile) -> tuple[float, 
 
     close = float(df["close"].iloc[-1])
     vol = float(df["volume"].iloc[-1])
+    last_high = float(df["high"].iloc[-1])
+    last_low = float(df["low"].iloc[-1])
 
     ma20 = df["close"].rolling(profile.ma_fast).mean()
     ma50 = df["close"].rolling(profile.ma_mid).mean()
@@ -58,6 +60,20 @@ def score_candidate(df: pd.DataFrame, profile: StrategyProfile) -> tuple[float, 
     ma200_last = float(ma200.iloc[-1]) if not np.isnan(ma200.iloc[-1]) else np.nan
 
     atr = compute_atr(df, profile.atr_period)
+
+    def _distance_atr(ref: float | None, px: float, atr_val: float | None) -> float | None:
+        if ref is None or atr_val is None or atr_val <= 0:
+            return None
+        return float((px - ref) / atr_val)
+
+    def _ma_slope_pct(ma_series: pd.Series, lookback: int = 5) -> float | None:
+        if len(ma_series) < lookback + 1:
+            return None
+        now_v = ma_series.iloc[-1]
+        prev_v = ma_series.iloc[-(lookback + 1)]
+        if np.isnan(now_v) or np.isnan(prev_v) or prev_v == 0:
+            return None
+        return float((now_v - prev_v) / prev_v)
 
     # Trend (0–4)
     if not np.isnan(ma50_last) and close > ma50_last:
@@ -121,6 +137,18 @@ def score_candidate(df: pd.DataFrame, profile: StrategyProfile) -> tuple[float, 
     structure_stop = float(df["low"].iloc[-swing_lb:].min()) if len(df) >= swing_lb else float(df["low"].min())
     atr_stop = (close - profile.atr_k * atr) if (atr is not None) else None
 
+    breakout_distance_atr = _distance_atr(breakout_level, close, atr)
+    ma20_distance_atr = _distance_atr(None if np.isnan(ma20_last) else ma20_last, close, atr)
+    ma50_distance_atr = _distance_atr(None if np.isnan(ma50_last) else ma50_last, close, atr)
+    ma200_distance_atr = _distance_atr(None if np.isnan(ma200_last) else ma200_last, close, atr)
+    ma20_slope_pct = _ma_slope_pct(ma20, lookback=5)
+    ma50_slope_pct = _ma_slope_pct(ma50, lookback=5)
+    range_pct = float((last_high - last_low) / close) if close > 0 else None
+    close_location_in_bar = None
+    bar_range = last_high - last_low
+    if bar_range > 0:
+        close_location_in_bar = float((close - last_low) / bar_range)
+
     computed = {
         "close": close,
         "atr": atr,
@@ -133,6 +161,14 @@ def score_candidate(df: pd.DataFrame, profile: StrategyProfile) -> tuple[float, 
         "extended_atr": extended_atr,
         "structure_stop": structure_stop,
         "atr_stop": atr_stop,
+        "breakout_distance_atr": breakout_distance_atr,
+        "ma20_distance_atr": ma20_distance_atr,
+        "ma50_distance_atr": ma50_distance_atr,
+        "ma200_distance_atr": ma200_distance_atr,
+        "ma20_slope_pct": ma20_slope_pct,
+        "ma50_slope_pct": ma50_slope_pct,
+        "range_pct": range_pct,
+        "close_location_in_bar": close_location_in_bar,
     }
     return score, reasons, computed
 
