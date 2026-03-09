@@ -120,6 +120,8 @@ def make_intent_base(
 
         # timestamps
         "signal_ts_utc": now.astimezone(timezone.utc).isoformat(),
+        "signal_hour_utc": int(now.astimezone(timezone.utc).hour),
+        "signal_day_of_week": now.astimezone(timezone.utc).strftime("%a"),
         "bar_start_ts_utc": bar_start.astimezone(timezone.utc).isoformat(),
         "bar_end_ts_utc": bar_end.astimezone(timezone.utc).isoformat(),
         "timeframe_min": timeframe_min,
@@ -142,6 +144,14 @@ def make_intent_base(
         "ma50": computed_for_log.get("ma50"),
         "ma200": computed_for_log.get("ma200"),
         "breakout_level": computed_for_log.get("breakout_level"),
+        "breakout_distance_atr": computed_for_log.get("breakout_distance_atr"),
+        "ma20_distance_atr": computed_for_log.get("ma20_distance_atr"),
+        "ma50_distance_atr": computed_for_log.get("ma50_distance_atr"),
+        "ma200_distance_atr": computed_for_log.get("ma200_distance_atr"),
+        "ma20_slope_pct": computed_for_log.get("ma20_slope_pct"),
+        "ma50_slope_pct": computed_for_log.get("ma50_slope_pct"),
+        "range_pct": computed_for_log.get("range_pct"),
+        "close_location_in_bar": computed_for_log.get("close_location_in_bar"),
         "anchor_symbol": computed_for_log.get("anchor_symbol"),
         "anchor_regime": computed_for_log.get("anchor_regime"),
         "anchor_close": computed_for_log.get("anchor_close"),
@@ -153,6 +163,7 @@ def make_intent_base(
         # planned levels / sizing placeholders (keep alerts_intents schema stable)
         "entry_low": None,
         "entry_high": None,
+        "entry_zone_width_pct": None,
         "stop_px": None,
         "t1_px": None,
         "t2_px": None,
@@ -189,7 +200,7 @@ def run():
     if profile is None:
         raise ValueError(f"Unknown STRATEGY_PROFILE: {config.STRATEGY_PROFILE}")
     
-    strategy_version = "v2_sprint1"
+    strategy_version = "v3_research_step2"
     config_hash = compute_config_hash(profile)
     
     min_needed = max(
@@ -307,6 +318,11 @@ def run():
                 intent_row["alert_id"] = candidate.alert_id
                 intent_row["entry_low"] = round(candidate.entry_low, 6)
                 intent_row["entry_high"] = round(candidate.entry_high, 6)
+                signal_px = intent_row.get("signal_px")
+                if signal_px is not None and signal_px > 0:
+                    intent_row["entry_zone_width_pct"] = round(
+                        (candidate.entry_high - candidate.entry_low) / signal_px, 6
+                    )
                 intent_row["stop_px"] = round(candidate.stop, 6)
                 intent_row["t1_px"] = round(candidate.t1, 6)
                 intent_row["t2_px"] = round(candidate.t2, 6)

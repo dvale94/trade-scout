@@ -33,9 +33,18 @@ def existing_csvs() -> dict[str, Path]:
 def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
     # 1) trades + 2) trades_enriched
     if "alerts_intents" in csvs and "outcomes" in csvs:
+        intent_cols = {
+            row[1] for row in con.execute("PRAGMA table_info('alerts_intents')").fetchall()
+        }
+
+        def intent_expr(col: str, fallback_expr: str = "NULL") -> str:
+            if col in intent_cols:
+                return f"i.{col}"
+            return f"{fallback_expr} AS {col}"
+
         con.execute("DROP VIEW IF EXISTS trades")
         con.execute(
-            """
+            f"""
             CREATE VIEW trades AS
             SELECT
               i.alert_id,
@@ -47,16 +56,36 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
               i.config_hash,
               i.tier,
               i.signal_ts_utc,
+              {intent_expr('signal_hour_utc', "EXTRACT(HOUR FROM TRY_CAST(i.signal_ts_utc AS TIMESTAMP))")},
+              {intent_expr('signal_day_of_week', "STRFTIME(TRY_CAST(i.signal_ts_utc AS TIMESTAMP), '%a')")},
               i.bar_start_ts_utc,
               i.bar_end_ts_utc,
               i.timeframe_min,
               i.score,
+              {intent_expr('atr')},
+              {intent_expr('ma20')},
+              {intent_expr('ma50')},
+              {intent_expr('ma200')},
+              {intent_expr('breakout_level')},
+              {intent_expr('breakout_distance_atr')},
+              {intent_expr('ma20_distance_atr')},
+              {intent_expr('ma50_distance_atr')},
+              {intent_expr('ma200_distance_atr')},
+              {intent_expr('ma20_slope_pct')},
+              {intent_expr('ma50_slope_pct')},
+              {intent_expr('range_pct')},
+              {intent_expr('close_location_in_bar')},
               i.anchor_symbol,
               i.anchor_regime,
+              i.anchor_close,
+              i.anchor_ma50,
+              i.anchor_ma200,
               i.vol_z,
+              i.extended_atr,
               i.signal_px,
               i.entry_low,
               i.entry_high,
+              {intent_expr('entry_zone_width_pct')},
               i.stop_px,
               i.t1_px,
               i.t2_px,
@@ -91,7 +120,6 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
               t.*,
               TRY_CAST(t.signal_ts_utc AS TIMESTAMP) AS signal_ts,
               CAST(TRY_CAST(t.signal_ts_utc AS TIMESTAMP) AS DATE) AS signal_date,
-              EXTRACT(HOUR FROM TRY_CAST(t.signal_ts_utc AS TIMESTAMP)) AS signal_hour_utc,
               EXTRACT(DOW FROM TRY_CAST(t.signal_ts_utc AS TIMESTAMP)) AS signal_dow_utc,
               CASE WHEN t.pnl_R IS NOT NULL THEN TRUE ELSE FALSE END AS closed_trade,
               CASE WHEN t.pnl_R > 0 THEN TRUE ELSE FALSE END AS winner,
