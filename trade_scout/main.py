@@ -180,6 +180,12 @@ def make_intent_base(
     return row
 
 
+def _compute_entry_zone_width_pct(entry_low: float | None, entry_high: float | None) -> float | None:
+    if entry_low is None or entry_high is None or entry_high <= 0:
+        return None
+    return (entry_high - entry_low) / entry_high
+
+
 def websocket_backoff(attempt: int, base: float = 5.0, cap: float = 120.0) -> float:
     """
     Exponential backoff with jitter.
@@ -318,11 +324,9 @@ def run():
                 intent_row["alert_id"] = candidate.alert_id
                 intent_row["entry_low"] = round(candidate.entry_low, 6)
                 intent_row["entry_high"] = round(candidate.entry_high, 6)
-                signal_px = intent_row.get("signal_px")
-                if signal_px is not None and signal_px > 0:
-                    intent_row["entry_zone_width_pct"] = round(
-                        (candidate.entry_high - candidate.entry_low) / signal_px, 6
-                    )
+                entry_zone_width_pct = _compute_entry_zone_width_pct(candidate.entry_low, candidate.entry_high)
+                if entry_zone_width_pct is not None:
+                    intent_row["entry_zone_width_pct"] = round(entry_zone_width_pct, 6)
                 intent_row["stop_px"] = round(candidate.stop, 6)
                 intent_row["t1_px"] = round(candidate.t1, 6)
                 intent_row["t2_px"] = round(candidate.t2, 6)
