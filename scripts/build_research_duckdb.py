@@ -42,6 +42,11 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
                 return f"i.{col}"
             return f"{fallback_expr} AS {col}"
 
+        def intent_numeric_expr(col: str) -> str:
+            if col in intent_cols:
+                return f"TRY_CAST(i.{col} AS DOUBLE) AS {col}"
+            return f"NULL AS {col}"
+
         con.execute("DROP VIEW IF EXISTS trades")
         con.execute(
             f"""
@@ -60,52 +65,52 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
               {intent_expr('signal_day_of_week', "STRFTIME(TRY_CAST(i.signal_ts_utc AS TIMESTAMP), '%a')")},
               i.bar_start_ts_utc,
               i.bar_end_ts_utc,
-              i.timeframe_min,
-              i.score,
-              {intent_expr('atr')},
-              {intent_expr('ma20')},
-              {intent_expr('ma50')},
-              {intent_expr('ma200')},
-              {intent_expr('breakout_level')},
-              {intent_expr('breakout_distance_atr')},
-              {intent_expr('ma20_distance_atr')},
-              {intent_expr('ma50_distance_atr')},
-              {intent_expr('ma200_distance_atr')},
-              {intent_expr('ma20_slope_pct')},
-              {intent_expr('ma50_slope_pct')},
-              {intent_expr('range_pct')},
-              {intent_expr('close_location_in_bar')},
+              TRY_CAST(i.timeframe_min AS INTEGER) AS timeframe_min,
+              TRY_CAST(i.score AS DOUBLE) AS score,
+              {intent_numeric_expr('atr')},
+              {intent_numeric_expr('ma20')},
+              {intent_numeric_expr('ma50')},
+              {intent_numeric_expr('ma200')},
+              {intent_numeric_expr('breakout_level')},
+              {intent_numeric_expr('breakout_distance_atr')},
+              {intent_numeric_expr('ma20_distance_atr')},
+              {intent_numeric_expr('ma50_distance_atr')},
+              {intent_numeric_expr('ma200_distance_atr')},
+              {intent_numeric_expr('ma20_slope_pct')},
+              {intent_numeric_expr('ma50_slope_pct')},
+              {intent_numeric_expr('range_pct')},
+              {intent_numeric_expr('close_location_in_bar')},
               i.anchor_symbol,
               i.anchor_regime,
-              i.anchor_close,
-              i.anchor_ma50,
-              i.anchor_ma200,
-              i.vol_z,
-              i.extended_atr,
-              i.signal_px,
-              i.entry_low,
-              i.entry_high,
-              {intent_expr('entry_zone_width_pct')},
-              i.stop_px,
-              i.t1_px,
-              i.t2_px,
+              TRY_CAST(i.anchor_close AS DOUBLE) AS anchor_close,
+              TRY_CAST(i.anchor_ma50 AS DOUBLE) AS anchor_ma50,
+              TRY_CAST(i.anchor_ma200 AS DOUBLE) AS anchor_ma200,
+              TRY_CAST(i.vol_z AS DOUBLE) AS vol_z,
+              TRY_CAST(i.extended_atr AS DOUBLE) AS extended_atr,
+              TRY_CAST(i.signal_px AS DOUBLE) AS signal_px,
+              TRY_CAST(i.entry_low AS DOUBLE) AS entry_low,
+              TRY_CAST(i.entry_high AS DOUBLE) AS entry_high,
+              {intent_numeric_expr('entry_zone_width_pct')},
+              TRY_CAST(i.stop_px AS DOUBLE) AS stop_px,
+              TRY_CAST(i.t1_px AS DOUBLE) AS t1_px,
+              TRY_CAST(i.t2_px AS DOUBLE) AS t2_px,
               i.alert_status,
-              o.entered,
+              TRY_CAST(o.entered AS BOOLEAN) AS entered,
               o.entry_ts_utc,
-              o.entry_px,
+              TRY_CAST(o.entry_px AS DOUBLE) AS entry_px,
               o.exit_ts_utc,
-              o.exit_px,
+              TRY_CAST(o.exit_px AS DOUBLE) AS exit_px,
               o.exit_reason,
-              o.pnl_R,
-              o.mfe_R,
-              o.mae_R,
-              o.time_in_trade_s,
-              o.time_to_t1_s,
-              o.time_to_t2_s,
-              o.time_to_stop_s,
-              o.t1_touched,
-              o.t2_touched,
-              o.stop_touched
+              TRY_CAST(o.pnl_R AS DOUBLE) AS pnl_R,
+              TRY_CAST(o.mfe_R AS DOUBLE) AS mfe_R,
+              TRY_CAST(o.mae_R AS DOUBLE) AS mae_R,
+              TRY_CAST(o.time_in_trade_s AS DOUBLE) AS time_in_trade_s,
+              TRY_CAST(o.time_to_t1_s AS DOUBLE) AS time_to_t1_s,
+              TRY_CAST(o.time_to_t2_s AS DOUBLE) AS time_to_t2_s,
+              TRY_CAST(o.time_to_stop_s AS DOUBLE) AS time_to_stop_s,
+              TRY_CAST(o.t1_touched AS BOOLEAN) AS t1_touched,
+              TRY_CAST(o.t2_touched AS BOOLEAN) AS t2_touched,
+              TRY_CAST(o.stop_touched AS BOOLEAN) AS stop_touched
             FROM alerts_intents i
             LEFT JOIN outcomes o USING (alert_id)
             WHERE i.alert_status = 'ALERT_CREATED'
@@ -174,7 +179,7 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
               COUNT(*) FILTER (WHERE alert_status = 'SKIPPED_INVALID_STOP') AS skipped_invalid_stop,
               COUNT(*) FILTER (WHERE alert_status = 'SKIPPED_TIGHT_STOP') AS skipped_tight_stop,
               COUNT(*) FILTER (WHERE alert_status = 'ERROR_ALERT_PIPELINE') AS pipeline_errors,
-              AVG(score) AS avg_score
+              AVG(TRY_CAST(score AS DOUBLE)) AS avg_score
             FROM alerts_intents
             GROUP BY 1,2
             ORDER BY 1,2
