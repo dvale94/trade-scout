@@ -1,8 +1,9 @@
 import csv
 import os
 import json
-from datetime import timezone
+from datetime import datetime, timezone
 from typing import Any
+from pathlib import Path
 
 from . import config
 from .strategy import Candidate
@@ -44,6 +45,7 @@ ALERT_INTENT_FIELDS = [
     "ma50_slope_pct",
     "range_pct",
     "close_location_in_bar",
+    "entry_zone_width_pct",
     "anchor_symbol",
     "anchor_regime",
     "anchor_close",
@@ -53,7 +55,6 @@ ALERT_INTENT_FIELDS = [
     "extended_atr",
     "entry_low",
     "entry_high",
-    "entry_zone_width_pct",
     "stop_px",
     "t1_px",
     "t2_px",
@@ -108,13 +109,51 @@ def _write_row(path: str, row: dict[str, Any]):
 
 
 def _write_row_with_schema(path: str, row: dict[str, Any], fieldnames: list[str]):
-    file_exists = os.path.isfile(path)
-    normalized = {k: row.get(k) for k in fieldnames}
+    normalized = _normalize_row_for_schema(row, fieldnames, path)
+    _ensure_csv_schema(path, fieldnames)
     with open(path, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        if not file_exists:
-            writer.writeheader()
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writerow(normalized)
+
+
+def _normalize_row_for_schema(row: dict[str, Any], fieldnames: list[str], path: str) -> dict[str, Any]:
+    field_set = set(fieldnames)
+    extras = sorted([k for k in row.keys() if k not in field_set])
+    if extras:
+        # Never silently spill schema drift into CSV columns.
+        print(f"[JOURNAL] dropping unexpected fields for {path}: {extras}")
+    return {k: row.get(k, "") for k in fieldnames}
+
+
+def _read_csv_header(path: str) -> list[str] | None:
+    if not os.path.isfile(path) or os.path.getsize(path) == 0:
+        return None
+    with open(path, "r", newline="") as f:
+        reader = csv.reader(f)
+        return next(reader, None)
+
+
+def _rotate_file(path: str, reason: str) -> Path:
+    src = Path(path)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    rotated = src.with_name(f"{src.stem}.{reason}.{ts}{src.suffix}.bak")
+    src.replace(rotated)
+    return rotated
+
+
+def _ensure_csv_schema(path: str, fieldnames: list[str]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    header = _read_csv_header(path)
+    if header == fieldnames:
+        return
+
+    if header is not None:
+        rotated = _rotate_file(path, "schema_mismatch")
+        print(f"[JOURNAL] schema mismatch for {path}; rotated old file to {rotated}")
+
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
 
 
 def log_alert(candidate: Candidate, computed: dict, tier: str, strategy_profile: str):
