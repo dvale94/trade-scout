@@ -15,6 +15,7 @@ MARKET_TYPE = os.getenv("MARKET_TYPE", "crypto").strip().lower()
 CSV_MAP = {
     f"{MARKET_TYPE}_alerts.csv": "alerts",
     f"{MARKET_TYPE}_alerts_intents.csv": "alerts_intents",
+    f"{MARKET_TYPE}_alert_context.csv": "alert_context_raw",
     f"{MARKET_TYPE}_executions.csv": "executions",
     f"{MARKET_TYPE}_outcomes.csv": "outcomes",
     f"{MARKET_TYPE}_telemetry.csv": "telemetry",
@@ -73,13 +74,54 @@ def raw_count_expr(table: str, cols: set[str], col: str) -> str:
     return f"0 AS {col}_non_null_rows"
 
 
+def safe_row_count(con: duckdb.DuckDBPyConnection, table_or_view: str) -> int | None:
+    try:
+        return int(con.execute(f"SELECT COUNT(*) FROM {table_or_view}").fetchone()[0])
+    except duckdb.Error:
+        return None
+
+
+def print_build_summary(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
+    raw_tables = list(csvs.keys())
+    alert_context_exists = "yes" if safe_row_count(con, "alert_context") is not None else "no"
+
+    print(f"[DUCKDB] raw_tables_loaded={', '.join(raw_tables) if raw_tables else 'none'}")
+    for table in raw_tables:
+        row_count = safe_row_count(con, table)
+        row_count_label = row_count if row_count is not None else "missing"
+        print(f"[DUCKDB] raw.{table} rows={row_count_label}")
+
+    print(f"[DUCKDB] view.alert_context exists={alert_context_exists}")
+
+    for view_name in [
+        "trades",
+        "trades_enriched",
+        "executions_enriched",
+        "strategy_summary",
+        "alert_funnel",
+        "schema_coverage_summary",
+    ]:
+        row_count = safe_row_count(con, view_name)
+        if row_count is not None:
+            print(f"[DUCKDB] view.{view_name} rows={row_count}")
+
+
 def create_schema_coverage_summary(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
     con.execute("DROP VIEW IF EXISTS schema_coverage_summary")
 
     select_statements: list[str] = []
 
-    for source_name in ["alerts", "alerts_intents", "executions", "outcomes", "telemetry"]:
-        if source_name not in csvs:
+    source_specs = [
+        ("alerts", "alerts"),
+        ("alerts_intents", "alerts_intents"),
+        ("alert_context", "alert_context_raw"),
+        ("executions", "executions"),
+        ("outcomes", "outcomes"),
+        ("telemetry", "telemetry"),
+    ]
+
+    for source_name, raw_table in source_specs:
+        if raw_table not in csvs:
             select_statements.append(
                 f"""
                 SELECT
@@ -104,7 +146,7 @@ def create_schema_coverage_summary(con: duckdb.DuckDBPyConnection, csvs: dict[st
             )
             continue
 
-        cols = table_columns(con, source_name)
+        cols = table_columns(con, raw_table)
         select_statements.append(
             f"""
             SELECT
@@ -122,10 +164,10 @@ def create_schema_coverage_summary(con: duckdb.DuckDBPyConnection, csvs: dict[st
               {'TRUE' if 'vol_z' in cols else 'FALSE'} AS has_vol_z,
               {raw_count_expr(source_name, cols, 'vol_z')},
               {'TRUE' if 'anchor_regime' in cols else 'FALSE'} AS has_anchor_regime,
-              {raw_count_expr(source_name, cols, 'anchor_regime')},
+              {raw_count_expr(raw_table, cols, 'anchor_regime')},
               {'TRUE' if 'pnl_R' in cols else 'FALSE'} AS has_pnl_R,
-              {raw_count_expr(source_name, cols, 'pnl_R')}
-            FROM {source_name}
+              {raw_count_expr(raw_table, cols, 'pnl_R')}
+            FROM {raw_table}
             """
         )
 
@@ -133,6 +175,50 @@ def create_schema_coverage_summary(con: duckdb.DuckDBPyConnection, csvs: dict[st
 
 
 def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
+    con.execute("DROP VIEW IF EXISTS alert_context")
+    if "alert_context_raw" in csvs:
+        context_cols = table_columns(con, "alert_context_raw")
+        con.execute(
+            f"""
+            CREATE VIEW alert_context AS
+            SELECT
+              {raw_select_expr('', context_cols, 'schema_version')},
+              {raw_select_expr('', context_cols, 'alert_id')},
+              {raw_select_expr('', context_cols, 'market_type')},
+              {raw_select_expr('', context_cols, 'strategy_profile')},
+              {raw_select_expr('', context_cols, 'strategy_version')},
+              {raw_select_expr('', context_cols, 'config_hash')},
+              {raw_select_expr('', context_cols, 'signal_ts_utc')},
+              {raw_int_select_expr('', context_cols, 'signal_hour_utc')},
+              {raw_select_expr('', context_cols, 'signal_day_of_week')},
+              {raw_select_expr('', context_cols, 'bar_start_ts_utc')},
+              {raw_select_expr('', context_cols, 'bar_end_ts_utc')},
+              {raw_numeric_select_expr('', context_cols, 'score')},
+              {raw_numeric_select_expr('', context_cols, 'atr')},
+              {raw_numeric_select_expr('', context_cols, 'ma20')},
+              {raw_numeric_select_expr('', context_cols, 'ma50')},
+              {raw_numeric_select_expr('', context_cols, 'ma200')},
+              {raw_numeric_select_expr('', context_cols, 'breakout_level')},
+              {raw_numeric_select_expr('', context_cols, 'breakout_distance_atr')},
+              {raw_numeric_select_expr('', context_cols, 'ma20_distance_atr')},
+              {raw_numeric_select_expr('', context_cols, 'ma50_distance_atr')},
+              {raw_numeric_select_expr('', context_cols, 'ma200_distance_atr')},
+              {raw_numeric_select_expr('', context_cols, 'ma20_slope_pct')},
+              {raw_numeric_select_expr('', context_cols, 'ma50_slope_pct')},
+              {raw_numeric_select_expr('', context_cols, 'range_pct')},
+              {raw_numeric_select_expr('', context_cols, 'close_location_in_bar')},
+              {raw_numeric_select_expr('', context_cols, 'entry_zone_width_pct')},
+              {raw_select_expr('', context_cols, 'anchor_symbol')},
+              {raw_select_expr('', context_cols, 'anchor_regime')},
+              {raw_numeric_select_expr('', context_cols, 'anchor_close')},
+              {raw_numeric_select_expr('', context_cols, 'anchor_ma50')},
+              {raw_numeric_select_expr('', context_cols, 'anchor_ma200')},
+              {raw_numeric_select_expr('', context_cols, 'vol_z')},
+              {raw_numeric_select_expr('', context_cols, 'extended_atr')}
+            FROM alert_context_raw
+            """
+        )
+
     # 1) trades + 2) trades_enriched
     if "alerts_intents" in csvs and "outcomes" in csvs:
         intent_cols = table_columns(con, "alerts_intents")
@@ -209,11 +295,68 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
         )
 
         con.execute("DROP VIEW IF EXISTS trades_enriched")
-        con.execute(
-            """
-            CREATE VIEW trades_enriched AS
-            SELECT
-              t.*,
+        if "alert_context_raw" in csvs:
+            context_cols = table_columns(con, "alert_context")
+            con.execute(
+                f"""
+                CREATE VIEW trades_enriched AS
+                SELECT
+                  t.*,
+                  {raw_value_expr('c', context_cols, 'schema_version')} AS alert_context_schema_version,
+                  {raw_numeric_value_expr('c', context_cols, 'score')} AS context_score,
+                  TRY_CAST({raw_value_expr('c', context_cols, 'signal_hour_utc')} AS INTEGER) AS context_signal_hour_utc,
+                  {raw_value_expr('c', context_cols, 'signal_day_of_week')} AS context_signal_day_of_week,
+                  {raw_numeric_value_expr('c', context_cols, 'atr')} AS context_atr,
+                  {raw_numeric_value_expr('c', context_cols, 'ma20')} AS context_ma20,
+                  {raw_numeric_value_expr('c', context_cols, 'ma50')} AS context_ma50,
+                  {raw_numeric_value_expr('c', context_cols, 'ma200')} AS context_ma200,
+                  {raw_numeric_value_expr('c', context_cols, 'breakout_level')} AS context_breakout_level,
+                  {raw_numeric_value_expr('c', context_cols, 'breakout_distance_atr')} AS context_breakout_distance_atr,
+                  {raw_numeric_value_expr('c', context_cols, 'ma20_distance_atr')} AS context_ma20_distance_atr,
+                  {raw_numeric_value_expr('c', context_cols, 'ma50_distance_atr')} AS context_ma50_distance_atr,
+                  {raw_numeric_value_expr('c', context_cols, 'ma200_distance_atr')} AS context_ma200_distance_atr,
+                  {raw_numeric_value_expr('c', context_cols, 'ma20_slope_pct')} AS context_ma20_slope_pct,
+                  {raw_numeric_value_expr('c', context_cols, 'ma50_slope_pct')} AS context_ma50_slope_pct,
+                  {raw_numeric_value_expr('c', context_cols, 'range_pct')} AS context_range_pct,
+                  {raw_numeric_value_expr('c', context_cols, 'close_location_in_bar')} AS context_close_location_in_bar,
+                  {raw_numeric_value_expr('c', context_cols, 'entry_zone_width_pct')} AS context_entry_zone_width_pct,
+                  {raw_value_expr('c', context_cols, 'anchor_symbol')} AS context_anchor_symbol,
+                  {raw_value_expr('c', context_cols, 'anchor_regime')} AS context_anchor_regime,
+                  {raw_numeric_value_expr('c', context_cols, 'anchor_close')} AS context_anchor_close,
+                  {raw_numeric_value_expr('c', context_cols, 'anchor_ma50')} AS context_anchor_ma50,
+                  {raw_numeric_value_expr('c', context_cols, 'anchor_ma200')} AS context_anchor_ma200,
+                  {raw_numeric_value_expr('c', context_cols, 'vol_z')} AS context_vol_z,
+                  {raw_numeric_value_expr('c', context_cols, 'extended_atr')} AS context_extended_atr,
+                  TRY_CAST(t.signal_ts_utc AS TIMESTAMP) AS signal_ts,
+                  CAST(TRY_CAST(t.signal_ts_utc AS TIMESTAMP) AS DATE) AS signal_date,
+                  EXTRACT(DOW FROM TRY_CAST(t.signal_ts_utc AS TIMESTAMP)) AS signal_dow_utc,
+                  CASE WHEN t.pnl_R IS NOT NULL THEN TRUE ELSE FALSE END AS closed_trade,
+                  CASE WHEN t.pnl_R > 0 THEN TRUE ELSE FALSE END AS winner,
+                  CASE WHEN t.pnl_R < 0 THEN TRUE ELSE FALSE END AS loser,
+                  CASE WHEN t.exit_reason = 'TIMEOUT' THEN TRUE ELSE FALSE END AS timeout_trade,
+                  CASE WHEN t.exit_reason = 'NO_ENTRY_FILL' THEN TRUE ELSE FALSE END AS no_entry_fill,
+                  CASE WHEN t.exit_reason = 'STOP' THEN TRUE ELSE FALSE END AS stop_exit,
+                  CASE WHEN t.exit_reason = 'T2' THEN TRUE ELSE FALSE END AS t2_exit,
+                  CASE
+                    WHEN COALESCE(t.t1_touched, FALSE) = TRUE AND COALESCE(t.t2_touched, FALSE) = FALSE
+                      THEN TRUE
+                    ELSE FALSE
+                  END AS hit_t1_only,
+                  CASE
+                    WHEN t.entry_high > 0 AND t.stop_px IS NOT NULL
+                      THEN (t.entry_high - t.stop_px) / t.entry_high
+                    ELSE NULL
+                  END AS risk_pct
+                FROM trades t
+                LEFT JOIN alert_context c USING (alert_id)
+                """
+            )
+        else:
+            con.execute(
+                """
+                CREATE VIEW trades_enriched AS
+                SELECT
+                  t.*,
               TRY_CAST(t.signal_ts_utc AS TIMESTAMP) AS signal_ts,
               CAST(TRY_CAST(t.signal_ts_utc AS TIMESTAMP) AS DATE) AS signal_date,
               EXTRACT(DOW FROM TRY_CAST(t.signal_ts_utc AS TIMESTAMP)) AS signal_dow_utc,
@@ -233,10 +376,10 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
                 WHEN t.entry_high > 0 AND t.stop_px IS NOT NULL
                   THEN (t.entry_high - t.stop_px) / t.entry_high
                 ELSE NULL
-              END AS risk_pct
-            FROM trades t
-            """
-        )
+                  END AS risk_pct
+                FROM trades t
+                """
+            )
 
     # 3) executions_enriched
     if "executions" in csvs:
@@ -407,6 +550,10 @@ def main() -> None:
     DUCKDB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = duckdb.connect(str(DUCKDB_PATH))
 
+    con.execute("DROP VIEW IF EXISTS alert_context")
+    con.execute("DROP TABLE IF EXISTS alert_context")
+    con.execute("DROP TABLE IF EXISTS alert_context_raw")
+
     csvs = existing_csvs()
     for table, path in csvs.items():
         con.execute(f"DROP TABLE IF EXISTS {table}")
@@ -416,6 +563,7 @@ def main() -> None:
         )
 
     create_views(con, csvs)
+    print_build_summary(con, csvs)
 
     con.execute("CHECKPOINT")
     con.close()

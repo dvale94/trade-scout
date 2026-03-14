@@ -69,6 +69,42 @@ ALERT_INTENT_FIELDS = [
     "schema_version",
 ]
 
+ALERT_CONTEXT_FIELDS = [
+    "schema_version",
+    "alert_id",
+    "market_type",
+    "strategy_profile",
+    "strategy_version",
+    "config_hash",
+    "signal_ts_utc",
+    "signal_hour_utc",
+    "signal_day_of_week",
+    "bar_start_ts_utc",
+    "bar_end_ts_utc",
+    "score",
+    "atr",
+    "ma20",
+    "ma50",
+    "ma200",
+    "breakout_level",
+    "breakout_distance_atr",
+    "ma20_distance_atr",
+    "ma50_distance_atr",
+    "ma200_distance_atr",
+    "ma20_slope_pct",
+    "ma50_slope_pct",
+    "range_pct",
+    "close_location_in_bar",
+    "entry_zone_width_pct",
+    "anchor_symbol",
+    "anchor_regime",
+    "anchor_close",
+    "anchor_ma50",
+    "anchor_ma200",
+    "vol_z",
+    "extended_atr",
+]
+
 OUTCOME_FIELDS = [
     "alert_id",
     "symbol",
@@ -163,6 +199,10 @@ def watches_state_path() -> str:
 
 def alerts_intents_path() -> str:
     return _path(f"{config.MARKET_TYPE}_alerts_intents.csv")
+
+
+def alert_context_path(market_type: str) -> str:
+    return _path(f"{market_type}_alert_context.csv")
 
 
 def executions_path() -> str:
@@ -301,6 +341,10 @@ def log_telemetry(row: dict[str, Any]):
 
 def log_alert_intent(row: dict[str, Any]):
     _write_row_with_schema(alerts_intents_path(), row, ALERT_INTENT_FIELDS)
+
+
+def log_alert_context(row: dict[str, Any]):
+    _write_row_with_schema(alert_context_path(config.MARKET_TYPE), row, ALERT_CONTEXT_FIELDS)
 
 
 def log_execution(row: dict[str, Any]):

@@ -180,6 +180,10 @@ def make_intent_base(
     return row
 
 
+def make_alert_context_row(intent_row: dict) -> dict:
+    return {field: intent_row.get(field) for field in journal.ALERT_CONTEXT_FIELDS}
+
+
 def _compute_entry_zone_width_pct(entry_low: float | None, entry_high: float | None) -> float | None:
     if entry_low is None or entry_high is None or entry_high <= 0:
         return None
@@ -305,11 +309,18 @@ def run():
                 strategy_version=strategy_version,
             )
 
+            def log_intent_and_context(row: dict) -> None:
+                journal.log_alert_intent(row)
+                try:
+                    journal.log_alert_context(make_alert_context_row(row))
+                except Exception as context_err:
+                    print(f"ALERT CONTEXT LOG ERROR for {symbol}: {context_err}")
+
             if not cooldown.allowed(symbol, tier, now):
                 telemetry.record_cooldown_blocked(tier)
                 intent_row["alert_status"] = "SKIPPED_COOLDOWN"
                 intent_row["skip_reason"] = "COOLDOWN"
-                journal.log_alert_intent(intent_row)
+                log_intent_and_context(intent_row)
                 return
 
             try:
@@ -318,7 +329,7 @@ def run():
                     intent_row["alert_status"] = "SKIPPED_INVALID_STOP"
                     intent_row["skip_reason"] = "CANDIDATE_NONE"
                     intent_row["reasons"] = " | ".join(reasons) if reasons else None
-                    journal.log_alert_intent(intent_row)
+                    log_intent_and_context(intent_row)
                     return
 
                 intent_row["alert_id"] = candidate.alert_id
@@ -344,7 +355,7 @@ def run():
                     intent_row["alert_status"] = "SKIPPED_TIGHT_STOP"
                     intent_row["skip_reason"] = "TIGHT_STOP"
                     intent_row["reasons"] = " | ".join(candidate.reasons) if candidate.reasons else None
-                    journal.log_alert_intent(intent_row)
+                    log_intent_and_context(intent_row)
                     return
 
                 journal.log_alert(candidate, computed_for_log, tier, config.STRATEGY_PROFILE)
@@ -353,7 +364,7 @@ def run():
 
                 intent_row["alert_status"] = "ALERT_CREATED"
                 intent_row["reasons"] = " | ".join(candidate.reasons) if candidate.reasons else None
-                journal.log_alert_intent(intent_row)
+                log_intent_and_context(intent_row)
 
                 watch_mgr.add(watch.Watch(
                     alert_id=candidate.alert_id,
@@ -383,7 +394,7 @@ def run():
                 print(f"ALERT ERROR for {symbol}: {e}")
                 intent_row["alert_status"] = "ERROR_ALERT_PIPELINE"
                 intent_row["error_message"] = str(e)
-                journal.log_alert_intent(intent_row)
+                log_intent_and_context(intent_row)
 
         finally:
             telemetry.maybe_flush(datetime.now(timezone.utc))

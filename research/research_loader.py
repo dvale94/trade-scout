@@ -172,6 +172,20 @@ def load_alerts_intents_sql(
     )
 
 
+def load_alert_context_sql(
+    duckdb_path: str | Path | None = None,
+    market_type: str | None = _DEFAULT_MARKET_TYPE,
+    limit: int | None = None,
+) -> pd.DataFrame:
+    return _safe_select(
+        table_or_view="alert_context",
+        duckdb_path=duckdb_path,
+        order_by="signal_ts_utc DESC NULLS LAST",
+        limit=limit,
+        market_type=market_type,
+    )
+
+
 def load_strategy_summary_sql(
     duckdb_path: str | Path | None = None,
     limit: int | None = None,
