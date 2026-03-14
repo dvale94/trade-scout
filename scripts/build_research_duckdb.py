@@ -13,6 +13,7 @@ DUCKDB_PATH = Path(os.getenv("DUCKDB_PATH", LOG_DIR / "research.duckdb"))
 MARKET_TYPE = os.getenv("MARKET_TYPE", "crypto").strip().lower()
 
 CSV_MAP = {
+    # Legacy notification/debug log. Loaded only for compatibility; core research views do not depend on it.
     f"{MARKET_TYPE}_alerts.csv": "alerts",
     f"{MARKET_TYPE}_alerts_intents.csv": "alerts_intents",
     f"{MARKET_TYPE}_alert_context.csv": "alert_context_raw",
@@ -214,15 +215,22 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
               {raw_numeric_select_expr('', context_cols, 'anchor_ma50')},
               {raw_numeric_select_expr('', context_cols, 'anchor_ma200')},
               {raw_numeric_select_expr('', context_cols, 'vol_z')},
-              {raw_numeric_select_expr('', context_cols, 'extended_atr')}
+              {raw_numeric_select_expr('', context_cols, 'extended_atr')},
+              {raw_select_expr('', context_cols, 'market_regime')},
+              {raw_select_expr('', context_cols, 'volatility_regime')},
+              {raw_select_expr('', context_cols, 'anchor_trend_1h')},
+              {raw_select_expr('', context_cols, 'anchor_trend_4h')},
+              {raw_select_expr('', context_cols, 'anchor_trend_1d')},
+              {raw_select_expr('', context_cols, 'score_bucket')}
             FROM alert_context_raw
             """
         )
 
     # 1) trades + 2) trades_enriched
-    if "alerts_intents" in csvs and "outcomes" in csvs:
+    if "alerts_intents" in csvs:
         intent_cols = table_columns(con, "alerts_intents")
-        outcome_cols = table_columns(con, "outcomes")
+        outcome_cols = table_columns(con, "outcomes") if "outcomes" in csvs else set()
+        outcome_join = "LEFT JOIN outcomes o USING (alert_id)" if "outcomes" in csvs else ""
 
         con.execute("DROP VIEW IF EXISTS trades")
         con.execute(
@@ -266,8 +274,14 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
               {raw_numeric_select_expr('o', outcome_cols, 'exit_px')},
               {raw_select_expr('o', outcome_cols, 'exit_reason')},
               {raw_numeric_select_expr('o', outcome_cols, 'pnl_R')},
+              {raw_select_expr('o', outcome_cols, 'first_touch')},
+              {raw_select_expr('o', outcome_cols, 'first_touch_ts_utc')},
               {raw_numeric_select_expr('o', outcome_cols, 'mfe_R')},
               {raw_numeric_select_expr('o', outcome_cols, 'mae_R')},
+              {raw_numeric_select_expr('o', outcome_cols, 'mfe_r')},
+              {raw_numeric_select_expr('o', outcome_cols, 'mae_r')},
+              {raw_numeric_select_expr('o', outcome_cols, 'mfe_px')},
+              {raw_numeric_select_expr('o', outcome_cols, 'mae_px')},
               {raw_numeric_select_expr('o', outcome_cols, 'time_in_trade_s')},
               {raw_numeric_select_expr('o', outcome_cols, 'time_to_t1_s')},
               {raw_numeric_select_expr('o', outcome_cols, 'time_to_t2_s')},
@@ -276,7 +290,7 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
               {raw_boolean_select_expr('o', outcome_cols, 't2_touched')},
               {raw_boolean_select_expr('o', outcome_cols, 'stop_touched')}
             FROM alerts_intents i
-            LEFT JOIN outcomes o USING (alert_id)
+            {outcome_join}
             WHERE COALESCE({raw_value_expr('i', intent_cols, 'alert_status')}, '') = 'ALERT_CREATED'
             """
         )
@@ -316,6 +330,12 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
                   {raw_numeric_value_expr('c', context_cols, 'anchor_ma200')} AS anchor_ma200,
                   {raw_numeric_value_expr('c', context_cols, 'vol_z')} AS vol_z,
                   {raw_numeric_value_expr('c', context_cols, 'extended_atr')} AS extended_atr,
+                  {raw_value_expr('c', context_cols, 'market_regime')} AS market_regime,
+                  {raw_value_expr('c', context_cols, 'volatility_regime')} AS volatility_regime,
+                  {raw_value_expr('c', context_cols, 'anchor_trend_1h')} AS anchor_trend_1h,
+                  {raw_value_expr('c', context_cols, 'anchor_trend_4h')} AS anchor_trend_4h,
+                  {raw_value_expr('c', context_cols, 'anchor_trend_1d')} AS anchor_trend_1d,
+                  {raw_value_expr('c', context_cols, 'score_bucket')} AS score_bucket,
                   TRY_CAST(t.signal_ts_utc AS TIMESTAMP) AS signal_ts,
                   CAST(TRY_CAST(t.signal_ts_utc AS TIMESTAMP) AS DATE) AS signal_date,
                   EXTRACT(DOW FROM TRY_CAST(t.signal_ts_utc AS TIMESTAMP)) AS signal_dow_utc,
@@ -373,6 +393,12 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
                   NULL AS anchor_ma200,
                   NULL AS vol_z,
                   NULL AS extended_atr,
+                  NULL AS market_regime,
+                  NULL AS volatility_regime,
+                  NULL AS anchor_trend_1h,
+                  NULL AS anchor_trend_4h,
+                  NULL AS anchor_trend_1d,
+                  NULL AS score_bucket,
               TRY_CAST(t.signal_ts_utc AS TIMESTAMP) AS signal_ts,
               CAST(TRY_CAST(t.signal_ts_utc AS TIMESTAMP) AS DATE) AS signal_date,
               EXTRACT(DOW FROM TRY_CAST(t.signal_ts_utc AS TIMESTAMP)) AS signal_dow_utc,
@@ -409,6 +435,9 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
               TRY_CAST({raw_value_expr('e', execution_cols, 'exec_ts_utc')} AS TIMESTAMP) AS exec_ts,
               CAST(TRY_CAST({raw_value_expr('e', execution_cols, 'exec_ts_utc')} AS TIMESTAMP) AS DATE) AS exec_date,
               EXTRACT(HOUR FROM TRY_CAST({raw_value_expr('e', execution_cols, 'exec_ts_utc')} AS TIMESTAMP)) AS exec_hour_utc,
+              {raw_numeric_select_expr('e', execution_cols, 'entry_fill_px')},
+              {raw_select_expr('e', execution_cols, 'entry_fill_ts_utc')},
+              {raw_numeric_select_expr('e', execution_cols, 'slippage_pct')},
               CASE WHEN COALESCE({raw_value_expr('e', execution_cols, 'exec_type')}, '') = 'ENTRY' THEN TRUE ELSE FALSE END AS is_entry,
               CASE WHEN COALESCE({raw_value_expr('e', execution_cols, 'exec_type')}, '') <> 'ENTRY' THEN TRUE ELSE FALSE END AS is_exit
             FROM executions e
@@ -462,70 +491,96 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
             )
 
     # 5) alert_funnel (intent-stage only; no pre-threshold claims)
-    if "alerts_intents" in csvs and "outcomes" in csvs:
+    if "alerts_intents" in csvs:
         intent_cols = table_columns(con, "alerts_intents")
-        outcome_cols = table_columns(con, "outcomes")
         con.execute("DROP VIEW IF EXISTS alert_funnel")
-        con.execute(
-            f"""
-            CREATE VIEW alert_funnel AS
-            WITH intent_rollup AS (
-              SELECT
-                {raw_select_expr('i', intent_cols, 'market_type')},
-                {raw_select_expr('i', intent_cols, 'strategy_profile')},
-                {raw_select_expr('i', intent_cols, 'tier')},
-                COUNT(*) AS total_intent_rows,
-                COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('i', intent_cols, 'alert_status')}, '') = 'ALERT_CREATED') AS alerts_created,
-                COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('i', intent_cols, 'alert_status')}, '') = 'SKIPPED_COOLDOWN') AS skipped_cooldown,
-                COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('i', intent_cols, 'alert_status')}, '') = 'SKIPPED_INVALID_STOP') AS skipped_invalid_stop,
-                COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('i', intent_cols, 'alert_status')}, '') = 'SKIPPED_TIGHT_STOP') AS skipped_tight_stop,
-                COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('i', intent_cols, 'alert_status')}, '') = 'ERROR_ALERT_PIPELINE') AS pipeline_errors
-              FROM alerts_intents i
-              GROUP BY 1,2,3
-            ),
-            created_outcomes AS (
-              SELECT
-                {raw_select_expr('i', intent_cols, 'market_type')},
-                {raw_select_expr('i', intent_cols, 'strategy_profile')},
-                {raw_select_expr('i', intent_cols, 'tier')},
-                COUNT(*) FILTER (WHERE COALESCE({raw_boolean_value_expr('o', outcome_cols, 'entered')}, FALSE)) AS entered_count,
-                COUNT(*) FILTER (WHERE {raw_numeric_value_expr('o', outcome_cols, 'pnl_R')} IS NOT NULL) AS closed_trade_count,
-                COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('o', outcome_cols, 'exit_reason')}, '') = 'NO_ENTRY_FILL') AS no_entry_fill_count,
-                COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('o', outcome_cols, 'exit_reason')}, '') = 'STOP') AS stop_exit_count,
-                COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('o', outcome_cols, 'exit_reason')}, '') = 'TIMEOUT') AS timeout_exit_count,
-                COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('o', outcome_cols, 'exit_reason')}, '') = 'T2') AS t2_exit_count
-              FROM alerts_intents i
-              LEFT JOIN outcomes o USING (alert_id)
-              WHERE COALESCE({raw_value_expr('i', intent_cols, 'alert_status')}, '') = 'ALERT_CREATED'
-              GROUP BY 1,2,3
+        if "outcomes" in csvs:
+            outcome_cols = table_columns(con, "outcomes")
+            con.execute(
+                f"""
+                CREATE VIEW alert_funnel AS
+                WITH intent_rollup AS (
+                  SELECT
+                    {raw_select_expr('i', intent_cols, 'market_type')},
+                    {raw_select_expr('i', intent_cols, 'strategy_profile')},
+                    {raw_select_expr('i', intent_cols, 'tier')},
+                    COUNT(*) AS total_intent_rows,
+                    COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('i', intent_cols, 'alert_status')}, '') = 'ALERT_CREATED') AS alerts_created,
+                    COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('i', intent_cols, 'alert_status')}, '') = 'SKIPPED_COOLDOWN') AS skipped_cooldown,
+                    COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('i', intent_cols, 'alert_status')}, '') = 'SKIPPED_INVALID_STOP') AS skipped_invalid_stop,
+                    COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('i', intent_cols, 'alert_status')}, '') = 'SKIPPED_TIGHT_STOP') AS skipped_tight_stop,
+                    COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('i', intent_cols, 'alert_status')}, '') = 'ERROR_ALERT_PIPELINE') AS pipeline_errors
+                  FROM alerts_intents i
+                  GROUP BY 1,2,3
+                ),
+                created_outcomes AS (
+                  SELECT
+                    {raw_select_expr('i', intent_cols, 'market_type')},
+                    {raw_select_expr('i', intent_cols, 'strategy_profile')},
+                    {raw_select_expr('i', intent_cols, 'tier')},
+                    COUNT(*) FILTER (WHERE COALESCE({raw_boolean_value_expr('o', outcome_cols, 'entered')}, FALSE)) AS entered_count,
+                    COUNT(*) FILTER (WHERE {raw_numeric_value_expr('o', outcome_cols, 'pnl_R')} IS NOT NULL) AS closed_trade_count,
+                    COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('o', outcome_cols, 'exit_reason')}, '') = 'NO_ENTRY_FILL') AS no_entry_fill_count,
+                    COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('o', outcome_cols, 'exit_reason')}, '') = 'STOP') AS stop_exit_count,
+                    COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('o', outcome_cols, 'exit_reason')}, '') = 'TIMEOUT') AS timeout_exit_count,
+                    COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('o', outcome_cols, 'exit_reason')}, '') = 'T2') AS t2_exit_count
+                  FROM alerts_intents i
+                  LEFT JOIN outcomes o USING (alert_id)
+                  WHERE COALESCE({raw_value_expr('i', intent_cols, 'alert_status')}, '') = 'ALERT_CREATED'
+                  GROUP BY 1,2,3
+                )
+                SELECT
+                  ir.market_type,
+                  ir.strategy_profile,
+                  ir.tier,
+                  ir.total_intent_rows,
+                  ir.alerts_created,
+                  ir.skipped_cooldown,
+                  ir.skipped_invalid_stop,
+                  ir.skipped_tight_stop,
+                  ir.pipeline_errors,
+                  COALESCE(co.entered_count, 0) AS entered_count,
+                  COALESCE(co.closed_trade_count, 0) AS closed_trade_count,
+                  COALESCE(co.no_entry_fill_count, 0) AS no_entry_fill_count,
+                  COALESCE(co.stop_exit_count, 0) AS stop_exit_count,
+                  COALESCE(co.timeout_exit_count, 0) AS timeout_exit_count,
+                  COALESCE(co.t2_exit_count, 0) AS t2_exit_count
+                FROM intent_rollup ir
+                LEFT JOIN created_outcomes co
+                  ON ir.market_type = co.market_type
+                 AND ir.strategy_profile = co.strategy_profile
+                 AND ir.tier = co.tier
+                ORDER BY 1,2,3
+                """
             )
-            SELECT
-              ir.market_type,
-              ir.strategy_profile,
-              ir.tier,
-              ir.total_intent_rows,
-              ir.alerts_created,
-              ir.skipped_cooldown,
-              ir.skipped_invalid_stop,
-              ir.skipped_tight_stop,
-              ir.pipeline_errors,
-              COALESCE(co.entered_count, 0) AS entered_count,
-              COALESCE(co.closed_trade_count, 0) AS closed_trade_count,
-              COALESCE(co.no_entry_fill_count, 0) AS no_entry_fill_count,
-              COALESCE(co.stop_exit_count, 0) AS stop_exit_count,
-              COALESCE(co.timeout_exit_count, 0) AS timeout_exit_count,
-              COALESCE(co.t2_exit_count, 0) AS t2_exit_count
-            FROM intent_rollup ir
-            LEFT JOIN created_outcomes co
-              ON ir.market_type = co.market_type
-             AND ir.strategy_profile = co.strategy_profile
-             AND ir.tier = co.tier
-            ORDER BY 1,2,3
-            """
-        )
+        else:
+            con.execute(
+                f"""
+                CREATE VIEW alert_funnel AS
+                SELECT
+                  {raw_select_expr('i', intent_cols, 'market_type')},
+                  {raw_select_expr('i', intent_cols, 'strategy_profile')},
+                  {raw_select_expr('i', intent_cols, 'tier')},
+                  COUNT(*) AS total_intent_rows,
+                  COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('i', intent_cols, 'alert_status')}, '') = 'ALERT_CREATED') AS alerts_created,
+                  COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('i', intent_cols, 'alert_status')}, '') = 'SKIPPED_COOLDOWN') AS skipped_cooldown,
+                  COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('i', intent_cols, 'alert_status')}, '') = 'SKIPPED_INVALID_STOP') AS skipped_invalid_stop,
+                  COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('i', intent_cols, 'alert_status')}, '') = 'SKIPPED_TIGHT_STOP') AS skipped_tight_stop,
+                  COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('i', intent_cols, 'alert_status')}, '') = 'ERROR_ALERT_PIPELINE') AS pipeline_errors,
+                  0 AS entered_count,
+                  0 AS closed_trade_count,
+                  0 AS no_entry_fill_count,
+                  0 AS stop_exit_count,
+                  0 AS timeout_exit_count,
+                  0 AS t2_exit_count
+                FROM alerts_intents i
+                GROUP BY 1,2,3
+                ORDER BY 1,2,3
+                """
+            )
 
     # 6) symbol_regime_summary
-    if "alerts_intents" in csvs and "outcomes" in csvs:
+    if "alerts_intents" in csvs:
         con.execute("DROP VIEW IF EXISTS symbol_regime_summary")
         con.execute(
             """

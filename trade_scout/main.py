@@ -154,6 +154,7 @@ def make_alert_context_row(
     strategy_version: str,
 ) -> dict:
     bar_start_ts_utc, bar_end_ts_utc = _signal_window_fields(bar_ts, timeframe_min)
+    anchor_trend_1h, anchor_trend_4h, anchor_trend_1d = _anchor_trend_snapshot(computed_for_log)
     return {
         "alert_id": alert_id,
         "market_type": config.MARKET_TYPE,
@@ -187,6 +188,12 @@ def make_alert_context_row(
         "anchor_ma200": computed_for_log.get("anchor_ma200"),
         "vol_z": computed_for_log.get("vol_z"),
         "extended_atr": computed_for_log.get("extended_atr"),
+        "market_regime": _market_regime(computed_for_log),
+        "volatility_regime": _volatility_regime(computed_for_log),
+        "anchor_trend_1h": anchor_trend_1h,
+        "anchor_trend_4h": anchor_trend_4h,
+        "anchor_trend_1d": anchor_trend_1d,
+        "score_bucket": _score_bucket(score),
     }
 
 
@@ -194,6 +201,62 @@ def _compute_entry_zone_width_pct(entry_low: float | None, entry_high: float | N
     if entry_low is None or entry_high is None or entry_high <= 0:
         return None
     return (entry_high - entry_low) / entry_high
+
+
+def _trend_label(lhs: float | None, rhs: float | None) -> str | None:
+    if lhs is None or rhs is None:
+        return None
+    if lhs > rhs:
+        return "UP"
+    if lhs < rhs:
+        return "DOWN"
+    return "FLAT"
+
+
+def _market_regime(computed_for_log: dict) -> str | None:
+    # Regime stays lightweight: anchor regime plus simple volatility/trend proxies.
+    regime = computed_for_log.get("anchor_regime")
+    return str(regime).upper() if regime is not None else None
+
+
+def _volatility_regime(computed_for_log: dict) -> str | None:
+    vol_z = computed_for_log.get("vol_z")
+    try:
+        vol_z = float(vol_z) if vol_z is not None else None
+    except (TypeError, ValueError):
+        vol_z = None
+
+    if vol_z is None:
+        return None
+    if vol_z >= 1.5:
+        return "HIGH"
+    if vol_z <= -0.5:
+        return "LOW"
+    return "NORMAL"
+
+
+def _anchor_trend_snapshot(computed_for_log: dict) -> tuple[str | None, str | None, str | None]:
+    close = computed_for_log.get("anchor_close")
+    ma50 = computed_for_log.get("anchor_ma50")
+    ma200 = computed_for_log.get("anchor_ma200")
+    return (
+        _trend_label(close, ma50),
+        _trend_label(close, ma200),
+        _trend_label(ma50, ma200),
+    )
+
+
+def _score_bucket(score: float) -> str:
+    # Stable score bands for grouped edge studies.
+    if score < 5.0:
+        return "LT_5"
+    if score < 6.0:
+        return "5_TO_5_9"
+    if score < 7.0:
+        return "6_TO_6_9"
+    if score < 8.0:
+        return "7_TO_7_9"
+    return "8_PLUS"
 
 
 def websocket_backoff(attempt: int, base: float = 5.0, cap: float = 120.0) -> float:

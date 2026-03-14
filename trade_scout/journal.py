@@ -12,6 +12,10 @@ LOG_DIR = config.LOG_DIR
 
 # `alerts_intents` is the frozen core signal/audit schema.
 # `alert_context` is the evolving analytics/context schema.
+# `executions` is the realized fill/execution schema.
+# `outcomes` is the realized lifecycle/result schema.
+# `alerts.csv` is a legacy notification/debug log, not research truth.
+# Authoritative research data comes from alerts_intents + alert_context + executions + outcomes.
 ALERT_INTENT_FIELDS = [
     "alert_id",
     "symbol",
@@ -79,6 +83,12 @@ ALERT_CONTEXT_FIELDS = [
     "anchor_ma200",
     "vol_z",
     "extended_atr",
+    "market_regime",
+    "volatility_regime",
+    "anchor_trend_1h",
+    "anchor_trend_4h",
+    "anchor_trend_1d",
+    "score_bucket",
 ]
 
 OUTCOME_FIELDS = [
@@ -101,8 +111,14 @@ OUTCOME_FIELDS = [
     "t2_ts_utc",
     "stop_touched",
     "stop_ts_utc",
+    "first_touch",
+    "first_touch_ts_utc",
     "mfe_R",
     "mae_R",
+    "mfe_r",
+    "mae_r",
+    "mfe_px",
+    "mae_px",
     "time_in_trade_s",
     "time_to_t1_s",
     "time_to_t2_s",
@@ -122,6 +138,9 @@ EXECUTION_FIELDS = [
     "exec_ts_utc",
     "exec_px",
     "exec_px_source",
+    "entry_fill_px",
+    "entry_fill_ts_utc",
+    "slippage_pct",
     "qty",
     "fee_estimate",
     "slippage_bps_estimate",

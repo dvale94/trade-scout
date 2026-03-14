@@ -13,6 +13,12 @@ def _dt_from_iso(s: str | None) -> datetime | None:
     return datetime.fromisoformat(s) if s else None
 
 
+def _dt_diff_s(a: datetime | None, b: datetime | None) -> int | None:
+    if not a or not b:
+        return None
+    return int((b - a).total_seconds())
+
+
 @dataclass
 class Watch:
     alert_id: str
@@ -143,6 +149,16 @@ class Watch:
         except Exception:
             pass
 
+        entry_fill_px = self.entry_px
+        entry_fill_ts = self.entry_ts
+        if exec_type == "ENTRY":
+            entry_fill_px = float(px)
+            entry_fill_ts = ts
+
+        slippage_pct = None
+        if entry_fill_px is not None and self.entry_high > 0:
+            slippage_pct = ((entry_fill_px - self.entry_high) / self.entry_high) * 100.0
+
         return {
             "exec_id": str(uuid4()),
             "alert_id": self.alert_id,
@@ -152,10 +168,49 @@ class Watch:
             "exec_ts_utc": ts.astimezone(timezone.utc).isoformat(),
             "exec_px": float(px),
             "exec_px_source": px_source,
+            "entry_fill_px": entry_fill_px,
+            "entry_fill_ts_utc": _dt_to_iso(entry_fill_ts),
+            "slippage_pct": round(slippage_pct, 6) if slippage_pct is not None else None,
             "qty": None,  # placeholder for now
             "fee_estimate": None,
             "slippage_bps_estimate": None,
             "latency_ms": latency_ms,
+        }
+
+
+    def _first_touch_info(self) -> tuple[str, str | None]:
+        events: list[tuple[int, str, datetime]] = []
+        if self.stop_ts is not None:
+            events.append((0, "STOP", self.stop_ts))
+        if self.t1_ts is not None:
+            events.append((1, "T1", self.t1_ts))
+        if self.t2_ts is not None:
+            events.append((2, "T2", self.t2_ts))
+        if self.done_reason == "TIMEOUT" and self.done_ts is not None:
+            events.append((3, "TIMEOUT", self.done_ts))
+
+        if not events:
+            return "NONE", None
+
+        _, label, ts = min(events, key=lambda item: (item[2], item[0]))
+        return label, _dt_to_iso(ts)
+
+
+    def _mfe_mae_metrics(self) -> dict[str, float | None]:
+        if self.R <= 0:
+            return {"mfe_r": None, "mae_r": None, "mfe_px": None, "mae_px": None}
+
+        entry_ref = self.entry_px if self.entry_px is not None else self.entry_high
+        if entry_ref is None:
+            return {"mfe_r": None, "mae_r": None, "mfe_px": None, "mae_px": None}
+
+        mfe_r = round((self.max_favorable - entry_ref) / self.R, 4)
+        mae_r = round((entry_ref - self.max_adverse) / self.R, 4)
+        return {
+            "mfe_r": mfe_r,
+            "mae_r": mae_r,
+            "mfe_px": round(self.max_favorable, 6),
+            "mae_px": round(self.max_adverse, 6),
         }
 
 
@@ -165,16 +220,12 @@ class Watch:
         t2_touched = self.t2_ts is not None
         stop_touched = self.stop_ts is not None
 
-        # Time metrics
-        def _dt_diff_s(a: datetime | None, b: datetime | None) -> int | None:
-            if not a or not b:
-                return None
-            return int((b - a).total_seconds())
-
         entry_ts = self.entry_ts
         exit_ts = self.done_ts
 
         time_in_trade_s = _dt_diff_s(entry_ts, exit_ts) if self.entered else None
+        first_touch, first_touch_ts_utc = self._first_touch_info()
+        mfe_mae = self._mfe_mae_metrics()
 
         # R-based PnL
         pnl_R = None
@@ -212,9 +263,16 @@ class Watch:
             "t2_ts_utc": _dt_to_iso(self.t2_ts),
             "stop_touched": stop_touched,
             "stop_ts_utc": _dt_to_iso(self.stop_ts),
+            "first_touch": first_touch,
+            "first_touch_ts_utc": first_touch_ts_utc,
 
-            "mfe_R": round((self.max_favorable - self.entry_high) / self.R, 4) if self.R > 0 else None,
-            "mae_R": round((self.entry_high - self.max_adverse) / self.R, 4) if self.R > 0 else None,
+            # MFE/MAE describe the best and worst excursion seen over the watch lifecycle.
+            "mfe_R": mfe_mae["mfe_r"],
+            "mae_R": mfe_mae["mae_r"],
+            "mfe_r": mfe_mae["mfe_r"],
+            "mae_r": mfe_mae["mae_r"],
+            "mfe_px": mfe_mae["mfe_px"],
+            "mae_px": mfe_mae["mae_px"],
 
             "time_in_trade_s": time_in_trade_s,
             "time_to_t1_s": _dt_diff_s(self.entry_ts, self.t1_ts) if self.entered else None,
