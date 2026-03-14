@@ -1,9 +1,8 @@
 import csv
 import os
 import json
-from datetime import datetime, timezone
+from datetime import timezone
 from typing import Any
-from pathlib import Path
 
 from . import config
 from .strategy import Candidate
@@ -67,6 +66,77 @@ ALERT_INTENT_FIELDS = [
     "qty_model",
     "qty",
     "reasons",
+    "schema_version",
+]
+
+OUTCOME_FIELDS = [
+    "alert_id",
+    "symbol",
+    "side",
+    "strategy_profile",
+    "strategy_version",
+    "config_hash",
+    "entry_ts_utc",
+    "entry_px",
+    "exit_ts_utc",
+    "exit_px",
+    "exit_reason",
+    "pnl_R",
+    "pnl_usd_est",
+    "t1_touched",
+    "t1_ts_utc",
+    "t2_touched",
+    "t2_ts_utc",
+    "stop_touched",
+    "stop_ts_utc",
+    "mfe_R",
+    "mae_R",
+    "time_in_trade_s",
+    "time_to_t1_s",
+    "time_to_t2_s",
+    "time_to_stop_s",
+    "max_spread_bps_seen",
+    "avg_spread_bps_seen",
+    "entered",
+    "schema_version",
+]
+
+EXECUTION_FIELDS = [
+    "exec_id",
+    "alert_id",
+    "symbol",
+    "side",
+    "exec_type",
+    "exec_ts_utc",
+    "exec_px",
+    "exec_px_source",
+    "qty",
+    "fee_estimate",
+    "slippage_bps_estimate",
+    "latency_ms",
+    "schema_version",
+]
+
+TELEMETRY_FIELDS = [
+    "timestamp_utc",
+    "market_type",
+    "strategy_profile",
+    "timeframe_min",
+    "bars_seen",
+    "anchor_bars_seen",
+    "insufficient_history",
+    "indicator_missing",
+    "below_score",
+    "alerts_sent",
+    "skipped_tight_stop",
+    "scores_n",
+    "score_min",
+    "score_avg",
+    "score_max",
+    "tier_selected",
+    "cooldown_blocked",
+    "alerts_by_tier",
+    "schema_version",
 ]
 
 
@@ -110,13 +180,16 @@ def _write_row(path: str, row: dict[str, Any]):
 
 def _write_row_with_schema(path: str, row: dict[str, Any], fieldnames: list[str]):
     normalized = _normalize_row_for_schema(row, fieldnames, path)
-    _ensure_csv_schema(path, fieldnames)
+    _migrate_csv_schema_additive(path, fieldnames)
     with open(path, "a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writerow(normalized)
 
 
 def _normalize_row_for_schema(row: dict[str, Any], fieldnames: list[str], path: str) -> dict[str, Any]:
+    row = dict(row)
+    if "schema_version" in fieldnames and "schema_version" not in row:
+        row["schema_version"] = "1"
     field_set = set(fieldnames)
     extras = sorted([k for k in row.keys() if k not in field_set])
     if extras:
@@ -133,27 +206,53 @@ def _read_csv_header(path: str) -> list[str] | None:
         return next(reader, None)
 
 
-def _rotate_file(path: str, reason: str) -> Path:
-    src = Path(path)
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    rotated = src.with_name(f"{src.stem}.{reason}.{ts}{src.suffix}.bak")
-    src.replace(rotated)
-    return rotated
+def _validate_schema_change(path: str, old_fields: list[str], new_fields: list[str]) -> None:
+    old_set = set(old_fields)
+    new_set = set(new_fields)
+    missing = [field for field in old_fields if field not in new_set]
+    if missing:
+        raise ValueError(
+            f"[JOURNAL] destructive schema change for {path}: missing existing columns {missing}"
+        )
+
+    old_idx = 0
+    for field in new_fields:
+        if old_idx < len(old_fields) and field == old_fields[old_idx]:
+            old_idx += 1
+    if old_idx != len(old_fields):
+        raise ValueError(
+            f"[JOURNAL] incompatible schema reorder for {path}: "
+            f"existing columns must remain in the same relative order"
+        )
+
+    if len(new_fields) == len(old_fields) and old_set == new_set:
+        raise ValueError(
+            f"[JOURNAL] incompatible schema reorder for {path}: "
+            f"column order changed without an additive schema update"
+        )
 
 
-def _ensure_csv_schema(path: str, fieldnames: list[str]) -> None:
+def _migrate_csv_schema_additive(path: str, fieldnames: list[str]) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     header = _read_csv_header(path)
     if header == fieldnames:
         return
+    if header is None:
+        with open(path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+        return
 
-    if header is not None:
-        rotated = _rotate_file(path, "schema_mismatch")
-        print(f"[JOURNAL] schema mismatch for {path}; rotated old file to {rotated}")
+    _validate_schema_change(path, header, fieldnames)
+
+    with open(path, "r", newline="") as f:
+        rows = list(csv.DictReader(f))
 
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field, "") for field in fieldnames})
 
 
 def log_alert(candidate: Candidate, computed: dict, tier: str, strategy_profile: str):
@@ -193,11 +292,11 @@ def log_alert(candidate: Candidate, computed: dict, tier: str, strategy_profile:
 
 
 def log_outcome(outcome_row: dict[str, Any]):
-    _write_row(outcomes_path(), outcome_row)
+    _write_row_with_schema(outcomes_path(), outcome_row, OUTCOME_FIELDS)
 
 
 def log_telemetry(row: dict[str, Any]):
-    _write_row(telemetry_path(), row)
+    _write_row_with_schema(telemetry_path(), row, TELEMETRY_FIELDS)
 
 
 def log_alert_intent(row: dict[str, Any]):
@@ -205,7 +304,7 @@ def log_alert_intent(row: dict[str, Any]):
 
 
 def log_execution(row: dict[str, Any]):
-    _write_row(executions_path(), row)
+    _write_row_with_schema(executions_path(), row, EXECUTION_FIELDS)
 
 
 def save_active_watches(payload: dict):
