@@ -96,6 +96,29 @@ def _safe_select(**kwargs) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def research_object_exists_sql(
+    name: str,
+    duckdb_path: str | Path | None = None,
+) -> bool:
+    con = connect_research_db(duckdb_path=duckdb_path, read_only=True)
+    try:
+        return bool(_table_columns(con, name))
+    finally:
+        con.close()
+
+
+def list_research_objects_sql(
+    duckdb_path: str | Path | None = None,
+) -> pd.DataFrame:
+    con = connect_research_db(duckdb_path=duckdb_path, read_only=True)
+    try:
+        return con.execute("SHOW ALL TABLES").df()
+    except Exception:
+        return pd.DataFrame()
+    finally:
+        con.close()
+
+
 def load_trades_sql(
     duckdb_path: str | Path | None = None,
     market_type: str | None = _DEFAULT_MARKET_TYPE,
@@ -153,6 +176,32 @@ def load_executions_enriched_sql(
         duckdb_path=duckdb_path,
         order_by="exec_ts DESC NULLS LAST",
         limit=limit,
+    )
+
+
+def load_outcomes_sql(
+    duckdb_path: str | Path | None = None,
+    limit: int | None = None,
+) -> pd.DataFrame:
+    return _safe_select(
+        table_or_view="outcomes",
+        duckdb_path=duckdb_path,
+        order_by="exit_ts_utc DESC NULLS LAST",
+        limit=limit,
+    )
+
+
+def load_telemetry_sql(
+    duckdb_path: str | Path | None = None,
+    market_type: str | None = _DEFAULT_MARKET_TYPE,
+    limit: int | None = None,
+) -> pd.DataFrame:
+    return _safe_select(
+        table_or_view="telemetry",
+        duckdb_path=duckdb_path,
+        order_by="timestamp_utc DESC NULLS LAST",
+        limit=limit,
+        market_type=market_type,
     )
 
 
@@ -236,3 +285,17 @@ def load_schema_coverage_summary_sql(
         order_by="source_name",
         limit=limit,
     )
+
+
+def load_research_frames_sql(
+    duckdb_path: str | Path | None = None,
+    market_type: str | None = _DEFAULT_MARKET_TYPE,
+) -> dict[str, pd.DataFrame]:
+    return {
+        "trades": load_trades_enriched_sql(duckdb_path=duckdb_path, market_type=market_type),
+        "alerts_intents": load_alerts_intents_sql(duckdb_path=duckdb_path, market_type=market_type),
+        "executions": load_executions_sql(duckdb_path=duckdb_path),
+        "outcomes": load_outcomes_sql(duckdb_path=duckdb_path),
+        "telemetry": load_telemetry_sql(duckdb_path=duckdb_path, market_type=market_type),
+        "schema_coverage": load_schema_coverage_summary_sql(duckdb_path=duckdb_path),
+    }
