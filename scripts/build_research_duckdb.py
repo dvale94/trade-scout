@@ -238,40 +238,27 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
               i.config_hash,
               i.tier,
               i.signal_ts_utc,
-              {raw_select_expr('i', intent_cols, 'signal_hour_utc', "EXTRACT(HOUR FROM TRY_CAST(i.signal_ts_utc AS TIMESTAMP))")},
-              {raw_select_expr('i', intent_cols, 'signal_day_of_week', "STRFTIME(TRY_CAST(i.signal_ts_utc AS TIMESTAMP), '%a')")},
-              {raw_select_expr('i', intent_cols, 'bar_start_ts_utc')},
-              {raw_select_expr('i', intent_cols, 'bar_end_ts_utc')},
               {raw_int_select_expr('i', intent_cols, 'timeframe_min')},
-              {raw_numeric_select_expr('i', intent_cols, 'score')},
-              {raw_numeric_select_expr('i', intent_cols, 'atr')},
-              {raw_numeric_select_expr('i', intent_cols, 'ma20')},
-              {raw_numeric_select_expr('i', intent_cols, 'ma50')},
-              {raw_numeric_select_expr('i', intent_cols, 'ma200')},
-              {raw_numeric_select_expr('i', intent_cols, 'breakout_level')},
-              {raw_numeric_select_expr('i', intent_cols, 'breakout_distance_atr')},
-              {raw_numeric_select_expr('i', intent_cols, 'ma20_distance_atr')},
-              {raw_numeric_select_expr('i', intent_cols, 'ma50_distance_atr')},
-              {raw_numeric_select_expr('i', intent_cols, 'ma200_distance_atr')},
-              {raw_numeric_select_expr('i', intent_cols, 'ma20_slope_pct')},
-              {raw_numeric_select_expr('i', intent_cols, 'ma50_slope_pct')},
-              {raw_numeric_select_expr('i', intent_cols, 'range_pct')},
-              {raw_numeric_select_expr('i', intent_cols, 'close_location_in_bar')},
-              {raw_select_expr('i', intent_cols, 'anchor_symbol')},
-              {raw_select_expr('i', intent_cols, 'anchor_regime')},
-              {raw_numeric_select_expr('i', intent_cols, 'anchor_close')},
-              {raw_numeric_select_expr('i', intent_cols, 'anchor_ma50')},
-              {raw_numeric_select_expr('i', intent_cols, 'anchor_ma200')},
-              {raw_numeric_select_expr('i', intent_cols, 'vol_z')},
-              {raw_numeric_select_expr('i', intent_cols, 'extended_atr')},
               {raw_numeric_select_expr('i', intent_cols, 'signal_px')},
+              {raw_select_expr('i', intent_cols, 'signal_px_type')},
               {raw_numeric_select_expr('i', intent_cols, 'entry_low')},
               {raw_numeric_select_expr('i', intent_cols, 'entry_high')},
-              {raw_numeric_select_expr('i', intent_cols, 'entry_zone_width_pct')},
               {raw_numeric_select_expr('i', intent_cols, 'stop_px')},
               {raw_numeric_select_expr('i', intent_cols, 't1_px')},
               {raw_numeric_select_expr('i', intent_cols, 't2_px')},
               {raw_select_expr('i', intent_cols, 'alert_status')},
+              {raw_select_expr('i', intent_cols, 'skip_reason')},
+              {raw_select_expr('i', intent_cols, 'error_message')},
+              {raw_int_select_expr('i', intent_cols, 'timeout_seconds')},
+              {raw_numeric_select_expr('i', intent_cols, 'stop_distance')},
+              {raw_numeric_select_expr('i', intent_cols, 't1_R')},
+              {raw_numeric_select_expr('i', intent_cols, 't2_R')},
+              {raw_select_expr('i', intent_cols, 'risk_model')},
+              {raw_numeric_select_expr('i', intent_cols, 'risk_usd')},
+              {raw_select_expr('i', intent_cols, 'qty_model')},
+              {raw_numeric_select_expr('i', intent_cols, 'qty')},
+              {raw_select_expr('i', intent_cols, 'reasons')},
+              {raw_select_expr('i', intent_cols, 'schema_version')},
               {raw_boolean_select_expr('o', outcome_cols, 'entered')},
               {raw_select_expr('o', outcome_cols, 'entry_ts_utc')},
               {raw_numeric_select_expr('o', outcome_cols, 'entry_px')},
@@ -303,30 +290,32 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
                 SELECT
                   t.*,
                   {raw_value_expr('c', context_cols, 'schema_version')} AS alert_context_schema_version,
-                  {raw_numeric_value_expr('c', context_cols, 'score')} AS context_score,
-                  TRY_CAST({raw_value_expr('c', context_cols, 'signal_hour_utc')} AS INTEGER) AS context_signal_hour_utc,
-                  {raw_value_expr('c', context_cols, 'signal_day_of_week')} AS context_signal_day_of_week,
-                  {raw_numeric_value_expr('c', context_cols, 'atr')} AS context_atr,
-                  {raw_numeric_value_expr('c', context_cols, 'ma20')} AS context_ma20,
-                  {raw_numeric_value_expr('c', context_cols, 'ma50')} AS context_ma50,
-                  {raw_numeric_value_expr('c', context_cols, 'ma200')} AS context_ma200,
-                  {raw_numeric_value_expr('c', context_cols, 'breakout_level')} AS context_breakout_level,
-                  {raw_numeric_value_expr('c', context_cols, 'breakout_distance_atr')} AS context_breakout_distance_atr,
-                  {raw_numeric_value_expr('c', context_cols, 'ma20_distance_atr')} AS context_ma20_distance_atr,
-                  {raw_numeric_value_expr('c', context_cols, 'ma50_distance_atr')} AS context_ma50_distance_atr,
-                  {raw_numeric_value_expr('c', context_cols, 'ma200_distance_atr')} AS context_ma200_distance_atr,
-                  {raw_numeric_value_expr('c', context_cols, 'ma20_slope_pct')} AS context_ma20_slope_pct,
-                  {raw_numeric_value_expr('c', context_cols, 'ma50_slope_pct')} AS context_ma50_slope_pct,
-                  {raw_numeric_value_expr('c', context_cols, 'range_pct')} AS context_range_pct,
-                  {raw_numeric_value_expr('c', context_cols, 'close_location_in_bar')} AS context_close_location_in_bar,
-                  {raw_numeric_value_expr('c', context_cols, 'entry_zone_width_pct')} AS context_entry_zone_width_pct,
-                  {raw_value_expr('c', context_cols, 'anchor_symbol')} AS context_anchor_symbol,
-                  {raw_value_expr('c', context_cols, 'anchor_regime')} AS context_anchor_regime,
-                  {raw_numeric_value_expr('c', context_cols, 'anchor_close')} AS context_anchor_close,
-                  {raw_numeric_value_expr('c', context_cols, 'anchor_ma50')} AS context_anchor_ma50,
-                  {raw_numeric_value_expr('c', context_cols, 'anchor_ma200')} AS context_anchor_ma200,
-                  {raw_numeric_value_expr('c', context_cols, 'vol_z')} AS context_vol_z,
-                  {raw_numeric_value_expr('c', context_cols, 'extended_atr')} AS context_extended_atr,
+                  COALESCE(TRY_CAST({raw_value_expr('c', context_cols, 'signal_hour_utc')} AS INTEGER), EXTRACT(HOUR FROM TRY_CAST(t.signal_ts_utc AS TIMESTAMP))) AS signal_hour_utc,
+                  COALESCE({raw_value_expr('c', context_cols, 'signal_day_of_week')}, STRFTIME(TRY_CAST(t.signal_ts_utc AS TIMESTAMP), '%a')) AS signal_day_of_week,
+                  {raw_value_expr('c', context_cols, 'bar_start_ts_utc')} AS bar_start_ts_utc,
+                  {raw_value_expr('c', context_cols, 'bar_end_ts_utc')} AS bar_end_ts_utc,
+                  {raw_numeric_value_expr('c', context_cols, 'score')} AS score,
+                  {raw_numeric_value_expr('c', context_cols, 'atr')} AS atr,
+                  {raw_numeric_value_expr('c', context_cols, 'ma20')} AS ma20,
+                  {raw_numeric_value_expr('c', context_cols, 'ma50')} AS ma50,
+                  {raw_numeric_value_expr('c', context_cols, 'ma200')} AS ma200,
+                  {raw_numeric_value_expr('c', context_cols, 'breakout_level')} AS breakout_level,
+                  {raw_numeric_value_expr('c', context_cols, 'breakout_distance_atr')} AS breakout_distance_atr,
+                  {raw_numeric_value_expr('c', context_cols, 'ma20_distance_atr')} AS ma20_distance_atr,
+                  {raw_numeric_value_expr('c', context_cols, 'ma50_distance_atr')} AS ma50_distance_atr,
+                  {raw_numeric_value_expr('c', context_cols, 'ma200_distance_atr')} AS ma200_distance_atr,
+                  {raw_numeric_value_expr('c', context_cols, 'ma20_slope_pct')} AS ma20_slope_pct,
+                  {raw_numeric_value_expr('c', context_cols, 'ma50_slope_pct')} AS ma50_slope_pct,
+                  {raw_numeric_value_expr('c', context_cols, 'range_pct')} AS range_pct,
+                  {raw_numeric_value_expr('c', context_cols, 'close_location_in_bar')} AS close_location_in_bar,
+                  {raw_numeric_value_expr('c', context_cols, 'entry_zone_width_pct')} AS entry_zone_width_pct,
+                  {raw_value_expr('c', context_cols, 'anchor_symbol')} AS anchor_symbol,
+                  {raw_value_expr('c', context_cols, 'anchor_regime')} AS anchor_regime,
+                  {raw_numeric_value_expr('c', context_cols, 'anchor_close')} AS anchor_close,
+                  {raw_numeric_value_expr('c', context_cols, 'anchor_ma50')} AS anchor_ma50,
+                  {raw_numeric_value_expr('c', context_cols, 'anchor_ma200')} AS anchor_ma200,
+                  {raw_numeric_value_expr('c', context_cols, 'vol_z')} AS vol_z,
+                  {raw_numeric_value_expr('c', context_cols, 'extended_atr')} AS extended_atr,
                   TRY_CAST(t.signal_ts_utc AS TIMESTAMP) AS signal_ts,
                   CAST(TRY_CAST(t.signal_ts_utc AS TIMESTAMP) AS DATE) AS signal_date,
                   EXTRACT(DOW FROM TRY_CAST(t.signal_ts_utc AS TIMESTAMP)) AS signal_dow_utc,
@@ -357,6 +346,33 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
                 CREATE VIEW trades_enriched AS
                 SELECT
                   t.*,
+                  NULL AS alert_context_schema_version,
+                  EXTRACT(HOUR FROM TRY_CAST(t.signal_ts_utc AS TIMESTAMP)) AS signal_hour_utc,
+                  STRFTIME(TRY_CAST(t.signal_ts_utc AS TIMESTAMP), '%a') AS signal_day_of_week,
+                  NULL AS bar_start_ts_utc,
+                  NULL AS bar_end_ts_utc,
+                  NULL AS score,
+                  NULL AS atr,
+                  NULL AS ma20,
+                  NULL AS ma50,
+                  NULL AS ma200,
+                  NULL AS breakout_level,
+                  NULL AS breakout_distance_atr,
+                  NULL AS ma20_distance_atr,
+                  NULL AS ma50_distance_atr,
+                  NULL AS ma200_distance_atr,
+                  NULL AS ma20_slope_pct,
+                  NULL AS ma50_slope_pct,
+                  NULL AS range_pct,
+                  NULL AS close_location_in_bar,
+                  NULL AS entry_zone_width_pct,
+                  NULL AS anchor_symbol,
+                  NULL AS anchor_regime,
+                  NULL AS anchor_close,
+                  NULL AS anchor_ma50,
+                  NULL AS anchor_ma200,
+                  NULL AS vol_z,
+                  NULL AS extended_atr,
               TRY_CAST(t.signal_ts_utc AS TIMESTAMP) AS signal_ts,
               CAST(TRY_CAST(t.signal_ts_utc AS TIMESTAMP) AS DATE) AS signal_date,
               EXTRACT(DOW FROM TRY_CAST(t.signal_ts_utc AS TIMESTAMP)) AS signal_dow_utc,
@@ -403,24 +419,47 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
     if "alerts_intents" in csvs:
         intent_cols = table_columns(con, "alerts_intents")
         con.execute("DROP VIEW IF EXISTS strategy_summary")
-        con.execute(
-            f"""
-            CREATE VIEW strategy_summary AS
-            SELECT
-              {raw_select_expr('', intent_cols, 'strategy_profile')},
-              {raw_select_expr('', intent_cols, 'tier')},
-              COUNT(*) AS intents_total,
-              COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('', intent_cols, 'alert_status')}, '') = 'ALERT_CREATED') AS alerts_created,
-              COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('', intent_cols, 'alert_status')}, '') = 'SKIPPED_COOLDOWN') AS skipped_cooldown,
-              COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('', intent_cols, 'alert_status')}, '') = 'SKIPPED_INVALID_STOP') AS skipped_invalid_stop,
-              COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('', intent_cols, 'alert_status')}, '') = 'SKIPPED_TIGHT_STOP') AS skipped_tight_stop,
-              COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('', intent_cols, 'alert_status')}, '') = 'ERROR_ALERT_PIPELINE') AS pipeline_errors,
-              AVG(TRY_CAST({raw_value_expr('', intent_cols, 'score')} AS DOUBLE)) AS avg_score
-            FROM alerts_intents
-            GROUP BY 1,2
-            ORDER BY 1,2
-            """
-        )
+        if "alert_context_raw" in csvs:
+            context_cols = table_columns(con, "alert_context")
+            con.execute(
+                f"""
+                CREATE VIEW strategy_summary AS
+                SELECT
+                  {raw_select_expr('ai', intent_cols, 'strategy_profile')},
+                  {raw_select_expr('ai', intent_cols, 'tier')},
+                  COUNT(*) AS intents_total,
+                  COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('ai', intent_cols, 'alert_status')}, '') = 'ALERT_CREATED') AS alerts_created,
+                  COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('ai', intent_cols, 'alert_status')}, '') = 'SKIPPED_COOLDOWN') AS skipped_cooldown,
+                  COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('ai', intent_cols, 'alert_status')}, '') = 'SKIPPED_INVALID_STOP') AS skipped_invalid_stop,
+                  COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('ai', intent_cols, 'alert_status')}, '') = 'SKIPPED_TIGHT_STOP') AS skipped_tight_stop,
+                  COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('ai', intent_cols, 'alert_status')}, '') = 'ERROR_ALERT_PIPELINE') AS pipeline_errors,
+                  AVG(TRY_CAST({raw_value_expr('ac', context_cols, 'score')} AS DOUBLE)) AS avg_score
+                FROM alerts_intents ai
+                LEFT JOIN alert_context ac
+                  ON ai.alert_id = ac.alert_id
+                GROUP BY 1,2
+                ORDER BY 1,2
+                """
+            )
+        else:
+            con.execute(
+                f"""
+                CREATE VIEW strategy_summary AS
+                SELECT
+                  {raw_select_expr('', intent_cols, 'strategy_profile')},
+                  {raw_select_expr('', intent_cols, 'tier')},
+                  COUNT(*) AS intents_total,
+                  COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('', intent_cols, 'alert_status')}, '') = 'ALERT_CREATED') AS alerts_created,
+                  COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('', intent_cols, 'alert_status')}, '') = 'SKIPPED_COOLDOWN') AS skipped_cooldown,
+                  COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('', intent_cols, 'alert_status')}, '') = 'SKIPPED_INVALID_STOP') AS skipped_invalid_stop,
+                  COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('', intent_cols, 'alert_status')}, '') = 'SKIPPED_TIGHT_STOP') AS skipped_tight_stop,
+                  COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('', intent_cols, 'alert_status')}, '') = 'ERROR_ALERT_PIPELINE') AS pipeline_errors,
+                  NULL AS avg_score
+                FROM alerts_intents
+                GROUP BY 1,2
+                ORDER BY 1,2
+                """
+            )
 
     # 5) alert_funnel (intent-stage only; no pre-threshold claims)
     if "alerts_intents" in csvs and "outcomes" in csvs:
