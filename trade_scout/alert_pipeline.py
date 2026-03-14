@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 from uuid import uuid4
 
@@ -40,7 +41,7 @@ class AlertPipeline:
     def __init__(self, context: RuntimeContext):
         self.context = context
 
-    def _log_intent_and_context(self, symbol: str, core_row: dict, context_row: dict) -> None:
+    def _log_intent_and_context(self, symbol: str, core_row, context_row) -> None:
         journal.log_alert_intent(core_row)
         try:
             journal.log_alert_context(context_row)
@@ -85,8 +86,7 @@ class AlertPipeline:
 
         if not self.context.cooldown.allowed(symbol, tier, now):
             self.context.telemetry.record_cooldown_blocked(tier)
-            intent_row["alert_status"] = "SKIPPED_COOLDOWN"
-            intent_row["skip_reason"] = "COOLDOWN"
+            intent_row = replace(intent_row, alert_status="SKIPPED_COOLDOWN", skip_reason="COOLDOWN")
             self._log_intent_and_context(symbol, intent_row, alert_context_row)
             return
 
@@ -99,36 +99,45 @@ class AlertPipeline:
                 score,
             )
             if candidate is None:
-                intent_row["alert_status"] = "SKIPPED_INVALID_STOP"
-                intent_row["skip_reason"] = "CANDIDATE_NONE"
-                intent_row["reasons"] = " | ".join(reasons) if reasons else None
+                intent_row = replace(
+                    intent_row,
+                    alert_status="SKIPPED_INVALID_STOP",
+                    skip_reason="CANDIDATE_NONE",
+                    reasons=" | ".join(reasons) if reasons else None,
+                )
                 self._log_intent_and_context(symbol, intent_row, alert_context_row)
                 return
 
-            intent_row["alert_id"] = candidate.alert_id
-            alert_context_row["alert_id"] = candidate.alert_id
-            intent_row["entry_low"] = round(candidate.entry_low, 6)
-            intent_row["entry_high"] = round(candidate.entry_high, 6)
+            intent_row = replace(
+                intent_row,
+                alert_id=candidate.alert_id,
+                entry_low=round(candidate.entry_low, 6),
+                entry_high=round(candidate.entry_high, 6),
+                stop_px=round(candidate.stop, 6),
+                t1_px=round(candidate.t1, 6),
+                t2_px=round(candidate.t2, 6),
+                timeout_seconds=int(profile.watch_timeout_min * 60),
+                stop_distance=round(candidate.r, 6),
+                t1_R=1.5,
+                t2_R=2.5,
+                risk_model="fixed_usd",
+                risk_usd=None,
+                qty_model=None,
+                qty=None,
+            )
+            alert_context_row = replace(alert_context_row, alert_id=candidate.alert_id)
             entry_zone_width_pct = compute_entry_zone_width_pct(candidate.entry_low, candidate.entry_high)
             if entry_zone_width_pct is not None:
-                alert_context_row["entry_zone_width_pct"] = round(entry_zone_width_pct, 6)
-            intent_row["stop_px"] = round(candidate.stop, 6)
-            intent_row["t1_px"] = round(candidate.t1, 6)
-            intent_row["t2_px"] = round(candidate.t2, 6)
-            intent_row["timeout_seconds"] = int(profile.watch_timeout_min * 60)
-            intent_row["stop_distance"] = round(candidate.r, 6)
-            intent_row["t1_R"] = 1.5
-            intent_row["t2_R"] = 2.5
-            intent_row["risk_model"] = "fixed_usd"
-            intent_row["risk_usd"] = None
-            intent_row["qty_model"] = None
-            intent_row["qty"] = None
+                alert_context_row = replace(alert_context_row, entry_zone_width_pct=round(entry_zone_width_pct, 6))
 
             if candidate.r / candidate.entry_high < 0.004:
                 self.context.telemetry.record_skipped_tight_stop()
-                intent_row["alert_status"] = "SKIPPED_TIGHT_STOP"
-                intent_row["skip_reason"] = "TIGHT_STOP"
-                intent_row["reasons"] = " | ".join(candidate.reasons) if candidate.reasons else None
+                intent_row = replace(
+                    intent_row,
+                    alert_status="SKIPPED_TIGHT_STOP",
+                    skip_reason="TIGHT_STOP",
+                    reasons=" | ".join(candidate.reasons) if candidate.reasons else None,
+                )
                 self._log_intent_and_context(symbol, intent_row, alert_context_row)
                 return
 
@@ -136,8 +145,11 @@ class AlertPipeline:
             notifier.discord_notify(format_alert(candidate, tier))
             self.context.telemetry.record_alert_sent(tier)
 
-            intent_row["alert_status"] = "ALERT_CREATED"
-            intent_row["reasons"] = " | ".join(candidate.reasons) if candidate.reasons else None
+            intent_row = replace(
+                intent_row,
+                alert_status="ALERT_CREATED",
+                reasons=" | ".join(candidate.reasons) if candidate.reasons else None,
+            )
             self._log_intent_and_context(symbol, intent_row, alert_context_row)
 
             self.context.watch_mgr.add(
@@ -168,6 +180,5 @@ class AlertPipeline:
 
         except Exception as e:
             print(f"ALERT ERROR for {symbol}: {e}")
-            intent_row["alert_status"] = "ERROR_ALERT_PIPELINE"
-            intent_row["error_message"] = str(e)
+            intent_row = replace(intent_row, alert_status="ERROR_ALERT_PIPELINE", error_message=str(e))
             self._log_intent_and_context(symbol, intent_row, alert_context_row)

@@ -1,9 +1,10 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone, timedelta
 from typing import Any
 from uuid import uuid4
 
 from . import journal
+from .journal_rows import ExecutionRow, OutcomeRow
 from .watch_state import WatchLifecycleState, assert_valid_watch_lifecycle, lifecycle_state_for_watch
 from .watch_transitions import WatchBar, WatchDecision, WatchTransitionType, decide_watch_bar_transition
 
@@ -150,7 +151,7 @@ class Watch:
         return watch
     
 
-    def _exec_row(self, exec_type: str, ts: datetime, px: float, px_source: str) -> dict[str, Any]:
+    def _exec_row(self, exec_type: str, ts: datetime, px: float, px_source: str) -> ExecutionRow:
         latency_ms = None
         try:
             latency_ms = int((ts - self.created_ts).total_seconds() * 1000)
@@ -167,23 +168,23 @@ class Watch:
         if entry_fill_px is not None and self.entry_high > 0:
             slippage_pct = ((entry_fill_px - self.entry_high) / self.entry_high) * 100.0
 
-        return {
-            "exec_id": str(uuid4()),
-            "alert_id": self.alert_id,
-            "symbol": self.symbol,
-            "side": self.side,
-            "exec_type": exec_type,
-            "exec_ts_utc": ts.astimezone(timezone.utc).isoformat(),
-            "exec_px": float(px),
-            "exec_px_source": px_source,
-            "entry_fill_px": entry_fill_px,
-            "entry_fill_ts_utc": _dt_to_iso(entry_fill_ts),
-            "slippage_pct": round(slippage_pct, 6) if slippage_pct is not None else None,
-            "qty": None,  # placeholder for now
-            "fee_estimate": None,
-            "slippage_bps_estimate": None,
-            "latency_ms": latency_ms,
-        }
+        return ExecutionRow(
+            exec_id=str(uuid4()),
+            alert_id=self.alert_id,
+            symbol=self.symbol,
+            side=self.side,
+            exec_type=exec_type,
+            exec_ts_utc=ts.astimezone(timezone.utc).isoformat(),
+            exec_px=float(px),
+            exec_px_source=px_source,
+            entry_fill_px=entry_fill_px,
+            entry_fill_ts_utc=_dt_to_iso(entry_fill_ts),
+            slippage_pct=round(slippage_pct, 6) if slippage_pct is not None else None,
+            qty=None,
+            fee_estimate=None,
+            slippage_bps_estimate=None,
+            latency_ms=latency_ms,
+        )
 
 
     def _first_touch_info(self) -> tuple[str, str | None]:
@@ -222,7 +223,7 @@ class Watch:
         }
 
 
-    def as_outcome_row(self) -> dict[str, Any]:
+    def as_outcome_row(self) -> OutcomeRow:
         # Touch flags
         t1_touched = self.t1_ts is not None
         t2_touched = self.t2_ts is not None
@@ -246,53 +247,42 @@ class Watch:
                 # TIMEOUT pnl_R is overridden at finalize using exit_px
                 pnl_R = 0.0
 
-        return {
-            "alert_id": self.alert_id,
-            "symbol": self.symbol,
-            "side": self.side,
-
-            "strategy_profile": self.strategy_profile,
-            "strategy_version": self.strategy_version,
-            "config_hash": self.config_hash,
-
-            "entry_ts_utc": _dt_to_iso(self.entry_ts),
-            "entry_px": self.entry_px,
-
-            "exit_ts_utc": _dt_to_iso(self.done_ts),
-            "exit_px": None,  # we’ll fill with actual exit px once we store it (see update logic below)
-            "exit_reason": self.done_reason,
-
-            "pnl_R": pnl_R,
-            "pnl_usd_est": None,
-
-            "t1_touched": t1_touched,
-            "t1_ts_utc": _dt_to_iso(self.t1_ts),
-            "t2_touched": t2_touched,
-            "t2_ts_utc": _dt_to_iso(self.t2_ts),
-            "stop_touched": stop_touched,
-            "stop_ts_utc": _dt_to_iso(self.stop_ts),
-            "first_touch": first_touch,
-            "first_touch_ts_utc": first_touch_ts_utc,
-
-            # MFE/MAE describe the best and worst excursion seen over the watch lifecycle.
-            "mfe_R": mfe_mae["mfe_r"],
-            "mae_R": mfe_mae["mae_r"],
-            "mfe_r": mfe_mae["mfe_r"],
-            "mae_r": mfe_mae["mae_r"],
-            "mfe_px": mfe_mae["mfe_px"],
-            "mae_px": mfe_mae["mae_px"],
-
-            "time_in_trade_s": time_in_trade_s,
-            "time_to_t1_s": _dt_diff_s(self.entry_ts, self.t1_ts) if self.entered else None,
-            "time_to_t2_s": _dt_diff_s(self.entry_ts, self.t2_ts) if self.entered else None,
-            "time_to_stop_s": _dt_diff_s(self.entry_ts, self.stop_ts) if self.entered else None,
-
-            "max_spread_bps_seen": None,
-            "avg_spread_bps_seen": None,
-
-            # useful to distinguish “watch existed” vs “trade existed”
-            "entered": self.entered,
-        }
+        return OutcomeRow(
+            alert_id=self.alert_id,
+            symbol=self.symbol,
+            side=self.side,
+            strategy_profile=self.strategy_profile,
+            strategy_version=self.strategy_version,
+            config_hash=self.config_hash,
+            entry_ts_utc=_dt_to_iso(self.entry_ts),
+            entry_px=self.entry_px,
+            exit_ts_utc=_dt_to_iso(self.done_ts),
+            exit_px=None,
+            exit_reason=self.done_reason,
+            pnl_R=pnl_R,
+            pnl_usd_est=None,
+            t1_touched=t1_touched,
+            t1_ts_utc=_dt_to_iso(self.t1_ts),
+            t2_touched=t2_touched,
+            t2_ts_utc=_dt_to_iso(self.t2_ts),
+            stop_touched=stop_touched,
+            stop_ts_utc=_dt_to_iso(self.stop_ts),
+            first_touch=first_touch,
+            first_touch_ts_utc=first_touch_ts_utc,
+            mfe_R=mfe_mae["mfe_r"],
+            mae_R=mfe_mae["mae_r"],
+            mfe_r=mfe_mae["mfe_r"],
+            mae_r=mfe_mae["mae_r"],
+            mfe_px=mfe_mae["mfe_px"],
+            mae_px=mfe_mae["mae_px"],
+            time_in_trade_s=time_in_trade_s,
+            time_to_t1_s=_dt_diff_s(self.entry_ts, self.t1_ts) if self.entered else None,
+            time_to_t2_s=_dt_diff_s(self.entry_ts, self.t2_ts) if self.entered else None,
+            time_to_stop_s=_dt_diff_s(self.entry_ts, self.stop_ts) if self.entered else None,
+            max_spread_bps_seen=None,
+            avg_spread_bps_seen=None,
+            entered=self.entered,
+        )
 
 
 class WatchManager:
@@ -417,8 +407,7 @@ class WatchManager:
 
         exit_px = float(w.stop)
         journal.log_execution(w._exec_row("EXIT_STOP", transition.ts, exit_px, transition.px_source or "bar_touch_stop"))
-        out = w.as_outcome_row()
-        out["exit_px"] = exit_px
+        out = replace(w.as_outcome_row(), exit_px=exit_px)
         journal.log_outcome(out)
 
     def _apply_exit_t2_transition(self, w: Watch, transition) -> None:
@@ -434,8 +423,7 @@ class WatchManager:
 
         exit_px = float(w.t2)
         journal.log_execution(w._exec_row("EXIT_T2", transition.ts, exit_px, transition.px_source or "bar_touch_t2"))
-        out = w.as_outcome_row()
-        out["exit_px"] = exit_px
+        out = replace(w.as_outcome_row(), exit_px=exit_px)
         journal.log_outcome(out)
 
     def _apply_exit_timeout_transition(self, w: Watch, transition) -> None:
@@ -447,8 +435,7 @@ class WatchManager:
 
         exit_px = float(transition.px)
         journal.log_execution(w._exec_row("EXIT_TIMEOUT", transition.ts, exit_px, transition.px_source or "bar_close_timeout"))
-        out = w.as_outcome_row()
-        out["exit_px"] = exit_px
+        out = replace(w.as_outcome_row(), exit_px=exit_px)
         if w.entry_px is not None and w.R > 0:
-            out["pnl_R"] = round((exit_px - w.entry_px) / w.R, 4)
+            out = replace(out, pnl_R=round((exit_px - w.entry_px) / w.R, 4))
         journal.log_outcome(out)
