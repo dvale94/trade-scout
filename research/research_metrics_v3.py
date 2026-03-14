@@ -8,6 +8,79 @@ import pandas as pd
 _DAY_ORDER = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 
+def requested_columns_present(trades: pd.DataFrame, columns: Sequence[str]) -> dict[str, bool]:
+    present = set(trades.columns)
+    return {col: col in present for col in columns}
+
+
+def non_null_column_coverage(trades: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame:
+    rows: list[dict] = []
+    total_rows = int(len(trades))
+
+    for col in columns:
+        if col not in trades.columns:
+            rows.append(
+                {
+                    "column": col,
+                    "present": False,
+                    "non_null_rows": 0,
+                    "coverage_pct": 0.0,
+                }
+            )
+            continue
+
+        non_null_rows = int(trades[col].notna().sum())
+        rows.append(
+            {
+                "column": col,
+                "present": True,
+                "non_null_rows": non_null_rows,
+                "coverage_pct": float(non_null_rows / total_rows) if total_rows else 0.0,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def split_core_and_advanced_rows(
+    trades: pd.DataFrame,
+    *,
+    core_columns: Sequence[str] = ("pnl_R",),
+    advanced_feature_columns: Sequence[str] = (),
+) -> dict[str, object]:
+    if trades.empty:
+        return {
+            "core_rows": pd.DataFrame(),
+            "advanced_rows": pd.DataFrame(),
+            "missing_core_columns": list(core_columns),
+            "missing_advanced_columns": list(advanced_feature_columns),
+            "core_row_count": 0,
+            "advanced_row_count": 0,
+        }
+
+    core_present = [col for col in core_columns if col in trades.columns]
+    advanced_present = [col for col in advanced_feature_columns if col in trades.columns]
+    missing_core = [col for col in core_columns if col not in trades.columns]
+    missing_advanced = [col for col in advanced_feature_columns if col not in trades.columns]
+
+    core_rows = trades.copy()
+    for col in core_present:
+        core_rows = core_rows[core_rows[col].notna()]
+
+    advanced_rows = core_rows.copy()
+    for col in advanced_present:
+        advanced_rows = advanced_rows[advanced_rows[col].notna()]
+
+    return {
+        "core_rows": core_rows.copy(),
+        "advanced_rows": advanced_rows.copy(),
+        "missing_core_columns": missing_core,
+        "missing_advanced_columns": missing_advanced,
+        "core_row_count": int(len(core_rows)),
+        "advanced_row_count": int(len(advanced_rows)),
+    }
+
+
 def _to_numeric(df: pd.DataFrame, col: str) -> pd.Series:
     if col not in df.columns:
         return pd.Series(dtype=float)

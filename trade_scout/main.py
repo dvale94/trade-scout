@@ -91,24 +91,24 @@ def compute_config_hash(profile) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
 
 
-def make_intent_base(
+def _signal_window_fields(bar_ts: datetime, timeframe_min: int) -> tuple[str, str]:
+    bar_end = bar_ts.astimezone(timezone.utc).isoformat()
+    bar_start = (bar_ts - timedelta(minutes=timeframe_min)).astimezone(timezone.utc).isoformat()
+    return bar_start, bar_end
+
+
+def make_intent_core_row(
     *,
     alert_id: str,
     symbol: str,
     tier: str,
     now: datetime,
-    bar_ts: datetime,
     timeframe_min: int,
-    score: float,
     computed_for_log: dict,
     config_hash: str,
     strategy_version: str,
 ) -> dict:
-    bar_end = bar_ts
-    bar_start = bar_ts - timedelta(minutes=timeframe_min)
-
     row = {
-        # identifiers
         "alert_id": alert_id,
         "symbol": symbol,
         "side": "LONG",
@@ -117,53 +117,15 @@ def make_intent_base(
         "strategy_version": strategy_version,
         "config_hash": config_hash,
         "tier": tier,
-
-        # timestamps
         "signal_ts_utc": now.astimezone(timezone.utc).isoformat(),
-        "signal_hour_utc": int(now.astimezone(timezone.utc).hour),
-        "signal_day_of_week": now.astimezone(timezone.utc).strftime("%a"),
-        "bar_start_ts_utc": bar_start.astimezone(timezone.utc).isoformat(),
-        "bar_end_ts_utc": bar_end.astimezone(timezone.utc).isoformat(),
         "timeframe_min": timeframe_min,
-
-        # signal price (what we scored on)
         "signal_px": float(computed_for_log.get("close")) if computed_for_log.get("close") is not None else None,
         "signal_px_type": "bar_close",
-
-        # status (filled later)
         "alert_status": None,
         "skip_reason": None,
         "error_message": None,
-
-        # quick context
-        "score": round(float(score), 4),
-
-        # carry forward your computed snapshot fields (anchor injected)
-        "atr": computed_for_log.get("atr"),
-        "ma20": computed_for_log.get("ma20"),
-        "ma50": computed_for_log.get("ma50"),
-        "ma200": computed_for_log.get("ma200"),
-        "breakout_level": computed_for_log.get("breakout_level"),
-        "breakout_distance_atr": computed_for_log.get("breakout_distance_atr"),
-        "ma20_distance_atr": computed_for_log.get("ma20_distance_atr"),
-        "ma50_distance_atr": computed_for_log.get("ma50_distance_atr"),
-        "ma200_distance_atr": computed_for_log.get("ma200_distance_atr"),
-        "ma20_slope_pct": computed_for_log.get("ma20_slope_pct"),
-        "ma50_slope_pct": computed_for_log.get("ma50_slope_pct"),
-        "range_pct": computed_for_log.get("range_pct"),
-        "close_location_in_bar": computed_for_log.get("close_location_in_bar"),
-        "anchor_symbol": computed_for_log.get("anchor_symbol"),
-        "anchor_regime": computed_for_log.get("anchor_regime"),
-        "anchor_close": computed_for_log.get("anchor_close"),
-        "anchor_ma50": computed_for_log.get("anchor_ma50"),
-        "anchor_ma200": computed_for_log.get("anchor_ma200"),
-        "vol_z": computed_for_log.get("vol_z"),
-        "extended_atr": computed_for_log.get("extended_atr"),
-
-        # planned levels / sizing placeholders (keep alerts_intents schema stable)
         "entry_low": None,
         "entry_high": None,
-        "entry_zone_width_pct": None,
         "stop_px": None,
         "t1_px": None,
         "t2_px": None,
@@ -180,10 +142,121 @@ def make_intent_base(
     return row
 
 
+def make_alert_context_row(
+    *,
+    alert_id: str,
+    now: datetime,
+    bar_ts: datetime,
+    timeframe_min: int,
+    score: float,
+    computed_for_log: dict,
+    config_hash: str,
+    strategy_version: str,
+) -> dict:
+    bar_start_ts_utc, bar_end_ts_utc = _signal_window_fields(bar_ts, timeframe_min)
+    anchor_trend_1h, anchor_trend_4h, anchor_trend_1d = _anchor_trend_snapshot(computed_for_log)
+    return {
+        "alert_id": alert_id,
+        "market_type": config.MARKET_TYPE,
+        "strategy_profile": config.STRATEGY_PROFILE,
+        "strategy_version": strategy_version,
+        "config_hash": config_hash,
+        "signal_ts_utc": now.astimezone(timezone.utc).isoformat(),
+        "signal_hour_utc": int(now.astimezone(timezone.utc).hour),
+        "signal_day_of_week": now.astimezone(timezone.utc).strftime("%a"),
+        "bar_start_ts_utc": bar_start_ts_utc,
+        "bar_end_ts_utc": bar_end_ts_utc,
+        "score": round(float(score), 4),
+        "atr": computed_for_log.get("atr"),
+        "ma20": computed_for_log.get("ma20"),
+        "ma50": computed_for_log.get("ma50"),
+        "ma200": computed_for_log.get("ma200"),
+        "breakout_level": computed_for_log.get("breakout_level"),
+        "breakout_distance_atr": computed_for_log.get("breakout_distance_atr"),
+        "ma20_distance_atr": computed_for_log.get("ma20_distance_atr"),
+        "ma50_distance_atr": computed_for_log.get("ma50_distance_atr"),
+        "ma200_distance_atr": computed_for_log.get("ma200_distance_atr"),
+        "ma20_slope_pct": computed_for_log.get("ma20_slope_pct"),
+        "ma50_slope_pct": computed_for_log.get("ma50_slope_pct"),
+        "range_pct": computed_for_log.get("range_pct"),
+        "close_location_in_bar": computed_for_log.get("close_location_in_bar"),
+        "entry_zone_width_pct": None,
+        "anchor_symbol": computed_for_log.get("anchor_symbol"),
+        "anchor_regime": computed_for_log.get("anchor_regime"),
+        "anchor_close": computed_for_log.get("anchor_close"),
+        "anchor_ma50": computed_for_log.get("anchor_ma50"),
+        "anchor_ma200": computed_for_log.get("anchor_ma200"),
+        "vol_z": computed_for_log.get("vol_z"),
+        "extended_atr": computed_for_log.get("extended_atr"),
+        "market_regime": _market_regime(computed_for_log),
+        "volatility_regime": _volatility_regime(computed_for_log),
+        "anchor_trend_1h": anchor_trend_1h,
+        "anchor_trend_4h": anchor_trend_4h,
+        "anchor_trend_1d": anchor_trend_1d,
+        "score_bucket": _score_bucket(score),
+    }
+
+
 def _compute_entry_zone_width_pct(entry_low: float | None, entry_high: float | None) -> float | None:
     if entry_low is None or entry_high is None or entry_high <= 0:
         return None
     return (entry_high - entry_low) / entry_high
+
+
+def _trend_label(lhs: float | None, rhs: float | None) -> str | None:
+    if lhs is None or rhs is None:
+        return None
+    if lhs > rhs:
+        return "UP"
+    if lhs < rhs:
+        return "DOWN"
+    return "FLAT"
+
+
+def _market_regime(computed_for_log: dict) -> str | None:
+    # Regime stays lightweight: anchor regime plus simple volatility/trend proxies.
+    regime = computed_for_log.get("anchor_regime")
+    return str(regime).upper() if regime is not None else None
+
+
+def _volatility_regime(computed_for_log: dict) -> str | None:
+    vol_z = computed_for_log.get("vol_z")
+    try:
+        vol_z = float(vol_z) if vol_z is not None else None
+    except (TypeError, ValueError):
+        vol_z = None
+
+    if vol_z is None:
+        return None
+    if vol_z >= 1.5:
+        return "HIGH"
+    if vol_z <= -0.5:
+        return "LOW"
+    return "NORMAL"
+
+
+def _anchor_trend_snapshot(computed_for_log: dict) -> tuple[str | None, str | None, str | None]:
+    close = computed_for_log.get("anchor_close")
+    ma50 = computed_for_log.get("anchor_ma50")
+    ma200 = computed_for_log.get("anchor_ma200")
+    return (
+        _trend_label(close, ma50),
+        _trend_label(close, ma200),
+        _trend_label(ma50, ma200),
+    )
+
+
+def _score_bucket(score: float) -> str:
+    # Stable score bands for grouped edge studies.
+    if score < 5.0:
+        return "LT_5"
+    if score < 6.0:
+        return "5_TO_5_9"
+    if score < 7.0:
+        return "6_TO_6_9"
+    if score < 8.0:
+        return "7_TO_7_9"
+    return "8_PLUS"
 
 
 def websocket_backoff(attempt: int, base: float = 5.0, cap: float = 120.0) -> float:
@@ -292,10 +365,18 @@ def run():
             computed_for_log = anchor.inject_into_computed(computed)
             provisional_alert_id = str(uuid4())
 
-            intent_row = make_intent_base(
+            intent_row = make_intent_core_row(
                 alert_id=provisional_alert_id,
                 symbol=symbol,
                 tier=tier,
+                now=now,
+                timeframe_min=profile.timeframe_min,
+                computed_for_log=computed_for_log,
+                config_hash=config_hash,
+                strategy_version=strategy_version,
+            )
+            alert_context_row = make_alert_context_row(
+                alert_id=provisional_alert_id,
                 now=now,
                 bar_ts=ts,
                 timeframe_min=profile.timeframe_min,
@@ -305,11 +386,18 @@ def run():
                 strategy_version=strategy_version,
             )
 
+            def log_intent_and_context(core_row: dict, context_row: dict) -> None:
+                journal.log_alert_intent(core_row)
+                try:
+                    journal.log_alert_context(context_row)
+                except Exception as context_err:
+                    print(f"ALERT CONTEXT LOG ERROR for {symbol}: {context_err}")
+
             if not cooldown.allowed(symbol, tier, now):
                 telemetry.record_cooldown_blocked(tier)
                 intent_row["alert_status"] = "SKIPPED_COOLDOWN"
                 intent_row["skip_reason"] = "COOLDOWN"
-                journal.log_alert_intent(intent_row)
+                log_intent_and_context(intent_row, alert_context_row)
                 return
 
             try:
@@ -318,15 +406,16 @@ def run():
                     intent_row["alert_status"] = "SKIPPED_INVALID_STOP"
                     intent_row["skip_reason"] = "CANDIDATE_NONE"
                     intent_row["reasons"] = " | ".join(reasons) if reasons else None
-                    journal.log_alert_intent(intent_row)
+                    log_intent_and_context(intent_row, alert_context_row)
                     return
 
                 intent_row["alert_id"] = candidate.alert_id
+                alert_context_row["alert_id"] = candidate.alert_id
                 intent_row["entry_low"] = round(candidate.entry_low, 6)
                 intent_row["entry_high"] = round(candidate.entry_high, 6)
                 entry_zone_width_pct = _compute_entry_zone_width_pct(candidate.entry_low, candidate.entry_high)
                 if entry_zone_width_pct is not None:
-                    intent_row["entry_zone_width_pct"] = round(entry_zone_width_pct, 6)
+                    alert_context_row["entry_zone_width_pct"] = round(entry_zone_width_pct, 6)
                 intent_row["stop_px"] = round(candidate.stop, 6)
                 intent_row["t1_px"] = round(candidate.t1, 6)
                 intent_row["t2_px"] = round(candidate.t2, 6)
@@ -344,7 +433,7 @@ def run():
                     intent_row["alert_status"] = "SKIPPED_TIGHT_STOP"
                     intent_row["skip_reason"] = "TIGHT_STOP"
                     intent_row["reasons"] = " | ".join(candidate.reasons) if candidate.reasons else None
-                    journal.log_alert_intent(intent_row)
+                    log_intent_and_context(intent_row, alert_context_row)
                     return
 
                 journal.log_alert(candidate, computed_for_log, tier, config.STRATEGY_PROFILE)
@@ -353,7 +442,7 @@ def run():
 
                 intent_row["alert_status"] = "ALERT_CREATED"
                 intent_row["reasons"] = " | ".join(candidate.reasons) if candidate.reasons else None
-                journal.log_alert_intent(intent_row)
+                log_intent_and_context(intent_row, alert_context_row)
 
                 watch_mgr.add(watch.Watch(
                     alert_id=candidate.alert_id,
@@ -383,7 +472,7 @@ def run():
                 print(f"ALERT ERROR for {symbol}: {e}")
                 intent_row["alert_status"] = "ERROR_ALERT_PIPELINE"
                 intent_row["error_message"] = str(e)
-                journal.log_alert_intent(intent_row)
+                log_intent_and_context(intent_row, alert_context_row)
 
         finally:
             telemetry.maybe_flush(datetime.now(timezone.utc))
