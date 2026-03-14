@@ -30,22 +30,113 @@ def existing_csvs() -> dict[str, Path]:
     return out
 
 
+def table_columns(con: duckdb.DuckDBPyConnection, table: str) -> set[str]:
+    try:
+        return {row[1] for row in con.execute(f"PRAGMA table_info('{table}')").fetchall()}
+    except duckdb.Error:
+        return set()
+
+
+def raw_value_expr(alias: str, cols: set[str], col: str, fallback_expr: str = "NULL") -> str:
+    if col in cols:
+        return f"{alias}.{col}" if alias else col
+    return fallback_expr
+
+
+def raw_select_expr(alias: str, cols: set[str], col: str, fallback_expr: str = "NULL") -> str:
+    return f"{raw_value_expr(alias, cols, col, fallback_expr)} AS {col}"
+
+
+def raw_numeric_value_expr(alias: str, cols: set[str], col: str) -> str:
+    return f"TRY_CAST({raw_value_expr(alias, cols, col)} AS DOUBLE)"
+
+
+def raw_numeric_select_expr(alias: str, cols: set[str], col: str) -> str:
+    return f"{raw_numeric_value_expr(alias, cols, col)} AS {col}"
+
+
+def raw_boolean_value_expr(alias: str, cols: set[str], col: str) -> str:
+    return f"TRY_CAST({raw_value_expr(alias, cols, col)} AS BOOLEAN)"
+
+
+def raw_boolean_select_expr(alias: str, cols: set[str], col: str) -> str:
+    return f"{raw_boolean_value_expr(alias, cols, col)} AS {col}"
+
+
+def raw_int_select_expr(alias: str, cols: set[str], col: str) -> str:
+    return f"TRY_CAST({raw_value_expr(alias, cols, col)} AS INTEGER) AS {col}"
+
+
+def raw_count_expr(table: str, cols: set[str], col: str) -> str:
+    if col in cols:
+        return f"COUNT(*) FILTER (WHERE {col} IS NOT NULL) AS {col}_non_null_rows"
+    return f"0 AS {col}_non_null_rows"
+
+
+def create_schema_coverage_summary(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
+    con.execute("DROP VIEW IF EXISTS schema_coverage_summary")
+
+    select_statements: list[str] = []
+
+    for source_name in ["alerts", "alerts_intents", "executions", "outcomes", "telemetry"]:
+        if source_name not in csvs:
+            select_statements.append(
+                f"""
+                SELECT
+                  '{source_name}' AS source_name,
+                  0 AS row_count,
+                  FALSE AS has_schema_version,
+                  FALSE AS has_score,
+                  0 AS score_non_null_rows,
+                  FALSE AS has_signal_hour_utc,
+                  0 AS signal_hour_utc_non_null_rows,
+                  FALSE AS has_signal_day_of_week,
+                  0 AS signal_day_of_week_non_null_rows,
+                  FALSE AS has_atr,
+                  0 AS atr_non_null_rows,
+                  FALSE AS has_vol_z,
+                  0 AS vol_z_non_null_rows,
+                  FALSE AS has_anchor_regime,
+                  0 AS anchor_regime_non_null_rows,
+                  FALSE AS has_pnl_R,
+                  0 AS pnl_R_non_null_rows
+                """
+            )
+            continue
+
+        cols = table_columns(con, source_name)
+        select_statements.append(
+            f"""
+            SELECT
+              '{source_name}' AS source_name,
+              COUNT(*) AS row_count,
+              {'TRUE' if 'schema_version' in cols else 'FALSE'} AS has_schema_version,
+              {'TRUE' if 'score' in cols else 'FALSE'} AS has_score,
+              {raw_count_expr(source_name, cols, 'score')},
+              {'TRUE' if 'signal_hour_utc' in cols else 'FALSE'} AS has_signal_hour_utc,
+              {raw_count_expr(source_name, cols, 'signal_hour_utc')},
+              {'TRUE' if 'signal_day_of_week' in cols else 'FALSE'} AS has_signal_day_of_week,
+              {raw_count_expr(source_name, cols, 'signal_day_of_week')},
+              {'TRUE' if 'atr' in cols else 'FALSE'} AS has_atr,
+              {raw_count_expr(source_name, cols, 'atr')},
+              {'TRUE' if 'vol_z' in cols else 'FALSE'} AS has_vol_z,
+              {raw_count_expr(source_name, cols, 'vol_z')},
+              {'TRUE' if 'anchor_regime' in cols else 'FALSE'} AS has_anchor_regime,
+              {raw_count_expr(source_name, cols, 'anchor_regime')},
+              {'TRUE' if 'pnl_R' in cols else 'FALSE'} AS has_pnl_R,
+              {raw_count_expr(source_name, cols, 'pnl_R')}
+            FROM {source_name}
+            """
+        )
+
+    con.execute("CREATE VIEW schema_coverage_summary AS " + "\nUNION ALL\n".join(select_statements))
+
+
 def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
     # 1) trades + 2) trades_enriched
     if "alerts_intents" in csvs and "outcomes" in csvs:
-        intent_cols = {
-            row[1] for row in con.execute("PRAGMA table_info('alerts_intents')").fetchall()
-        }
-
-        def intent_expr(col: str, fallback_expr: str = "NULL") -> str:
-            if col in intent_cols:
-                return f"i.{col}"
-            return f"{fallback_expr} AS {col}"
-
-        def intent_numeric_expr(col: str) -> str:
-            if col in intent_cols:
-                return f"TRY_CAST(i.{col} AS DOUBLE) AS {col}"
-            return f"NULL AS {col}"
+        intent_cols = table_columns(con, "alerts_intents")
+        outcome_cols = table_columns(con, "outcomes")
 
         con.execute("DROP VIEW IF EXISTS trades")
         con.execute(
@@ -61,59 +152,59 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
               i.config_hash,
               i.tier,
               i.signal_ts_utc,
-              {intent_expr('signal_hour_utc', "EXTRACT(HOUR FROM TRY_CAST(i.signal_ts_utc AS TIMESTAMP))")},
-              {intent_expr('signal_day_of_week', "STRFTIME(TRY_CAST(i.signal_ts_utc AS TIMESTAMP), '%a')")},
-              i.bar_start_ts_utc,
-              i.bar_end_ts_utc,
-              TRY_CAST(i.timeframe_min AS INTEGER) AS timeframe_min,
-              TRY_CAST(i.score AS DOUBLE) AS score,
-              {intent_numeric_expr('atr')},
-              {intent_numeric_expr('ma20')},
-              {intent_numeric_expr('ma50')},
-              {intent_numeric_expr('ma200')},
-              {intent_numeric_expr('breakout_level')},
-              {intent_numeric_expr('breakout_distance_atr')},
-              {intent_numeric_expr('ma20_distance_atr')},
-              {intent_numeric_expr('ma50_distance_atr')},
-              {intent_numeric_expr('ma200_distance_atr')},
-              {intent_numeric_expr('ma20_slope_pct')},
-              {intent_numeric_expr('ma50_slope_pct')},
-              {intent_numeric_expr('range_pct')},
-              {intent_numeric_expr('close_location_in_bar')},
-              i.anchor_symbol,
-              i.anchor_regime,
-              TRY_CAST(i.anchor_close AS DOUBLE) AS anchor_close,
-              TRY_CAST(i.anchor_ma50 AS DOUBLE) AS anchor_ma50,
-              TRY_CAST(i.anchor_ma200 AS DOUBLE) AS anchor_ma200,
-              TRY_CAST(i.vol_z AS DOUBLE) AS vol_z,
-              TRY_CAST(i.extended_atr AS DOUBLE) AS extended_atr,
-              TRY_CAST(i.signal_px AS DOUBLE) AS signal_px,
-              TRY_CAST(i.entry_low AS DOUBLE) AS entry_low,
-              TRY_CAST(i.entry_high AS DOUBLE) AS entry_high,
-              {intent_numeric_expr('entry_zone_width_pct')},
-              TRY_CAST(i.stop_px AS DOUBLE) AS stop_px,
-              TRY_CAST(i.t1_px AS DOUBLE) AS t1_px,
-              TRY_CAST(i.t2_px AS DOUBLE) AS t2_px,
-              i.alert_status,
-              TRY_CAST(o.entered AS BOOLEAN) AS entered,
-              o.entry_ts_utc,
-              TRY_CAST(o.entry_px AS DOUBLE) AS entry_px,
-              o.exit_ts_utc,
-              TRY_CAST(o.exit_px AS DOUBLE) AS exit_px,
-              o.exit_reason,
-              TRY_CAST(o.pnl_R AS DOUBLE) AS pnl_R,
-              TRY_CAST(o.mfe_R AS DOUBLE) AS mfe_R,
-              TRY_CAST(o.mae_R AS DOUBLE) AS mae_R,
-              TRY_CAST(o.time_in_trade_s AS DOUBLE) AS time_in_trade_s,
-              TRY_CAST(o.time_to_t1_s AS DOUBLE) AS time_to_t1_s,
-              TRY_CAST(o.time_to_t2_s AS DOUBLE) AS time_to_t2_s,
-              TRY_CAST(o.time_to_stop_s AS DOUBLE) AS time_to_stop_s,
-              TRY_CAST(o.t1_touched AS BOOLEAN) AS t1_touched,
-              TRY_CAST(o.t2_touched AS BOOLEAN) AS t2_touched,
-              TRY_CAST(o.stop_touched AS BOOLEAN) AS stop_touched
+              {raw_select_expr('i', intent_cols, 'signal_hour_utc', "EXTRACT(HOUR FROM TRY_CAST(i.signal_ts_utc AS TIMESTAMP))")},
+              {raw_select_expr('i', intent_cols, 'signal_day_of_week', "STRFTIME(TRY_CAST(i.signal_ts_utc AS TIMESTAMP), '%a')")},
+              {raw_select_expr('i', intent_cols, 'bar_start_ts_utc')},
+              {raw_select_expr('i', intent_cols, 'bar_end_ts_utc')},
+              {raw_int_select_expr('i', intent_cols, 'timeframe_min')},
+              {raw_numeric_select_expr('i', intent_cols, 'score')},
+              {raw_numeric_select_expr('i', intent_cols, 'atr')},
+              {raw_numeric_select_expr('i', intent_cols, 'ma20')},
+              {raw_numeric_select_expr('i', intent_cols, 'ma50')},
+              {raw_numeric_select_expr('i', intent_cols, 'ma200')},
+              {raw_numeric_select_expr('i', intent_cols, 'breakout_level')},
+              {raw_numeric_select_expr('i', intent_cols, 'breakout_distance_atr')},
+              {raw_numeric_select_expr('i', intent_cols, 'ma20_distance_atr')},
+              {raw_numeric_select_expr('i', intent_cols, 'ma50_distance_atr')},
+              {raw_numeric_select_expr('i', intent_cols, 'ma200_distance_atr')},
+              {raw_numeric_select_expr('i', intent_cols, 'ma20_slope_pct')},
+              {raw_numeric_select_expr('i', intent_cols, 'ma50_slope_pct')},
+              {raw_numeric_select_expr('i', intent_cols, 'range_pct')},
+              {raw_numeric_select_expr('i', intent_cols, 'close_location_in_bar')},
+              {raw_select_expr('i', intent_cols, 'anchor_symbol')},
+              {raw_select_expr('i', intent_cols, 'anchor_regime')},
+              {raw_numeric_select_expr('i', intent_cols, 'anchor_close')},
+              {raw_numeric_select_expr('i', intent_cols, 'anchor_ma50')},
+              {raw_numeric_select_expr('i', intent_cols, 'anchor_ma200')},
+              {raw_numeric_select_expr('i', intent_cols, 'vol_z')},
+              {raw_numeric_select_expr('i', intent_cols, 'extended_atr')},
+              {raw_numeric_select_expr('i', intent_cols, 'signal_px')},
+              {raw_numeric_select_expr('i', intent_cols, 'entry_low')},
+              {raw_numeric_select_expr('i', intent_cols, 'entry_high')},
+              {raw_numeric_select_expr('i', intent_cols, 'entry_zone_width_pct')},
+              {raw_numeric_select_expr('i', intent_cols, 'stop_px')},
+              {raw_numeric_select_expr('i', intent_cols, 't1_px')},
+              {raw_numeric_select_expr('i', intent_cols, 't2_px')},
+              {raw_select_expr('i', intent_cols, 'alert_status')},
+              {raw_boolean_select_expr('o', outcome_cols, 'entered')},
+              {raw_select_expr('o', outcome_cols, 'entry_ts_utc')},
+              {raw_numeric_select_expr('o', outcome_cols, 'entry_px')},
+              {raw_select_expr('o', outcome_cols, 'exit_ts_utc')},
+              {raw_numeric_select_expr('o', outcome_cols, 'exit_px')},
+              {raw_select_expr('o', outcome_cols, 'exit_reason')},
+              {raw_numeric_select_expr('o', outcome_cols, 'pnl_R')},
+              {raw_numeric_select_expr('o', outcome_cols, 'mfe_R')},
+              {raw_numeric_select_expr('o', outcome_cols, 'mae_R')},
+              {raw_numeric_select_expr('o', outcome_cols, 'time_in_trade_s')},
+              {raw_numeric_select_expr('o', outcome_cols, 'time_to_t1_s')},
+              {raw_numeric_select_expr('o', outcome_cols, 'time_to_t2_s')},
+              {raw_numeric_select_expr('o', outcome_cols, 'time_to_stop_s')},
+              {raw_boolean_select_expr('o', outcome_cols, 't1_touched')},
+              {raw_boolean_select_expr('o', outcome_cols, 't2_touched')},
+              {raw_boolean_select_expr('o', outcome_cols, 'stop_touched')}
             FROM alerts_intents i
             LEFT JOIN outcomes o USING (alert_id)
-            WHERE i.alert_status = 'ALERT_CREATED'
+            WHERE COALESCE({raw_value_expr('i', intent_cols, 'alert_status')}, '') = 'ALERT_CREATED'
             """
         )
 
@@ -149,37 +240,39 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
 
     # 3) executions_enriched
     if "executions" in csvs:
+        execution_cols = table_columns(con, "executions")
         con.execute("DROP VIEW IF EXISTS executions_enriched")
         con.execute(
-            """
+            f"""
             CREATE VIEW executions_enriched AS
             SELECT
               e.*,
-              TRY_CAST(e.exec_ts_utc AS TIMESTAMP) AS exec_ts,
-              CAST(TRY_CAST(e.exec_ts_utc AS TIMESTAMP) AS DATE) AS exec_date,
-              EXTRACT(HOUR FROM TRY_CAST(e.exec_ts_utc AS TIMESTAMP)) AS exec_hour_utc,
-              CASE WHEN e.exec_type = 'ENTRY' THEN TRUE ELSE FALSE END AS is_entry,
-              CASE WHEN e.exec_type <> 'ENTRY' THEN TRUE ELSE FALSE END AS is_exit
+              TRY_CAST({raw_value_expr('e', execution_cols, 'exec_ts_utc')} AS TIMESTAMP) AS exec_ts,
+              CAST(TRY_CAST({raw_value_expr('e', execution_cols, 'exec_ts_utc')} AS TIMESTAMP) AS DATE) AS exec_date,
+              EXTRACT(HOUR FROM TRY_CAST({raw_value_expr('e', execution_cols, 'exec_ts_utc')} AS TIMESTAMP)) AS exec_hour_utc,
+              CASE WHEN COALESCE({raw_value_expr('e', execution_cols, 'exec_type')}, '') = 'ENTRY' THEN TRUE ELSE FALSE END AS is_entry,
+              CASE WHEN COALESCE({raw_value_expr('e', execution_cols, 'exec_type')}, '') <> 'ENTRY' THEN TRUE ELSE FALSE END AS is_exit
             FROM executions e
             """
         )
 
     # 4) strategy_summary (real status values only)
     if "alerts_intents" in csvs:
+        intent_cols = table_columns(con, "alerts_intents")
         con.execute("DROP VIEW IF EXISTS strategy_summary")
         con.execute(
-            """
+            f"""
             CREATE VIEW strategy_summary AS
             SELECT
-              strategy_profile,
-              tier,
+              {raw_select_expr('', intent_cols, 'strategy_profile')},
+              {raw_select_expr('', intent_cols, 'tier')},
               COUNT(*) AS intents_total,
-              COUNT(*) FILTER (WHERE alert_status = 'ALERT_CREATED') AS alerts_created,
-              COUNT(*) FILTER (WHERE alert_status = 'SKIPPED_COOLDOWN') AS skipped_cooldown,
-              COUNT(*) FILTER (WHERE alert_status = 'SKIPPED_INVALID_STOP') AS skipped_invalid_stop,
-              COUNT(*) FILTER (WHERE alert_status = 'SKIPPED_TIGHT_STOP') AS skipped_tight_stop,
-              COUNT(*) FILTER (WHERE alert_status = 'ERROR_ALERT_PIPELINE') AS pipeline_errors,
-              AVG(TRY_CAST(score AS DOUBLE)) AS avg_score
+              COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('', intent_cols, 'alert_status')}, '') = 'ALERT_CREATED') AS alerts_created,
+              COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('', intent_cols, 'alert_status')}, '') = 'SKIPPED_COOLDOWN') AS skipped_cooldown,
+              COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('', intent_cols, 'alert_status')}, '') = 'SKIPPED_INVALID_STOP') AS skipped_invalid_stop,
+              COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('', intent_cols, 'alert_status')}, '') = 'SKIPPED_TIGHT_STOP') AS skipped_tight_stop,
+              COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('', intent_cols, 'alert_status')}, '') = 'ERROR_ALERT_PIPELINE') AS pipeline_errors,
+              AVG(TRY_CAST({raw_value_expr('', intent_cols, 'score')} AS DOUBLE)) AS avg_score
             FROM alerts_intents
             GROUP BY 1,2
             ORDER BY 1,2
@@ -188,38 +281,40 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
 
     # 5) alert_funnel (intent-stage only; no pre-threshold claims)
     if "alerts_intents" in csvs and "outcomes" in csvs:
+        intent_cols = table_columns(con, "alerts_intents")
+        outcome_cols = table_columns(con, "outcomes")
         con.execute("DROP VIEW IF EXISTS alert_funnel")
         con.execute(
-            """
+            f"""
             CREATE VIEW alert_funnel AS
             WITH intent_rollup AS (
               SELECT
-                i.market_type,
-                i.strategy_profile,
-                i.tier,
+                {raw_select_expr('i', intent_cols, 'market_type')},
+                {raw_select_expr('i', intent_cols, 'strategy_profile')},
+                {raw_select_expr('i', intent_cols, 'tier')},
                 COUNT(*) AS total_intent_rows,
-                COUNT(*) FILTER (WHERE i.alert_status = 'ALERT_CREATED') AS alerts_created,
-                COUNT(*) FILTER (WHERE i.alert_status = 'SKIPPED_COOLDOWN') AS skipped_cooldown,
-                COUNT(*) FILTER (WHERE i.alert_status = 'SKIPPED_INVALID_STOP') AS skipped_invalid_stop,
-                COUNT(*) FILTER (WHERE i.alert_status = 'SKIPPED_TIGHT_STOP') AS skipped_tight_stop,
-                COUNT(*) FILTER (WHERE i.alert_status = 'ERROR_ALERT_PIPELINE') AS pipeline_errors
+                COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('i', intent_cols, 'alert_status')}, '') = 'ALERT_CREATED') AS alerts_created,
+                COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('i', intent_cols, 'alert_status')}, '') = 'SKIPPED_COOLDOWN') AS skipped_cooldown,
+                COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('i', intent_cols, 'alert_status')}, '') = 'SKIPPED_INVALID_STOP') AS skipped_invalid_stop,
+                COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('i', intent_cols, 'alert_status')}, '') = 'SKIPPED_TIGHT_STOP') AS skipped_tight_stop,
+                COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('i', intent_cols, 'alert_status')}, '') = 'ERROR_ALERT_PIPELINE') AS pipeline_errors
               FROM alerts_intents i
               GROUP BY 1,2,3
             ),
             created_outcomes AS (
               SELECT
-                i.market_type,
-                i.strategy_profile,
-                i.tier,
-                COUNT(*) FILTER (WHERE COALESCE(o.entered, FALSE)) AS entered_count,
-                COUNT(*) FILTER (WHERE o.pnl_R IS NOT NULL) AS closed_trade_count,
-                COUNT(*) FILTER (WHERE o.exit_reason = 'NO_ENTRY_FILL') AS no_entry_fill_count,
-                COUNT(*) FILTER (WHERE o.exit_reason = 'STOP') AS stop_exit_count,
-                COUNT(*) FILTER (WHERE o.exit_reason = 'TIMEOUT') AS timeout_exit_count,
-                COUNT(*) FILTER (WHERE o.exit_reason = 'T2') AS t2_exit_count
+                {raw_select_expr('i', intent_cols, 'market_type')},
+                {raw_select_expr('i', intent_cols, 'strategy_profile')},
+                {raw_select_expr('i', intent_cols, 'tier')},
+                COUNT(*) FILTER (WHERE COALESCE({raw_boolean_value_expr('o', outcome_cols, 'entered')}, FALSE)) AS entered_count,
+                COUNT(*) FILTER (WHERE {raw_numeric_value_expr('o', outcome_cols, 'pnl_R')} IS NOT NULL) AS closed_trade_count,
+                COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('o', outcome_cols, 'exit_reason')}, '') = 'NO_ENTRY_FILL') AS no_entry_fill_count,
+                COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('o', outcome_cols, 'exit_reason')}, '') = 'STOP') AS stop_exit_count,
+                COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('o', outcome_cols, 'exit_reason')}, '') = 'TIMEOUT') AS timeout_exit_count,
+                COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('o', outcome_cols, 'exit_reason')}, '') = 'T2') AS t2_exit_count
               FROM alerts_intents i
               LEFT JOIN outcomes o USING (alert_id)
-              WHERE i.alert_status = 'ALERT_CREATED'
+              WHERE COALESCE({raw_value_expr('i', intent_cols, 'alert_status')}, '') = 'ALERT_CREATED'
               GROUP BY 1,2,3
             )
             SELECT
@@ -276,9 +371,7 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
 
     # 7) optional telemetry_summary
     if "telemetry" in csvs:
-        telemetry_cols = {
-            row[1] for row in con.execute("PRAGMA table_info('telemetry')").fetchall()
-        }
+        telemetry_cols = table_columns(con, "telemetry")
         if "hour_start_utc" in telemetry_cols:
             ts_col = "hour_start_utc"
         elif "timestamp_utc" in telemetry_cols:
@@ -306,6 +399,8 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
                 SELECT * FROM telemetry
                 """
             )
+
+    create_schema_coverage_summary(con, csvs)
 
 
 def main() -> None:
