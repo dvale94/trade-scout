@@ -31,6 +31,16 @@ def connect_research_db(
     return duckdb.connect(str(db_path), read_only=read_only)
 
 
+def _table_columns(
+    con: duckdb.DuckDBPyConnection,
+    table_or_view: str,
+) -> set[str]:
+    try:
+        return {row[1] for row in con.execute(f"PRAGMA table_info('{table_or_view}')").fetchall()}
+    except duckdb.Error:
+        return set()
+
+
 def _run_select(
     table_or_view: str,
     *,
@@ -42,35 +52,38 @@ def _run_select(
     entered_only: bool = False,
     closed_only: bool = False,
 ) -> pd.DataFrame:
-    clauses: list[str] = []
-    params: list[Any] = []
-
-    # Applied only where columns exist in the selected object.
-    if market_type:
-        clauses.append("market_type = ?")
-        params.append(market_type)
-
-    if alert_status:
-        clauses.append("alert_status = ?")
-        params.append(alert_status)
-
-    if entered_only:
-        clauses.append("COALESCE(entered, FALSE) = TRUE")
-
-    if closed_only:
-        clauses.append("pnl_R IS NOT NULL")
-
-    sql = f"SELECT * FROM {table_or_view}"
-    if clauses:
-        sql += " WHERE " + " AND ".join(clauses)
-    if order_by:
-        sql += f" ORDER BY {order_by}"
-    if limit is not None:
-        sql += " LIMIT ?"
-        params.append(limit)
-
     con = connect_research_db(duckdb_path=duckdb_path, read_only=True)
     try:
+        cols = _table_columns(con, table_or_view)
+        if not cols:
+            return pd.DataFrame()
+
+        clauses: list[str] = []
+        params: list[Any] = []
+
+        if market_type and "market_type" in cols:
+            clauses.append("market_type = ?")
+            params.append(market_type)
+
+        if alert_status and "alert_status" in cols:
+            clauses.append("alert_status = ?")
+            params.append(alert_status)
+
+        if entered_only and "entered" in cols:
+            clauses.append("COALESCE(entered, FALSE) = TRUE")
+
+        if closed_only and "pnl_R" in cols:
+            clauses.append("pnl_R IS NOT NULL")
+
+        sql = f"SELECT * FROM {table_or_view}"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        if order_by:
+            sql += f" ORDER BY {order_by}"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+
         return con.execute(sql, params).df()
     finally:
         con.close()
@@ -79,7 +92,7 @@ def _run_select(
 def _safe_select(**kwargs) -> pd.DataFrame:
     try:
         return _run_select(**kwargs)
-    except duckdb.Error:
+    except Exception:
         return pd.DataFrame()
 
 
@@ -196,4 +209,16 @@ def load_symbol_regime_summary_sql(
         order_by="symbol, anchor_regime, tier",
         limit=limit,
         market_type=market_type,
+    )
+
+
+def load_schema_coverage_summary_sql(
+    duckdb_path: str | Path | None = None,
+    limit: int | None = None,
+) -> pd.DataFrame:
+    return _safe_select(
+        table_or_view="schema_coverage_summary",
+        duckdb_path=duckdb_path,
+        order_by="source_name",
+        limit=limit,
     )
