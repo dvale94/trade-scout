@@ -1,10 +1,13 @@
+from __future__ import annotations
+
 import csv
 import os
 import json
 from datetime import timezone
-from typing import Any
+from typing import Any, Union
 
 from . import config
+from .journal_rows import AlertContextRow, AlertIntentRow, ExecutionRow, OutcomeRow
 from .strategy import Candidate
 
 LOG_DIR = config.LOG_DIR
@@ -214,11 +217,17 @@ def _write_row(path: str, row: dict[str, Any]):
 
 
 def _write_row_with_schema(path: str, row: dict[str, Any], fieldnames: list[str]):
-    normalized = _normalize_row_for_schema(row, fieldnames, path)
+    normalized = _normalize_row_for_schema(_coerce_csv_row(row), fieldnames, path)
     _migrate_csv_schema_additive(path, fieldnames)
     with open(path, "a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writerow(normalized)
+
+
+def _coerce_csv_row(row: Any) -> dict[str, Any]:
+    if hasattr(row, "to_csv_row") and callable(row.to_csv_row):
+        return row.to_csv_row()
+    return dict(row)
 
 
 def _normalize_row_for_schema(row: dict[str, Any], fieldnames: list[str], path: str) -> dict[str, Any]:
@@ -326,7 +335,7 @@ def log_alert(candidate: Candidate, computed: dict, tier: str, strategy_profile:
     _write_row(alerts_path(), row)
 
 
-def log_outcome(outcome_row: dict[str, Any]):
+def log_outcome(outcome_row: Union[OutcomeRow, dict[str, Any]]):
     _write_row_with_schema(outcomes_path(), outcome_row, OUTCOME_FIELDS)
 
 
@@ -334,15 +343,15 @@ def log_telemetry(row: dict[str, Any]):
     _write_row_with_schema(telemetry_path(), row, TELEMETRY_FIELDS)
 
 
-def log_alert_intent(row: dict[str, Any]):
+def log_alert_intent(row: Union[AlertIntentRow, dict[str, Any]]):
     _write_row_with_schema(alerts_intents_path(), row, ALERT_INTENT_FIELDS)
 
 
-def log_alert_context(row: dict[str, Any]):
+def log_alert_context(row: Union[AlertContextRow, dict[str, Any]]):
     _write_row_with_schema(alert_context_path(config.MARKET_TYPE), row, ALERT_CONTEXT_FIELDS)
 
 
-def log_execution(row: dict[str, Any]):
+def log_execution(row: Union[ExecutionRow, dict[str, Any]]):
     _write_row_with_schema(executions_path(), row, EXECUTION_FIELDS)
 
 

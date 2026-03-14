@@ -1,9 +1,12 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone, timedelta
 from typing import Any
 from uuid import uuid4
 
 from . import journal
+from .journal_rows import ExecutionRow, OutcomeRow
+from .watch_state import WatchLifecycleState, assert_valid_watch_lifecycle, lifecycle_state_for_watch
+from .watch_transitions import WatchBar, WatchDecision, WatchTransitionType, decide_watch_bar_transition
 
 def _dt_to_iso(dt: datetime | None) -> str | None:
     return dt.astimezone(timezone.utc).isoformat() if dt else None
@@ -60,6 +63,10 @@ class Watch:
     t2_ts: datetime | None = None
     stop_ts: datetime | None = None
 
+    @property
+    def lifecycle_state(self) -> WatchLifecycleState:
+        return lifecycle_state_for_watch(self)
+
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -103,7 +110,7 @@ class Watch:
 
     @staticmethod
     def from_dict(d: dict[str, Any]) -> "Watch":
-        return Watch(
+        watch = Watch(
             alert_id=d["alert_id"],
             symbol=d["symbol"],
             timeframe_min=int(d["timeframe_min"]),
@@ -140,9 +147,11 @@ class Watch:
             done_reason=d.get("done_reason"),
             done_ts=_dt_from_iso(d.get("done_ts")),
         )
+        assert_valid_watch_lifecycle(watch)
+        return watch
     
 
-    def _exec_row(self, exec_type: str, ts: datetime, px: float, px_source: str) -> dict[str, Any]:
+    def _exec_row(self, exec_type: str, ts: datetime, px: float, px_source: str) -> ExecutionRow:
         latency_ms = None
         try:
             latency_ms = int((ts - self.created_ts).total_seconds() * 1000)
@@ -159,23 +168,23 @@ class Watch:
         if entry_fill_px is not None and self.entry_high > 0:
             slippage_pct = ((entry_fill_px - self.entry_high) / self.entry_high) * 100.0
 
-        return {
-            "exec_id": str(uuid4()),
-            "alert_id": self.alert_id,
-            "symbol": self.symbol,
-            "side": self.side,
-            "exec_type": exec_type,
-            "exec_ts_utc": ts.astimezone(timezone.utc).isoformat(),
-            "exec_px": float(px),
-            "exec_px_source": px_source,
-            "entry_fill_px": entry_fill_px,
-            "entry_fill_ts_utc": _dt_to_iso(entry_fill_ts),
-            "slippage_pct": round(slippage_pct, 6) if slippage_pct is not None else None,
-            "qty": None,  # placeholder for now
-            "fee_estimate": None,
-            "slippage_bps_estimate": None,
-            "latency_ms": latency_ms,
-        }
+        return ExecutionRow(
+            exec_id=str(uuid4()),
+            alert_id=self.alert_id,
+            symbol=self.symbol,
+            side=self.side,
+            exec_type=exec_type,
+            exec_ts_utc=ts.astimezone(timezone.utc).isoformat(),
+            exec_px=float(px),
+            exec_px_source=px_source,
+            entry_fill_px=entry_fill_px,
+            entry_fill_ts_utc=_dt_to_iso(entry_fill_ts),
+            slippage_pct=round(slippage_pct, 6) if slippage_pct is not None else None,
+            qty=None,
+            fee_estimate=None,
+            slippage_bps_estimate=None,
+            latency_ms=latency_ms,
+        )
 
 
     def _first_touch_info(self) -> tuple[str, str | None]:
@@ -214,7 +223,7 @@ class Watch:
         }
 
 
-    def as_outcome_row(self) -> dict[str, Any]:
+    def as_outcome_row(self) -> OutcomeRow:
         # Touch flags
         t1_touched = self.t1_ts is not None
         t2_touched = self.t2_ts is not None
@@ -238,53 +247,42 @@ class Watch:
                 # TIMEOUT pnl_R is overridden at finalize using exit_px
                 pnl_R = 0.0
 
-        return {
-            "alert_id": self.alert_id,
-            "symbol": self.symbol,
-            "side": self.side,
-
-            "strategy_profile": self.strategy_profile,
-            "strategy_version": self.strategy_version,
-            "config_hash": self.config_hash,
-
-            "entry_ts_utc": _dt_to_iso(self.entry_ts),
-            "entry_px": self.entry_px,
-
-            "exit_ts_utc": _dt_to_iso(self.done_ts),
-            "exit_px": None,  # we’ll fill with actual exit px once we store it (see update logic below)
-            "exit_reason": self.done_reason,
-
-            "pnl_R": pnl_R,
-            "pnl_usd_est": None,
-
-            "t1_touched": t1_touched,
-            "t1_ts_utc": _dt_to_iso(self.t1_ts),
-            "t2_touched": t2_touched,
-            "t2_ts_utc": _dt_to_iso(self.t2_ts),
-            "stop_touched": stop_touched,
-            "stop_ts_utc": _dt_to_iso(self.stop_ts),
-            "first_touch": first_touch,
-            "first_touch_ts_utc": first_touch_ts_utc,
-
-            # MFE/MAE describe the best and worst excursion seen over the watch lifecycle.
-            "mfe_R": mfe_mae["mfe_r"],
-            "mae_R": mfe_mae["mae_r"],
-            "mfe_r": mfe_mae["mfe_r"],
-            "mae_r": mfe_mae["mae_r"],
-            "mfe_px": mfe_mae["mfe_px"],
-            "mae_px": mfe_mae["mae_px"],
-
-            "time_in_trade_s": time_in_trade_s,
-            "time_to_t1_s": _dt_diff_s(self.entry_ts, self.t1_ts) if self.entered else None,
-            "time_to_t2_s": _dt_diff_s(self.entry_ts, self.t2_ts) if self.entered else None,
-            "time_to_stop_s": _dt_diff_s(self.entry_ts, self.stop_ts) if self.entered else None,
-
-            "max_spread_bps_seen": None,
-            "avg_spread_bps_seen": None,
-
-            # useful to distinguish “watch existed” vs “trade existed”
-            "entered": self.entered,
-        }
+        return OutcomeRow(
+            alert_id=self.alert_id,
+            symbol=self.symbol,
+            side=self.side,
+            strategy_profile=self.strategy_profile,
+            strategy_version=self.strategy_version,
+            config_hash=self.config_hash,
+            entry_ts_utc=_dt_to_iso(self.entry_ts),
+            entry_px=self.entry_px,
+            exit_ts_utc=_dt_to_iso(self.done_ts),
+            exit_px=None,
+            exit_reason=self.done_reason,
+            pnl_R=pnl_R,
+            pnl_usd_est=None,
+            t1_touched=t1_touched,
+            t1_ts_utc=_dt_to_iso(self.t1_ts),
+            t2_touched=t2_touched,
+            t2_ts_utc=_dt_to_iso(self.t2_ts),
+            stop_touched=stop_touched,
+            stop_ts_utc=_dt_to_iso(self.stop_ts),
+            first_touch=first_touch,
+            first_touch_ts_utc=first_touch_ts_utc,
+            mfe_R=mfe_mae["mfe_r"],
+            mae_R=mfe_mae["mae_r"],
+            mfe_r=mfe_mae["mfe_r"],
+            mae_r=mfe_mae["mae_r"],
+            mfe_px=mfe_mae["mfe_px"],
+            mae_px=mfe_mae["mae_px"],
+            time_in_trade_s=time_in_trade_s,
+            time_to_t1_s=_dt_diff_s(self.entry_ts, self.t1_ts) if self.entered else None,
+            time_to_t2_s=_dt_diff_s(self.entry_ts, self.t2_ts) if self.entered else None,
+            time_to_stop_s=_dt_diff_s(self.entry_ts, self.stop_ts) if self.entered else None,
+            max_spread_bps_seen=None,
+            avg_spread_bps_seen=None,
+            entered=self.entered,
+        )
 
 
 class WatchManager:
@@ -298,6 +296,7 @@ class WatchManager:
 
 
     def add(self, w: Watch):
+        assert_valid_watch_lifecycle(w)
         arr = self.active.setdefault(w.symbol, [])
         # limit active watches per symbol
         if len(arr) >= self.max_active_per_symbol:
@@ -310,88 +309,19 @@ class WatchManager:
         if symbol not in self.active:
             return
 
+        bar = WatchBar(high=high, low=low, close=close, ts=ts)
         keep: list[Watch] = []
 
         for w in self.active[symbol]:
+            assert_valid_watch_lifecycle(w)
             if w.done:
                 continue
 
-            # Track excursions
-            w.max_favorable = max(w.max_favorable, high)
-            w.max_adverse = min(w.max_adverse, low)
-
-            # ENTRY simulation (only once)
-            if not w.entered:
-                zone_touched = (low <= w.entry_high) and (high >= w.entry_low)
-                if zone_touched:
-                    w.entered = True
-                    w.entry_ts = ts
-                    w.entry_px = float(w.entry_high)  # conservative worst fill in zone
-                    journal.log_execution(w._exec_row("ENTRY", ts, w.entry_px, "zone_touch_entry_high"))
-
-            if not w.entered:
-                if ts - w.created_ts >= self.timeout:
-                    w.done = True
-                    w.done_reason = "NO_ENTRY_FILL"
-                    w.done_ts = ts
-                    # No execution rows (because no fills happened)
-                    journal.log_outcome(w.as_outcome_row())
-                    continue
-
+            decision = decide_watch_bar_transition(w, bar, self.timeout)
+            self._apply_decision(w, decision)
+            assert_valid_watch_lifecycle(w)
+            if decision.keep_active:
                 keep.append(w)
-                continue
-
-            # STOP (worst-case priority)
-            if low <= w.stop:
-                w.done = True
-                w.done_reason = "STOP"
-                w.done_ts = ts
-                w.stop_ts = ts
-
-                exit_px = float(w.stop)
-                journal.log_execution(w._exec_row("EXIT_STOP", ts, exit_px, "bar_touch_stop"))
-                out = w.as_outcome_row()
-                out["exit_px"] = exit_px
-                journal.log_outcome(out)
-                continue
-
-            # T1 touch (log execution once)
-            if not w.hit_t1 and high >= w.t1:
-                w.hit_t1 = True
-                w.t1_ts = ts
-                journal.log_execution(w._exec_row("EXIT_T1", ts, float(w.t1), "bar_touch_t1"))
-
-            # T2 = final exit
-            if not w.hit_t2 and high >= w.t2:
-                w.hit_t2 = True
-                w.t2_ts = ts
-                w.done = True
-                w.done_reason = "T2"
-                w.done_ts = ts
-
-                exit_px = float(w.t2)
-                journal.log_execution(w._exec_row("EXIT_T2", ts, exit_px, "bar_touch_t2"))
-                out = w.as_outcome_row()
-                out["exit_px"] = exit_px
-                journal.log_outcome(out)
-                continue
-
-            # TIMEOUT (entered but no stop/t2)
-            if ts - w.created_ts >= self.timeout:
-                w.done = True
-                w.done_reason = "TIMEOUT"
-                w.done_ts = ts
-
-                exit_px = float(close)  # best available from bar stream
-                journal.log_execution(w._exec_row("EXIT_TIMEOUT", ts, exit_px, "bar_close_timeout"))
-                out = w.as_outcome_row()
-                out["exit_px"] = exit_px
-                if w.entry_px is not None and w.R > 0:
-                    out["pnl_R"] = round((exit_px - w.entry_px) / w.R, 4)
-                journal.log_outcome(out)
-                continue
-
-            keep.append(w)            
 
         self.active[symbol] = keep
         if not self.active[symbol]:
@@ -416,3 +346,96 @@ class WatchManager:
         for sym, items in active.items():
             restored[sym] = [Watch.from_dict(x) for x in items]
         self.active = restored
+
+    def _apply_decision(self, w: Watch, decision: WatchDecision) -> None:
+        w.max_favorable = decision.max_favorable
+        w.max_adverse = decision.max_adverse
+
+        for transition in decision.transitions:
+            if transition.transition_type == WatchTransitionType.ENTER:
+                self._apply_enter_transition(w, transition)
+                continue
+            if transition.transition_type == WatchTransitionType.EXPIRE_PENDING:
+                self._apply_expire_pending_transition(w, transition)
+                continue
+            if transition.transition_type == WatchTransitionType.TOUCH_T1:
+                self._apply_touch_t1_transition(w, transition)
+                continue
+            if transition.transition_type == WatchTransitionType.EXIT_STOP:
+                self._apply_exit_stop_transition(w, transition)
+                continue
+            if transition.transition_type == WatchTransitionType.EXIT_T2:
+                self._apply_exit_t2_transition(w, transition)
+                continue
+            if transition.transition_type == WatchTransitionType.EXIT_TIMEOUT:
+                self._apply_exit_timeout_transition(w, transition)
+                continue
+            raise ValueError(f"Unknown watch transition type: {transition.transition_type}")
+
+    def _apply_enter_transition(self, w: Watch, transition) -> None:
+        if w.lifecycle_state != WatchLifecycleState.PENDING_ENTRY:
+            raise ValueError("watch cannot enter twice")
+        w.entered = True
+        w.entry_ts = transition.ts
+        w.entry_px = float(w.entry_high)
+        journal.log_execution(w._exec_row("ENTRY", transition.ts, w.entry_px, transition.px_source or "zone_touch_entry_high"))
+
+    def _apply_expire_pending_transition(self, w: Watch, transition) -> None:
+        if w.lifecycle_state != WatchLifecycleState.PENDING_ENTRY:
+            raise ValueError("only pending watches can expire without entry")
+        w.done = True
+        w.done_reason = "NO_ENTRY_FILL"
+        w.done_ts = transition.ts
+        journal.log_outcome(w.as_outcome_row())
+
+    def _apply_touch_t1_transition(self, w: Watch, transition) -> None:
+        if w.lifecycle_state != WatchLifecycleState.ENTERED:
+            raise ValueError("watch must be entered before T1")
+        if w.hit_t1:
+            raise ValueError("watch cannot touch T1 twice")
+        w.hit_t1 = True
+        w.t1_ts = transition.ts
+        journal.log_execution(w._exec_row("EXIT_T1", transition.ts, float(w.t1), transition.px_source or "bar_touch_t1"))
+
+    def _apply_exit_stop_transition(self, w: Watch, transition) -> None:
+        if w.lifecycle_state != WatchLifecycleState.ENTERED:
+            raise ValueError("watch cannot stop out before entry")
+        w.done = True
+        w.done_reason = "STOP"
+        w.done_ts = transition.ts
+        w.stop_ts = transition.ts
+
+        exit_px = float(w.stop)
+        journal.log_execution(w._exec_row("EXIT_STOP", transition.ts, exit_px, transition.px_source or "bar_touch_stop"))
+        out = replace(w.as_outcome_row(), exit_px=exit_px)
+        journal.log_outcome(out)
+
+    def _apply_exit_t2_transition(self, w: Watch, transition) -> None:
+        if w.lifecycle_state != WatchLifecycleState.ENTERED:
+            raise ValueError("watch cannot exit T2 before entry")
+        if w.hit_t2:
+            raise ValueError("watch cannot exit T2 twice")
+        w.hit_t2 = True
+        w.t2_ts = transition.ts
+        w.done = True
+        w.done_reason = "T2"
+        w.done_ts = transition.ts
+
+        exit_px = float(w.t2)
+        journal.log_execution(w._exec_row("EXIT_T2", transition.ts, exit_px, transition.px_source or "bar_touch_t2"))
+        out = replace(w.as_outcome_row(), exit_px=exit_px)
+        journal.log_outcome(out)
+
+    def _apply_exit_timeout_transition(self, w: Watch, transition) -> None:
+        if w.lifecycle_state != WatchLifecycleState.ENTERED:
+            raise ValueError("watch cannot timeout before entry")
+        w.done = True
+        w.done_reason = "TIMEOUT"
+        w.done_ts = transition.ts
+
+        exit_px = float(transition.px)
+        journal.log_execution(w._exec_row("EXIT_TIMEOUT", transition.ts, exit_px, transition.px_source or "bar_close_timeout"))
+        out = replace(w.as_outcome_row(), exit_px=exit_px)
+        if w.entry_px is not None and w.R > 0:
+            out = replace(out, pnl_R=round((exit_px - w.entry_px) / w.R, 4))
+        journal.log_outcome(out)
