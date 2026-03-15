@@ -154,7 +154,15 @@ class Watch:
     def _exec_row(self, exec_type: str, ts: datetime, px: float, px_source: str) -> ExecutionRow:
         latency_ms = None
         try:
-            latency_ms = int((ts - self.created_ts).total_seconds() * 1000)
+            exec_ts = ts.astimezone(timezone.utc)
+            created_ts = self.created_ts.astimezone(timezone.utc)
+
+            exec_ts = exec_ts.replace(microsecond=(exec_ts.microsecond // 1000) * 1000)
+            created_ts = created_ts.replace(microsecond=(created_ts.microsecond // 1000) * 1000)
+
+            latency_ms = int((exec_ts - created_ts).total_seconds() * 1000)
+            if -1000 < latency_ms < 0:
+                latency_ms = 0
         except Exception:
             pass
 
