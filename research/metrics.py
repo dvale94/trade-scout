@@ -2,19 +2,132 @@ from __future__ import annotations
 import pandas as pd
 
 
+def _coerce_pnl_r(trades: pd.DataFrame | pd.Series) -> pd.Series:
+    if isinstance(trades, pd.Series):
+        return pd.to_numeric(trades, errors="coerce")
+    if trades.empty or "pnl_R" not in trades.columns:
+        return pd.Series(dtype="float64")
+    return pd.to_numeric(trades["pnl_R"], errors="coerce")
+
+
 def _closed_trades(df: pd.DataFrame) -> pd.DataFrame:
     """
     Closed trades are rows where pnl_R is present (exit happened and we computed pnl).
     This excludes still-open watches and NO_ENTRY_FILL if pnl_R wasn't set.
     """
+    pnl = _coerce_pnl_r(df)
+    if df.empty or pnl.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    out["pnl_R"] = pnl
+    return out[out["pnl_R"].notna()].copy()
+
+
+def summarize_trade_performance(trades: pd.DataFrame) -> dict:
+    df = _closed_trades(trades)
+    if df.empty:
+        return {
+            "trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "win_rate": None,
+            "avg_R": None,
+            "median_R": None,
+            "expectancy_R": None,
+            "avg_win_R": None,
+            "avg_loss_R_abs": None,
+            "payoff_ratio": None,
+            "profit_factor": None,
+        }
+
+    pnl = _coerce_pnl_r(df).dropna()
+    wins = pnl[pnl > 0]
+    losses = pnl[pnl < 0]
+
+    trades_n = int(len(pnl))
+    wins_n = int(len(wins))
+    losses_n = int(len(losses))
+
+    win_rate = float(wins_n / trades_n) if trades_n else None
+    avg_r = float(pnl.mean()) if trades_n else None
+    median_r = float(pnl.median()) if trades_n else None
+
+    avg_win_r = float(wins.mean()) if wins_n else None
+    avg_loss_r_abs = float(abs(losses.mean())) if losses_n else None
+
+    expectancy_r = None
+    if win_rate is not None:
+        expectancy_r = float(
+            (win_rate * (avg_win_r or 0.0)) - ((1.0 - win_rate) * (avg_loss_r_abs or 0.0))
+        )
+
+    payoff_ratio = None
+    if avg_win_r is not None and avg_loss_r_abs not in (None, 0.0):
+        payoff_ratio = float(avg_win_r / avg_loss_r_abs)
+
+    gross_profit = float(wins.sum()) if wins_n else 0.0
+    gross_loss = float(abs(losses.sum())) if losses_n else 0.0
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else None
+
+    return {
+        "trades": trades_n,
+        "wins": wins_n,
+        "losses": losses_n,
+        "win_rate": win_rate,
+        "avg_R": avg_r,
+        "median_R": median_r,
+        "expectancy_R": expectancy_r,
+        "avg_win_R": avg_win_r,
+        "avg_loss_R_abs": avg_loss_r_abs,
+        "payoff_ratio": payoff_ratio,
+        "profit_factor": profit_factor,
+    }
+
+
+def grouped_trade_performance(
+    df: pd.DataFrame,
+    by,
+    min_trades: int = 1,
+) -> pd.DataFrame:
     if df.empty or "pnl_R" not in df.columns:
         return pd.DataFrame()
-    return df[df["pnl_R"].notna()].copy()
+
+    if isinstance(by, str):
+        group_cols = [by]
+    else:
+        group_cols = list(by)
+
+    if not group_cols or any(col not in df.columns for col in group_cols):
+        return pd.DataFrame()
+
+    rows = []
+    for group_key, group_df in df.groupby(group_cols, observed=False, dropna=False):
+        summary = summarize_trade_performance(group_df)
+        if summary["trades"] < min_trades:
+            continue
+
+        if len(group_cols) == 1:
+            row = {group_cols[0]: group_key}
+        else:
+            if not isinstance(group_key, tuple):
+                group_key = (group_key,)
+            row = dict(zip(group_cols, group_key))
+        row.update(summary)
+        rows.append(row)
+
+    if not rows:
+        return pd.DataFrame()
+
+    return (
+        pd.DataFrame(rows)
+        .sort_values(["expectancy_R", "trades"], ascending=[False, False], na_position="last")
+        .reset_index(drop=True)
+    )
 
 
 def core_metrics(trades: pd.DataFrame) -> dict:
-    df = _closed_trades(trades)
-    if df.empty:
+    summary = summarize_trade_performance(trades)
+    if summary["trades"] == 0:
         return {
             "trade_count": 0,
             "win_rate": None,
@@ -24,34 +137,13 @@ def core_metrics(trades: pd.DataFrame) -> dict:
             "profit_factor": None,
         }
 
-    pnl = df["pnl_R"].astype(float)
-
-    wins = pnl[pnl > 0]
-    losses = pnl[pnl < 0]
-
-    trade_count = int(len(pnl))
-    win_rate = float(len(wins) / trade_count) if trade_count else None
-
-    avg_win = float(wins.mean()) if len(wins) else 0.0
-    avg_loss = float(losses.mean()) if len(losses) else 0.0  # negative
-
-    loss_rate = 1.0 - win_rate if win_rate is not None else None
-
-    expectancy = None
-    if win_rate is not None and loss_rate is not None:
-        expectancy = (win_rate * avg_win) - (loss_rate * abs(avg_loss))
-
-    gross_profit = float(wins.sum()) if len(wins) else 0.0
-    gross_loss = float(abs(losses.sum())) if len(losses) else 0.0
-    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else None
-
     return {
-        "trade_count": trade_count,
-        "win_rate": win_rate,
-        "avg_win_R": avg_win if len(wins) else None,
-        "avg_loss_R": avg_loss if len(losses) else None,
-        "expectancy_R": expectancy,
-        "profit_factor": profit_factor,
+        "trade_count": summary["trades"],
+        "win_rate": summary["win_rate"],
+        "avg_win_R": summary["avg_win_R"],
+        "avg_loss_R": (-summary["avg_loss_R_abs"]) if summary["avg_loss_R_abs"] is not None else None,
+        "expectancy_R": summary["expectancy_R"],
+        "profit_factor": summary["profit_factor"],
     }
 
 
@@ -76,29 +168,16 @@ def breakdown_expectancy(trades: pd.DataFrame, by: str) -> pd.DataFrame:
     """
     Returns expectancy by group (tier, symbol, anchor_regime, etc.)
     """
-    if trades.empty or "pnl_R" not in trades.columns or by not in trades.columns:
-        return pd.DataFrame()
-
-    df = trades[trades["pnl_R"].notna()].copy()
-    df["pnl_R"] = df["pnl_R"].astype(float)
-
-    def _exp(g: pd.Series) -> float:
-        wins = g[g > 0]
-        losses = g[g < 0]
-        if len(g) == 0:
-            return float("nan")
-        win_rate = len(wins) / len(g)
-        avg_win = wins.mean() if len(wins) else 0.0
-        avg_loss = abs(losses.mean()) if len(losses) else 0.0
-        return float((win_rate * avg_win) - ((1 - win_rate) * avg_loss))
-
-    out = (
-        df.groupby(by, observed=False)["pnl_R"]
-        .agg(trades="count", avg="mean", med="median", expectancy=_exp)
-        .reset_index()
-        .sort_values(["expectancy", "trades"], ascending=[False, False])
+    grouped = grouped_trade_performance(trades, by=by, min_trades=1)
+    if grouped.empty:
+        return grouped
+    return grouped.rename(
+        columns={
+            "avg_R": "avg",
+            "median_R": "med",
+            "expectancy_R": "expectancy",
+        }
     )
-    return out
 
 
 def score_buckets(trades: pd.DataFrame, buckets: int = 10) -> pd.DataFrame:
@@ -129,10 +208,11 @@ def threshold_sweep(trades: pd.DataFrame, thresholds: list[float]) -> pd.DataFra
         if sub.empty:
             rows.append({"threshold": t, "trades": 0, "expectancy_R": None, "avg_R": None})
             continue
+        summary = summarize_trade_performance(sub)
         rows.append({
             "threshold": t,
             "trades": int(len(sub)),
-            "expectancy_R": float(core_metrics(sub)["expectancy_R"]) if core_metrics(sub)["expectancy_R"] is not None else None,
-            "avg_R": float(sub["pnl_R"].mean()),
+            "expectancy_R": summary["expectancy_R"],
+            "avg_R": summary["avg_R"],
         })
     return pd.DataFrame(rows).sort_values("threshold")
