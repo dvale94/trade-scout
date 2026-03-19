@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from dataclasses import dataclass
 
 import duckdb
 from dotenv import load_dotenv
@@ -12,24 +13,57 @@ LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
 DUCKDB_PATH = Path(os.getenv("DUCKDB_PATH", LOG_DIR / "research.duckdb"))
 MARKET_TYPE = os.getenv("MARKET_TYPE", "crypto").strip().lower()
 
-CSV_MAP = {
+
+@dataclass(frozen=True)
+class CsvSourceSpec:
+    filename: str
+    table_name: str
+    required: bool = False
+    note: str | None = None
+
+
+CSV_SOURCES = [
     # Legacy notification/debug log. Loaded only for compatibility; core research views do not depend on it.
-    f"{MARKET_TYPE}_alerts.csv": "alerts",
-    f"{MARKET_TYPE}_alerts_intents.csv": "alerts_intents",
-    f"{MARKET_TYPE}_alert_context.csv": "alert_context_raw",
-    f"{MARKET_TYPE}_executions.csv": "executions",
-    f"{MARKET_TYPE}_outcomes.csv": "outcomes",
-    f"{MARKET_TYPE}_telemetry.csv": "telemetry",
-}
+    CsvSourceSpec(f"{MARKET_TYPE}_alerts.csv", "alerts", required=False, note="legacy compatibility"),
+    # Current core research truth starts here.
+    CsvSourceSpec(f"{MARKET_TYPE}_alerts_intents.csv", "alerts_intents", required=True, note="required core signal truth"),
+    CsvSourceSpec(f"{MARKET_TYPE}_alert_context.csv", "alert_context_raw", required=False, note="optional enriched context sidecar"),
+    CsvSourceSpec(f"{MARKET_TYPE}_executions.csv", "executions", required=False, note="optional realized executions"),
+    CsvSourceSpec(f"{MARKET_TYPE}_outcomes.csv", "outcomes", required=False, note="optional realized outcomes"),
+    CsvSourceSpec(f"{MARKET_TYPE}_telemetry.csv", "telemetry", required=False, note="optional system telemetry"),
+]
 
 
 def existing_csvs() -> dict[str, Path]:
     out: dict[str, Path] = {}
-    for filename, table in CSV_MAP.items():
-        path = LOG_DIR / filename
+    for source in CSV_SOURCES:
+        path = LOG_DIR / source.filename
         if path.exists() and path.stat().st_size > 0:
-            out[table] = path
+            out[source.table_name] = path
     return out
+
+
+def validate_required_sources(csvs: dict[str, Path]) -> None:
+    missing = [
+        source.filename
+        for source in CSV_SOURCES
+        if source.required and source.table_name not in csvs
+    ]
+    if missing:
+        raise FileNotFoundError(
+            "[DUCKDB] missing required source file(s): "
+            + ", ".join(missing)
+            + ". The current build requires alerts_intents to establish the core research contract."
+        )
+
+
+def load_raw_csv_tables(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
+    for table, path in csvs.items():
+        con.execute(f"DROP TABLE IF EXISTS {table}")
+        con.execute(
+            "CREATE TABLE " + table + " AS SELECT * FROM read_csv_auto(?, header=True, ignore_errors=True)",
+            [str(path)],
+        )
 
 
 def table_columns(con: duckdb.DuckDBPyConnection, table: str) -> set[str]:
@@ -82,9 +116,13 @@ def safe_row_count(con: duckdb.DuckDBPyConnection, table_or_view: str) -> int | 
         return None
 
 
+def relation_exists(con: duckdb.DuckDBPyConnection, table_or_view: str) -> bool:
+    return safe_row_count(con, table_or_view) is not None
+
+
 def print_build_summary(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
     raw_tables = list(csvs.keys())
-    alert_context_exists = "yes" if safe_row_count(con, "alert_context") is not None else "no"
+    alert_context_exists = "yes" if relation_exists(con, "alert_context") else "no"
 
     print(f"[DUCKDB] raw_tables_loaded={', '.join(raw_tables) if raw_tables else 'none'}")
     for table in raw_tables:
@@ -649,12 +687,8 @@ def main() -> None:
     con.execute("DROP TABLE IF EXISTS alert_context_raw")
 
     csvs = existing_csvs()
-    for table, path in csvs.items():
-        con.execute(f"DROP TABLE IF EXISTS {table}")
-        con.execute(
-            "CREATE TABLE " + table + " AS SELECT * FROM read_csv_auto(?, header=True, ignore_errors=True)",
-            [str(path)],
-        )
+    validate_required_sources(csvs)
+    load_raw_csv_tables(con, csvs)
 
     create_views(con, csvs)
     print_build_summary(con, csvs)

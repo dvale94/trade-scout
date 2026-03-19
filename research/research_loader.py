@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import duckdb
 import pandas as pd
@@ -14,6 +14,18 @@ load_dotenv(_REPO_ROOT / ".env")
 _DEFAULT_LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
 _DEFAULT_DUCKDB_PATH = Path(os.getenv("DUCKDB_PATH", _DEFAULT_LOG_DIR / "research.duckdb"))
 _DEFAULT_MARKET_TYPE = os.getenv("MARKET_TYPE", "crypto").strip().lower()
+_COMMON_TRADE_TIME_COLUMNS = (
+    "signal_ts",
+    "signal_ts_utc",
+    "entry_ts",
+    "entry_ts_utc",
+    "exit_ts",
+    "exit_ts_utc",
+    "exec_ts",
+    "exec_ts_utc",
+    "bar_end_ts_utc",
+    "bar_start_ts_utc",
+)
 
 
 def _resolve_duckdb_path(duckdb_path: str | Path | None = None) -> Path:
@@ -299,3 +311,103 @@ def load_research_frames_sql(
         "telemetry": load_telemetry_sql(duckdb_path=duckdb_path, market_type=market_type),
         "schema_coverage": load_schema_coverage_summary_sql(duckdb_path=duckdb_path),
     }
+
+
+def ensure_trade_frame(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if out.empty:
+        return out
+
+    for col in _COMMON_TRADE_TIME_COLUMNS:
+        if col in out.columns:
+            out[col] = pd.to_datetime(out[col], errors="coerce", utc=True)
+    return out
+
+
+def split_recent_vs_prior(
+    df: pd.DataFrame,
+    recent_n: int,
+    sort_by: str | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    out = df.copy()
+    if sort_by and sort_by in out.columns:
+        out = out.sort_values(sort_by, ascending=True)
+
+    if recent_n <= 0 or out.empty:
+        return out.copy(), out.iloc[0:0].copy()
+    if recent_n >= len(out):
+        return out.iloc[0:0].copy(), out.copy()
+
+    return out.iloc[:-recent_n].copy(), out.iloc[-recent_n:].copy()
+
+
+def split_by_time_cutoff(
+    df: pd.DataFrame,
+    cutoff,
+    time_col_candidates: Iterable[str] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, str | None]:
+    out = ensure_trade_frame(df)
+    candidates = tuple(time_col_candidates or _COMMON_TRADE_TIME_COLUMNS)
+    chosen_time_col = next((col for col in candidates if col in out.columns), None)
+
+    if chosen_time_col is None:
+        return out.copy(), out.iloc[0:0].copy(), None
+
+    time_values = pd.to_datetime(out[chosen_time_col], errors="coerce", utc=True)
+    if time_values.notna().sum() == 0:
+        return out.copy(), out.iloc[0:0].copy(), None
+
+    cutoff_ts = pd.to_datetime(cutoff, errors="coerce", utc=True)
+    if pd.isna(cutoff_ts):
+        return out.copy(), out.iloc[0:0].copy(), chosen_time_col
+
+    before_mask = time_values < cutoff_ts
+    after_mask = time_values >= cutoff_ts
+    return out.loc[before_mask].copy(), out.loc[after_mask].copy(), chosen_time_col
+
+
+def rolling_trade_windows(
+    df: pd.DataFrame,
+    window_size: int,
+    step: int = 1,
+    sort_by: str | None = None,
+) -> list[pd.DataFrame]:
+    if window_size <= 0 or step <= 0 or df.empty:
+        return []
+
+    out = df.copy()
+    if sort_by and sort_by in out.columns:
+        out = out.sort_values(sort_by, ascending=True)
+
+    if len(out) < window_size:
+        return []
+
+    windows: list[pd.DataFrame] = []
+    for start in range(0, len(out) - window_size + 1, step):
+        windows.append(out.iloc[start:start + window_size].copy())
+    return windows
+
+
+def expanding_trade_windows(
+    df: pd.DataFrame,
+    min_size: int,
+    step: int = 1,
+    sort_by: str | None = None,
+) -> list[pd.DataFrame]:
+    if min_size <= 0 or step <= 0 or df.empty:
+        return []
+
+    out = df.copy()
+    if sort_by and sort_by in out.columns:
+        out = out.sort_values(sort_by, ascending=True)
+
+    if len(out) < min_size:
+        return []
+
+    windows: list[pd.DataFrame] = []
+    for end in range(min_size, len(out) + 1, step):
+        windows.append(out.iloc[:end].copy())
+
+    if windows and len(windows[-1]) != len(out):
+        windows.append(out.copy())
+    return windows
