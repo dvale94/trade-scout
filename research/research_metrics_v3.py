@@ -424,9 +424,42 @@ def core_metrics(df: pd.DataFrame) -> pd.Series:
 def grouped_metrics(df: pd.DataFrame, by, min_trades: int = 5) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
-    out = df.groupby(by, dropna=False, observed=False).apply(core_metrics).reset_index()
-    out = out[out["trades"] >= min_trades].sort_values(["expectancy_R", "trades"], ascending=[False, False])
-    return out.reset_index(drop=True)
+
+    if isinstance(by, str):
+        group_cols = [by]
+    else:
+        group_cols = list(by)
+
+    if not group_cols or any(col not in df.columns for col in group_cols):
+        return pd.DataFrame()
+
+    rows: list[dict] = []
+    for group_key, sub in df.groupby(group_cols, dropna=False, observed=False):
+        metrics = core_metrics(sub)
+        trades = metrics.get("trades", 0)
+        if pd.isna(trades) or int(trades) < min_trades:
+            continue
+
+        if len(group_cols) == 1:
+            if isinstance(group_key, tuple):
+                group_key = group_key[0]
+            row = {group_cols[0]: group_key}
+        else:
+            if not isinstance(group_key, tuple):
+                group_key = (group_key,)
+            row = dict(zip(group_cols, group_key))
+
+        row.update(metrics.to_dict())
+        rows.append(row)
+
+    if not rows:
+        return pd.DataFrame()
+
+    return (
+        pd.DataFrame(rows)
+        .sort_values(["expectancy_R", "trades"], ascending=[False, False], na_position="last")
+        .reset_index(drop=True)
+    )
 
 
 def grouped_bootstrap_ci(df: pd.DataFrame, by, min_trades: int = 5, n_boot: int = 2000) -> pd.DataFrame:
@@ -883,25 +916,36 @@ def conditional_pair_metrics(
     if score_bucket_quantiles is not None and "score" in tmp.columns:
         tmp = with_score_buckets(tmp, q=score_bucket_quantiles)
 
-    combos: list[pd.DataFrame] = []
+    rows: list[dict] = []
     for a, b in dims:
         if a not in tmp.columns or b not in tmp.columns:
             continue
-        grouped = (
-            tmp.groupby([a, b], dropna=False, observed=False)
-            .apply(core_metrics)
-            .reset_index()
-        )
-        if "trades" in grouped.columns:
-            grouped = grouped[grouped["trades"] >= min_trades].copy()
-        grouped["dimension"] = f"{a} x {b}"
-        combos.append(grouped)
 
-    if not combos:
+        for group_key, sub in tmp.groupby([a, b], dropna=False, observed=False):
+            if not isinstance(group_key, tuple):
+                group_key = (group_key,)
+
+            metrics = core_metrics(sub)
+            trades_count = metrics.get("trades", 0)
+            if pd.isna(trades_count) or int(trades_count) < min_trades:
+                continue
+
+            row = {
+                a: group_key[0],
+                b: group_key[1] if len(group_key) > 1 else None,
+                "dimension": f"{a} x {b}",
+            }
+            row.update(metrics.to_dict())
+            rows.append(row)
+
+    if not rows:
         return pd.DataFrame()
 
-    out = pd.concat(combos, ignore_index=True)
-    return out.sort_values(["trades", "expectancy_R"], ascending=[False, False]).reset_index(drop=True)
+    return (
+        pd.DataFrame(rows)
+        .sort_values(["trades", "expectancy_R"], ascending=[False, False], na_position="last")
+        .reset_index(drop=True)
+    )
 
 
 def first_touch_summary_tables(trades: pd.DataFrame) -> dict[str, pd.DataFrame]:
