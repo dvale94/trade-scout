@@ -1,10 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
 import math
-from typing import TYPE_CHECKING
-from uuid import uuid4
 
 import numpy as np
 import pandas as pd
@@ -13,9 +10,6 @@ from trade_scout.strategy_profiles import StrategyProfile
 
 from .base import Strategy
 from .types import SetupCandidate, StrategyMetadata, TradePlan
-
-if TYPE_CHECKING:
-    from trade_scout.strategy import Candidate
 
 
 @dataclass(frozen=True)
@@ -32,12 +26,12 @@ class LongBreakoutContinuationStrategy(Strategy):
         )
 
     def evaluate_candidate(self, df: pd.DataFrame, profile: StrategyProfile) -> SetupCandidate:
-        score, reasons, computed = self.score_candidate(df, profile)
+        score, reasons, computed = self._score_candidate(df, profile)
         return SetupCandidate(
             score=score,
             reasons=tuple(reasons),
             computed=computed,
-            tier=self.pick_tier(score, df, profile, computed),
+            tier=self._pick_tier(score, df, profile, computed),
         )
 
     def build_trade_plan(
@@ -53,7 +47,7 @@ class LongBreakoutContinuationStrategy(Strategy):
             reasons=list(candidate.reasons),
         )
 
-    def score_candidate(self, df: pd.DataFrame, profile: StrategyProfile) -> tuple[float, list[str], dict]:
+    def _score_candidate(self, df: pd.DataFrame, profile: StrategyProfile) -> tuple[float, list[str], dict]:
         reasons: list[str] = []
         score = 0.0
 
@@ -169,7 +163,7 @@ class LongBreakoutContinuationStrategy(Strategy):
         }
         return score, reasons, computed
 
-    def pick_tier(
+    def _pick_tier(
         self,
         score: float,
         df: pd.DataFrame,
@@ -181,44 +175,6 @@ class LongBreakoutContinuationStrategy(Strategy):
         if score >= profile.a_threshold:
             return "A_CONTINUATION"
         return None
-
-    def build_trade_candidate(
-        self,
-        symbol: str,
-        profile: StrategyProfile,
-        computed: dict,
-        reasons: list[str],
-        score: float,
-    ) -> Candidate | None:
-        trade_plan = self._build_trade_plan(
-            symbol=symbol,
-            profile=profile,
-            computed=computed,
-            reasons=reasons,
-        )
-        if trade_plan is None:
-            return None
-
-        now = datetime.now(timezone.utc)
-        news_sent, news_summary = self.get_news_sentiment_stub(symbol)
-        from trade_scout.strategy import Candidate
-
-        return Candidate(
-            alert_id=str(uuid4()),
-            symbol=symbol,
-            timeframe_min=trade_plan.timeframe_min,
-            score=score,
-            ts=now,
-            entry_low=float(trade_plan.entry_low),
-            entry_high=float(trade_plan.entry_high),
-            stop=float(trade_plan.stop_px),
-            t1=float(trade_plan.t1_px),
-            t2=float(trade_plan.t2_px),
-            r=float(trade_plan.stop_distance),
-            reasons=reasons,
-            news_sentiment=news_sent,
-            news_summary=news_summary,
-        )
 
     def is_retest_setup(self, df: pd.DataFrame, profile: StrategyProfile, computed: dict) -> bool:
         breakout = computed.get("breakout_level")
@@ -254,10 +210,6 @@ class LongBreakoutContinuationStrategy(Strategy):
             trs.append(cls.true_range(highs[i], lows[i], closes[i - 1]))
         atr = pd.Series(trs).rolling(period).mean().iloc[-1]
         return float(atr) if not math.isnan(atr) else None
-
-    @staticmethod
-    def get_news_sentiment_stub(symbol: str) -> tuple[None, None]:
-        return None, None
 
     @staticmethod
     def _distance_atr(ref: float | None, px: float, atr_val: float | None) -> float | None:
