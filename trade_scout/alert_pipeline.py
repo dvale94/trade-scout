@@ -212,6 +212,8 @@ class AlertPipeline:
                     strategy_id=strategy_metadata.strategy_id,
                     strategy_version=strategy_metadata.strategy_version,
                     setup_family=strategy_metadata.setup_family,
+                    strategy_params_json=strategy_metadata.strategy_params_json,
+                    strategy_params_hash=strategy_metadata.strategy_params_hash,
                     config_hash=self.context.config_hash,
                     side="LONG",
                 )

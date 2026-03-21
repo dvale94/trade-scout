@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Callable, Mapping
 
 from .base import Strategy
+from .types import StrategyMetadata
 from .long_breakout_continuation import LongBreakoutContinuationStrategy
 
 StrategyBuilder = Callable[[Mapping[str, object]], Strategy]
@@ -41,6 +44,37 @@ def _build_long_breakout_continuation(params: Mapping[str, object]) -> Strategy:
     if not isinstance(strategy_version, str) or not strategy_version.strip():
         raise ValueError("strategy_version must be a non-empty string")
     return LongBreakoutContinuationStrategy(strategy_version=strategy_version.strip())
+
+
+def normalize_strategy_params(params: Mapping[str, object] | None = None) -> dict[str, object]:
+    if params is None:
+        return {}
+    return {str(key): params[key] for key in sorted(params.keys())}
+
+
+def strategy_params_json(params: Mapping[str, object] | None = None) -> str:
+    return json.dumps(normalize_strategy_params(params), sort_keys=True, separators=(",", ":"))
+
+
+def strategy_params_hash(params: Mapping[str, object] | None = None) -> str:
+    payload = strategy_params_json(params)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+
+
+def build_strategy_metadata(
+    strategy: Strategy,
+    params: Mapping[str, object] | None = None,
+) -> StrategyMetadata:
+    base = strategy.metadata_for_journaling()
+    params_json = strategy_params_json(params)
+    return StrategyMetadata(
+        strategy_id=base.strategy_id,
+        strategy_version=base.strategy_version,
+        setup_family=base.setup_family,
+        strategy_params_json=params_json,
+        strategy_params_hash=strategy_params_hash(params),
+        journal_metadata=base.journal_metadata,
+    )
 
 
 def make_strategy_registry() -> StrategyRegistry:

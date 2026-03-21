@@ -52,6 +52,8 @@ ALERT_INTENT_FIELDS = [
     "schema_version",
     "strategy_id",
     "setup_family",
+    "strategy_params_json",
+    "strategy_params_hash",
 ]
 
 ALERT_CONTEXT_FIELDS = [
@@ -96,6 +98,8 @@ ALERT_CONTEXT_FIELDS = [
     "score_bucket",
     "strategy_id",
     "setup_family",
+    "strategy_params_json",
+    "strategy_params_hash",
 ]
 
 OUTCOME_FIELDS = [
@@ -136,6 +140,8 @@ OUTCOME_FIELDS = [
     "schema_version",
     "strategy_id",
     "setup_family",
+    "strategy_params_json",
+    "strategy_params_hash",
 ]
 
 EXECUTION_FIELDS = [
@@ -158,6 +164,8 @@ EXECUTION_FIELDS = [
     "strategy_id",
     "strategy_version",
     "setup_family",
+    "strategy_params_json",
+    "strategy_params_hash",
 ]
 
 TELEMETRY_FIELDS = [

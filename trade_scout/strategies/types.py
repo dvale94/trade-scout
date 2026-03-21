@@ -18,6 +18,8 @@ class StrategyMetadata:
     strategy_id: str
     strategy_version: str
     setup_family: str
+    strategy_params_json: str | None = None
+    strategy_params_hash: str | None = None
     journal_metadata: Mapping[str, JournalScalar] = field(default_factory=dict)
 
     def __post_init__(self) -> None:

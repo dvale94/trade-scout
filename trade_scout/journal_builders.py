@@ -56,6 +56,8 @@ def make_intent_core_row(
         reasons=None,
         strategy_id=strategy_metadata.strategy_id,
         setup_family=strategy_metadata.setup_family,
+        strategy_params_json=strategy_metadata.strategy_params_json,
+        strategy_params_hash=strategy_metadata.strategy_params_hash,
     )
 
 
@@ -113,6 +115,8 @@ def make_alert_context_row(
         score_bucket=_score_bucket(score),
         strategy_id=strategy_metadata.strategy_id,
         setup_family=strategy_metadata.setup_family,
+        strategy_params_json=strategy_metadata.strategy_params_json,
+        strategy_params_hash=strategy_metadata.strategy_params_hash,
     )
 
 

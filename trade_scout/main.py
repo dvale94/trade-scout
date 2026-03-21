@@ -12,7 +12,7 @@ from . import watch
 from .bar_processor import BarProcessor
 from .cooldown import Cooldown
 from .runtime_context import EnabledStrategy, RuntimeContext, compute_config_hash
-from .strategies.registry import load_enabled_strategies
+from .strategies.registry import build_strategy_metadata, load_enabled_strategies
 
 
 def websocket_backoff(attempt: int, base: float = 5.0, cap: float = 120.0) -> float:
@@ -51,7 +51,13 @@ def run():
     if not strategies:
         raise ValueError("At least one enabled strategy is required")
     enabled_strategies = [
-        EnabledStrategy(strategy=strategy, metadata=strategy.metadata_for_journaling())
+        EnabledStrategy(
+            strategy=strategy,
+            metadata=build_strategy_metadata(
+                strategy,
+                config.STRATEGY_PARAMS.get(strategy.strategy_id),
+            ),
+        )
         for strategy in strategies
     ]
     strategy_version = ",".join(strategy.strategy_version for strategy in enabled_strategies)

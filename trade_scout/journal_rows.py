@@ -45,6 +45,8 @@ class AlertIntentRow:
     schema_version: str = "1"
     strategy_id: str | None = None
     setup_family: str | None = None
+    strategy_params_json: str | None = None
+    strategy_params_hash: str | None = None
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -95,6 +97,8 @@ class AlertIntentRow:
             "schema_version": self.schema_version,
             "strategy_id": self.strategy_id,
             "setup_family": self.setup_family,
+            "strategy_params_json": self.strategy_params_json,
+            "strategy_params_hash": self.strategy_params_hash,
         }
 
 
@@ -141,6 +145,8 @@ class AlertContextRow:
     schema_version: str = "1"
     strategy_id: str | None = None
     setup_family: str | None = None
+    strategy_params_json: str | None = None
+    strategy_params_hash: str | None = None
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -196,6 +202,8 @@ class AlertContextRow:
             "score_bucket": self.score_bucket,
             "strategy_id": self.strategy_id,
             "setup_family": self.setup_family,
+            "strategy_params_json": self.strategy_params_json,
+            "strategy_params_hash": self.strategy_params_hash,
         }
 
 
@@ -220,6 +228,8 @@ class ExecutionRow:
     strategy_id: str | None = None
     strategy_version: str | None = None
     setup_family: str | None = None
+    strategy_params_json: str | None = None
+    strategy_params_hash: str | None = None
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -254,6 +264,8 @@ class ExecutionRow:
             "strategy_id": self.strategy_id,
             "strategy_version": self.strategy_version,
             "setup_family": self.setup_family,
+            "strategy_params_json": self.strategy_params_json,
+            "strategy_params_hash": self.strategy_params_hash,
         }
 
 
@@ -296,6 +308,8 @@ class OutcomeRow:
     schema_version: str = "1"
     strategy_id: str | None = None
     setup_family: str | None = None
+    strategy_params_json: str | None = None
+    strategy_params_hash: str | None = None
 
     def __post_init__(self) -> None:
         for field_name in ("alert_id", "symbol", "side"):
@@ -340,4 +354,6 @@ class OutcomeRow:
             "schema_version": self.schema_version,
             "strategy_id": self.strategy_id,
             "setup_family": self.setup_family,
+            "strategy_params_json": self.strategy_params_json,
+            "strategy_params_hash": self.strategy_params_hash,
         }

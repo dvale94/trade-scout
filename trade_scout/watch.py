@@ -53,6 +53,8 @@ class Watch:
     strategy_id: str | None = None
     strategy_version: str | None = None
     setup_family: str | None = None
+    strategy_params_json: str | None = None
+    strategy_params_hash: str | None = None
     config_hash: str | None = None
     side: str = "LONG"
 
@@ -95,6 +97,8 @@ class Watch:
             "strategy_id": self.strategy_id,
             "strategy_version": self.strategy_version,
             "setup_family": self.setup_family,
+            "strategy_params_json": self.strategy_params_json,
+            "strategy_params_hash": self.strategy_params_hash,
             "config_hash": self.config_hash,
             "side": self.side,
 
@@ -138,6 +142,8 @@ class Watch:
             strategy_id=d.get("strategy_id", "legacy"),
             strategy_version=d.get("strategy_version"),
             setup_family=d.get("setup_family", "legacy"),
+            strategy_params_json=d.get("strategy_params_json"),
+            strategy_params_hash=d.get("strategy_params_hash"),
             config_hash=d.get("config_hash"),
             side=d.get("side", "LONG"),
 
@@ -201,6 +207,8 @@ class Watch:
             strategy_id=self.strategy_id or "legacy",
             strategy_version=self.strategy_version,
             setup_family=self.setup_family or "legacy",
+            strategy_params_json=self.strategy_params_json,
+            strategy_params_hash=self.strategy_params_hash,
         )
 
 
@@ -272,6 +280,8 @@ class Watch:
             strategy_id=self.strategy_id or "legacy",
             strategy_version=self.strategy_version,
             setup_family=self.setup_family or "legacy",
+            strategy_params_json=self.strategy_params_json,
+            strategy_params_hash=self.strategy_params_hash,
             config_hash=self.config_hash,
             entry_ts_utc=_dt_to_iso(self.entry_ts),
             entry_px=self.entry_px,
