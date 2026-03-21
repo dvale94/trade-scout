@@ -11,6 +11,7 @@ from trade_scout.strategies import (
     LongBreakoutContinuationStrategy,
     SetupCandidate,
     Strategy,
+    load_enabled_strategies,
     StrategyMetadata,
     TradePlan,
 )
@@ -121,6 +122,16 @@ class StrategyContractTest(unittest.TestCase):
         self.assertEqual(strategy.strategy_id, "long_breakout_continuation")
         self.assertEqual(metadata.strategy_version, "v1")
         self.assertEqual(metadata.setup_family, "breakout_continuation")
+
+    def test_registry_loads_default_strategy_shape(self):
+        strategies = load_enabled_strategies(
+            ["long_breakout_continuation"],
+            {"long_breakout_continuation": {"strategy_version": "v3_research_step2"}},
+        )
+
+        self.assertEqual(len(strategies), 1)
+        self.assertIsInstance(strategies[0], LongBreakoutContinuationStrategy)
+        self.assertEqual(strategies[0].metadata_for_journaling().strategy_version, "v3_research_step2")
 
 
 if __name__ == "__main__":

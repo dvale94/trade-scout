@@ -12,7 +12,7 @@ from . import watch
 from .bar_processor import BarProcessor
 from .cooldown import Cooldown
 from .runtime_context import RuntimeContext, compute_config_hash
-from .strategies.long_breakout_continuation import LongBreakoutContinuationStrategy
+from .strategies.registry import load_enabled_strategies
 
 
 def websocket_backoff(attempt: int, base: float = 5.0, cap: float = 120.0) -> float:
@@ -34,19 +34,27 @@ def run():
     profile = strategy_profiles.PROFILES.get(config.STRATEGY_PROFILE)
     if profile is None:
         raise ValueError(f"Unknown STRATEGY_PROFILE: {config.STRATEGY_PROFILE}")
-    
-    strategy_version = "v3_research_step2"
+
     config_hash = compute_config_hash(profile)
-    
+
     min_needed = max(
         profile.ma_mid + 5,
         profile.atr_period + 5,
         profile.breakout_lookback + profile.persist_bars + 5,
     )
     max_keep = max(profile.lookback_bars, min_needed)
-    
+
     anchor = anchors.AnchorTracker()
     symbols_to_run = list(dict.fromkeys(config.SYMBOLS + [anchor.anchor_symbol]))  # de-dupe, preserve order
+
+    strategies = load_enabled_strategies(config.ENABLED_STRATEGY_IDS, config.STRATEGY_PARAMS)
+    if len(strategies) != 1:
+        raise ValueError(
+            "This runtime currently supports exactly one enabled strategy; "
+            f"got {len(strategies)}: {config.ENABLED_STRATEGY_IDS}"
+        )
+    strategy = strategies[0]
+    strategy_version = strategy.metadata_for_journaling().strategy_version
 
     print(
         f"MARKET_TYPE={config.MARKET_TYPE} PROFILE={profile.name} timeframe={profile.timeframe_min}m "
@@ -68,7 +76,6 @@ def run():
     print(f"Restored active watches: {sum(len(v) for v in watch_mgr.active.values())}")
 
     telemetry = TelemetryTracker(config.STRATEGY_PROFILE, profile.timeframe_min)
-    strategy = LongBreakoutContinuationStrategy()
     runtime = RuntimeContext(
         profile=profile,
         strategy=strategy,
