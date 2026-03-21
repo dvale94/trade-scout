@@ -11,8 +11,8 @@ from .telemetry import TelemetryTracker
 from . import watch
 from .bar_processor import BarProcessor
 from .cooldown import Cooldown
-from .runtime_context import RuntimeContext, compute_config_hash
-from .strategy_engine import CurrentStrategyAdapter
+from .runtime_context import EnabledStrategy, RuntimeContext, compute_config_hash
+from .strategies.registry import build_strategy_metadata, load_enabled_strategies
 
 
 def websocket_backoff(attempt: int, base: float = 5.0, cap: float = 120.0) -> float:
@@ -34,23 +34,38 @@ def run():
     profile = strategy_profiles.PROFILES.get(config.STRATEGY_PROFILE)
     if profile is None:
         raise ValueError(f"Unknown STRATEGY_PROFILE: {config.STRATEGY_PROFILE}")
-    
-    strategy_version = "v3_research_step2"
+
     config_hash = compute_config_hash(profile)
-    
+
     min_needed = max(
         profile.ma_mid + 5,
         profile.atr_period + 5,
         profile.breakout_lookback + profile.persist_bars + 5,
     )
     max_keep = max(profile.lookback_bars, min_needed)
-    
+
     anchor = anchors.AnchorTracker()
     symbols_to_run = list(dict.fromkeys(config.SYMBOLS + [anchor.anchor_symbol]))  # de-dupe, preserve order
 
+    strategies = load_enabled_strategies(config.ENABLED_STRATEGY_IDS, config.STRATEGY_PARAMS)
+    if not strategies:
+        raise ValueError("At least one enabled strategy is required")
+    enabled_strategies = [
+        EnabledStrategy(
+            strategy=strategy,
+            metadata=build_strategy_metadata(
+                strategy,
+                config.STRATEGY_PARAMS.get(strategy.strategy_id),
+            ),
+        )
+        for strategy in strategies
+    ]
+    strategy_version = ",".join(strategy.strategy_version for strategy in enabled_strategies)
+
     print(
         f"MARKET_TYPE={config.MARKET_TYPE} PROFILE={profile.name} timeframe={profile.timeframe_min}m "
-        f"symbols={symbols_to_run} config_hash={config_hash} strat_ver={strategy_version}"
+        f"symbols={symbols_to_run} config_hash={config_hash} strat_ver={strategy_version} "
+        f"strategies={[strategy.metadata.strategy_id for strategy in enabled_strategies]}"
     )
 
     print("Seeding history...")
@@ -68,11 +83,9 @@ def run():
     print(f"Restored active watches: {sum(len(v) for v in watch_mgr.active.values())}")
 
     telemetry = TelemetryTracker(config.STRATEGY_PROFILE, profile.timeframe_min)
-    strategy_engine = CurrentStrategyAdapter()
     runtime = RuntimeContext(
         profile=profile,
-        strategy_engine=strategy_engine,
-        strategy_version=strategy_version,
+        strategies=enabled_strategies,
         config_hash=config_hash,
         min_needed=min_needed,
         max_keep=max_keep,

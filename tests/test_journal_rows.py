@@ -78,6 +78,10 @@ class JournalRowsTest(unittest.TestCase):
             qty_model=None,
             qty=None,
             reasons="Close > MA50",
+            strategy_id="long_breakout_continuation",
+            setup_family="breakout_continuation",
+            strategy_params_json="{\"strategy_version\":\"v3_research_step2\"}",
+            strategy_params_hash="params123456",
         )
         self.assertEqual(list(row.to_csv_row().keys()), journal.ALERT_INTENT_FIELDS)
 
@@ -121,6 +125,10 @@ class JournalRowsTest(unittest.TestCase):
             anchor_trend_4h=None,
             anchor_trend_1d=None,
             score_bucket="7_TO_7_9",
+            strategy_id="long_breakout_continuation",
+            setup_family="breakout_continuation",
+            strategy_params_json="{\"strategy_version\":\"v3_research_step2\"}",
+            strategy_params_hash="params123456",
         )
         execution = ExecutionRow(
             exec_id="e1",
@@ -138,6 +146,11 @@ class JournalRowsTest(unittest.TestCase):
             fee_estimate=None,
             slippage_bps_estimate=None,
             latency_ms=1000,
+            strategy_id="long_breakout_continuation",
+            strategy_version="v1",
+            setup_family="breakout_continuation",
+            strategy_params_json="{\"strategy_version\":\"v3_research_step2\"}",
+            strategy_params_hash="params123456",
         )
         outcome = OutcomeRow(
             alert_id="a1",
@@ -174,6 +187,10 @@ class JournalRowsTest(unittest.TestCase):
             max_spread_bps_seen=None,
             avg_spread_bps_seen=None,
             entered=True,
+            strategy_id="long_breakout_continuation",
+            setup_family="breakout_continuation",
+            strategy_params_json="{\"strategy_version\":\"v3_research_step2\"}",
+            strategy_params_hash="params123456",
         )
 
         self.assertEqual(list(context.to_csv_row().keys()), journal.ALERT_CONTEXT_FIELDS)
@@ -212,6 +229,10 @@ class JournalRowsTest(unittest.TestCase):
                 qty_model=None,
                 qty=None,
                 reasons=None,
+                strategy_id="long_breakout_continuation",
+                setup_family="breakout_continuation",
+                strategy_params_json="{\"strategy_version\":\"v3_research_step2\"}",
+                strategy_params_hash="params123456",
             )
         with self.assertRaises(ValueError):
             ExecutionRow(
@@ -263,6 +284,10 @@ class JournalRowsTest(unittest.TestCase):
             qty_model=None,
             qty=None,
             reasons="Close > MA50",
+            strategy_id="long_breakout_continuation",
+            setup_family="breakout_continuation",
+            strategy_params_json="{\"strategy_version\":\"v3_research_step2\"}",
+            strategy_params_hash="params123456",
         )
         journal.log_alert_intent(intent)
 
@@ -275,7 +300,21 @@ class JournalRowsTest(unittest.TestCase):
 
     def test_execution_schema_migration_remains_additive(self):
         path = journal.executions_path()
-        old_fields = journal.EXECUTION_FIELDS[:-3]
+        old_fields = [
+            "exec_id",
+            "alert_id",
+            "symbol",
+            "side",
+            "exec_type",
+            "exec_ts_utc",
+            "exec_px",
+            "exec_px_source",
+            "entry_fill_px",
+            "entry_fill_ts_utc",
+            "slippage_pct",
+            "qty",
+            "fee_estimate",
+        ]
         with open(path, "w", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=old_fields)
             writer.writeheader()
@@ -314,6 +353,11 @@ class JournalRowsTest(unittest.TestCase):
                 fee_estimate=None,
                 slippage_bps_estimate=None,
                 latency_ms=1000,
+                strategy_id="long_breakout_continuation",
+                strategy_version="v1",
+                setup_family="breakout_continuation",
+                strategy_params_json="{\"strategy_version\":\"v3_research_step2\"}",
+                strategy_params_hash="params123456",
             )
         )
 
@@ -327,8 +371,14 @@ class JournalRowsTest(unittest.TestCase):
         self.assertEqual(rows[0]["slippage_bps_estimate"], "")
         self.assertEqual(rows[0]["latency_ms"], "")
         self.assertEqual(rows[0]["schema_version"], "")
+        self.assertEqual(rows[0]["strategy_id"], "")
+        self.assertEqual(rows[0]["strategy_version"], "")
+        self.assertEqual(rows[0]["setup_family"], "")
+        self.assertEqual(rows[0]["strategy_params_json"], "")
+        self.assertEqual(rows[0]["strategy_params_hash"], "")
         self.assertEqual(rows[1]["exec_id"], "e2")
         self.assertEqual(rows[1]["schema_version"], "1")
+        self.assertEqual(rows[1]["strategy_id"], "long_breakout_continuation")
 
 
 if __name__ == "__main__":

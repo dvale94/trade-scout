@@ -13,7 +13,9 @@ from .journal_builders import (
     make_alert_context_row,
     make_intent_core_row,
 )
-from .runtime_context import RuntimeContext
+from .runtime_context import EnabledStrategy, RuntimeContext
+from .strategies.types import SetupCandidate
+from .strategy import Candidate
 
 
 def format_alert(candidate, tier: str) -> str:
@@ -37,6 +39,32 @@ def format_alert(candidate, tier: str) -> str:
     )
 
 
+def _candidate_from_trade_plan(
+    *,
+    alert_id: str,
+    symbol: str,
+    now: datetime,
+    setup_candidate: SetupCandidate,
+    trade_plan,
+) -> Candidate:
+    return Candidate(
+        alert_id=alert_id,
+        symbol=symbol,
+        timeframe_min=trade_plan.timeframe_min,
+        score=float(setup_candidate.score),
+        ts=now,
+        entry_low=float(trade_plan.entry_low),
+        entry_high=float(trade_plan.entry_high),
+        stop=float(trade_plan.stop_px),
+        t1=float(trade_plan.t1_px),
+        t2=float(trade_plan.t2_px),
+        r=float(trade_plan.stop_distance),
+        reasons=list(setup_candidate.reasons),
+        news_sentiment=None,
+        news_summary=None,
+    )
+
+
 class AlertPipeline:
     def __init__(self, context: RuntimeContext):
         self.context = context
@@ -51,16 +79,22 @@ class AlertPipeline:
     def process(
         self,
         *,
+        enabled_strategy: EnabledStrategy,
         symbol: str,
         now: datetime,
         ts: datetime,
-        score: float,
-        reasons: list[str],
-        computed: dict,
+        setup_candidate: SetupCandidate,
         computed_for_log: dict,
-        tier: str,
     ) -> None:
         profile = self.context.profile
+        strategy = enabled_strategy.strategy
+        strategy_metadata = enabled_strategy.metadata
+        score = float(setup_candidate.score)
+        reasons = list(setup_candidate.reasons)
+        tier = setup_candidate.tier
+
+        if tier is None:
+            raise ValueError("AlertPipeline.process requires a tiered setup candidate")
 
         provisional_alert_id = str(uuid4())
         intent_row = make_intent_core_row(
@@ -71,7 +105,7 @@ class AlertPipeline:
             timeframe_min=profile.timeframe_min,
             computed_for_log=computed_for_log,
             config_hash=self.context.config_hash,
-            strategy_version=self.context.strategy_version,
+            strategy_metadata=strategy_metadata,
         )
         alert_context_row = make_alert_context_row(
             alert_id=provisional_alert_id,
@@ -81,24 +115,22 @@ class AlertPipeline:
             score=score,
             computed_for_log=computed_for_log,
             config_hash=self.context.config_hash,
-            strategy_version=self.context.strategy_version,
+            strategy_metadata=strategy_metadata,
         )
 
-        if not self.context.cooldown.allowed(symbol, tier, now):
+        if not self.context.cooldown.allowed(symbol, tier, now, strategy_metadata.strategy_id):
             self.context.telemetry.record_cooldown_blocked(tier)
             intent_row = replace(intent_row, alert_status="SKIPPED_COOLDOWN", skip_reason="COOLDOWN")
             self._log_intent_and_context(symbol, intent_row, alert_context_row)
             return
 
         try:
-            candidate = self.context.strategy_engine.build_trade_candidate(
+            trade_plan = strategy.build_trade_plan(
                 symbol,
                 profile,
-                computed,
-                reasons,
-                score,
+                setup_candidate,
             )
-            if candidate is None:
+            if trade_plan is None:
                 intent_row = replace(
                     intent_row,
                     alert_status="SKIPPED_INVALID_STOP",
@@ -107,6 +139,14 @@ class AlertPipeline:
                 )
                 self._log_intent_and_context(symbol, intent_row, alert_context_row)
                 return
+
+            candidate = _candidate_from_trade_plan(
+                alert_id=str(uuid4()),
+                symbol=symbol,
+                now=now,
+                setup_candidate=setup_candidate,
+                trade_plan=trade_plan,
+            )
 
             intent_row = replace(
                 intent_row,
@@ -169,13 +209,17 @@ class AlertPipeline:
                     max_favorable=float(candidate.entry_high),
                     max_adverse=float(candidate.entry_high),
                     strategy_profile=config.STRATEGY_PROFILE,
-                    strategy_version=self.context.strategy_version,
+                    strategy_id=strategy_metadata.strategy_id,
+                    strategy_version=strategy_metadata.strategy_version,
+                    setup_family=strategy_metadata.setup_family,
+                    strategy_params_json=strategy_metadata.strategy_params_json,
+                    strategy_params_hash=strategy_metadata.strategy_params_hash,
                     config_hash=self.context.config_hash,
                     side="LONG",
                 )
             )
 
-            self.context.cooldown.mark(symbol, tier, now)
+            self.context.cooldown.mark(symbol, tier, now, strategy_metadata.strategy_id)
             print(f"ALERT {symbol} tier={tier} score={score:.2f}")
 
         except Exception as e:

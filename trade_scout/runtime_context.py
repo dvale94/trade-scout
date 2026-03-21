@@ -11,7 +11,18 @@ from . import config
 from . import watch
 from . import anchors
 from .cooldown import Cooldown
-from .strategy_engine import StrategyEngine
+from .strategies.base import Strategy
+from .strategies.types import StrategyMetadata
+
+
+@dataclass(frozen=True)
+class EnabledStrategy:
+    strategy: Strategy
+    metadata: StrategyMetadata
+
+    @property
+    def strategy_version(self) -> str:
+        return self.metadata.strategy_version
 
 
 def compute_config_hash(profile) -> str:
@@ -29,8 +40,7 @@ def compute_config_hash(profile) -> str:
 @dataclass
 class RuntimeContext:
     profile: object
-    strategy_engine: StrategyEngine
-    strategy_version: str
+    strategies: list[EnabledStrategy]
     config_hash: str
     min_needed: int
     max_keep: int

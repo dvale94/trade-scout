@@ -50,7 +50,11 @@ class Watch:
 
     # strategy metadata (so outcomes can join cleanly)
     strategy_profile: str | None = None
+    strategy_id: str | None = None
     strategy_version: str | None = None
+    setup_family: str | None = None
+    strategy_params_json: str | None = None
+    strategy_params_hash: str | None = None
     config_hash: str | None = None
     side: str = "LONG"
 
@@ -90,7 +94,11 @@ class Watch:
             "hit_t2": self.hit_t2,
 
             "strategy_profile": self.strategy_profile,
+            "strategy_id": self.strategy_id,
             "strategy_version": self.strategy_version,
+            "setup_family": self.setup_family,
+            "strategy_params_json": self.strategy_params_json,
+            "strategy_params_hash": self.strategy_params_hash,
             "config_hash": self.config_hash,
             "side": self.side,
 
@@ -131,7 +139,11 @@ class Watch:
             hit_t2=bool(d.get("hit_t2", False)),
 
             strategy_profile=d.get("strategy_profile"),
+            strategy_id=d.get("strategy_id", "legacy"),
             strategy_version=d.get("strategy_version"),
+            setup_family=d.get("setup_family", "legacy"),
+            strategy_params_json=d.get("strategy_params_json"),
+            strategy_params_hash=d.get("strategy_params_hash"),
             config_hash=d.get("config_hash"),
             side=d.get("side", "LONG"),
 
@@ -192,6 +204,11 @@ class Watch:
             fee_estimate=None,
             slippage_bps_estimate=None,
             latency_ms=latency_ms,
+            strategy_id=self.strategy_id or "legacy",
+            strategy_version=self.strategy_version,
+            setup_family=self.setup_family or "legacy",
+            strategy_params_json=self.strategy_params_json,
+            strategy_params_hash=self.strategy_params_hash,
         )
 
 
@@ -260,7 +277,11 @@ class Watch:
             symbol=self.symbol,
             side=self.side,
             strategy_profile=self.strategy_profile,
+            strategy_id=self.strategy_id or "legacy",
             strategy_version=self.strategy_version,
+            setup_family=self.setup_family or "legacy",
+            strategy_params_json=self.strategy_params_json,
+            strategy_params_hash=self.strategy_params_hash,
             config_hash=self.config_hash,
             entry_ts_utc=_dt_to_iso(self.entry_ts),
             entry_px=self.entry_px,

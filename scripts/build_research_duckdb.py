@@ -226,6 +226,10 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
               {raw_select_expr('', context_cols, 'market_type')},
               {raw_select_expr('', context_cols, 'strategy_profile')},
               {raw_select_expr('', context_cols, 'strategy_version')},
+              COALESCE({raw_value_expr('', context_cols, 'strategy_id', "'legacy'")}, 'legacy') AS strategy_id,
+              COALESCE({raw_value_expr('', context_cols, 'setup_family', "'legacy'")}, 'legacy') AS setup_family,
+              {raw_select_expr('', context_cols, 'strategy_params_json')},
+              {raw_select_expr('', context_cols, 'strategy_params_hash')},
               {raw_select_expr('', context_cols, 'config_hash')},
               {raw_select_expr('', context_cols, 'signal_ts_utc')},
               {raw_int_select_expr('', context_cols, 'signal_hour_utc')},
@@ -281,6 +285,10 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
               i.market_type,
               i.strategy_profile,
               i.strategy_version,
+              COALESCE({raw_value_expr('i', intent_cols, 'strategy_id', "'legacy'")}, 'legacy') AS strategy_id,
+              COALESCE({raw_value_expr('i', intent_cols, 'setup_family', "'legacy'")}, 'legacy') AS setup_family,
+              {raw_select_expr('i', intent_cols, 'strategy_params_json')},
+              {raw_select_expr('i', intent_cols, 'strategy_params_hash')},
               i.config_hash,
               i.tier,
               i.signal_ts_utc,
@@ -469,13 +477,30 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
             f"""
             CREATE VIEW executions_enriched AS
             SELECT
-              e.*,
-              TRY_CAST({raw_value_expr('e', execution_cols, 'exec_ts_utc')} AS TIMESTAMP) AS exec_ts,
-              CAST(TRY_CAST({raw_value_expr('e', execution_cols, 'exec_ts_utc')} AS TIMESTAMP) AS DATE) AS exec_date,
-              EXTRACT(HOUR FROM TRY_CAST({raw_value_expr('e', execution_cols, 'exec_ts_utc')} AS TIMESTAMP)) AS exec_hour_utc,
+              {raw_select_expr('e', execution_cols, 'exec_id')},
+              {raw_select_expr('e', execution_cols, 'alert_id')},
+              {raw_select_expr('e', execution_cols, 'symbol')},
+              {raw_select_expr('e', execution_cols, 'side')},
+              {raw_select_expr('e', execution_cols, 'exec_type')},
+              {raw_select_expr('e', execution_cols, 'exec_ts_utc')},
+              {raw_numeric_select_expr('e', execution_cols, 'exec_px')},
+              {raw_select_expr('e', execution_cols, 'exec_px_source')},
               {raw_numeric_select_expr('e', execution_cols, 'entry_fill_px')},
               {raw_select_expr('e', execution_cols, 'entry_fill_ts_utc')},
               {raw_numeric_select_expr('e', execution_cols, 'slippage_pct')},
+              {raw_numeric_select_expr('e', execution_cols, 'qty')},
+              {raw_numeric_select_expr('e', execution_cols, 'fee_estimate')},
+              {raw_numeric_select_expr('e', execution_cols, 'slippage_bps_estimate')},
+              {raw_numeric_select_expr('e', execution_cols, 'latency_ms')},
+              {raw_select_expr('e', execution_cols, 'schema_version')},
+              COALESCE({raw_value_expr('e', execution_cols, 'strategy_id', "'legacy'")}, 'legacy') AS strategy_id,
+              {raw_select_expr('e', execution_cols, 'strategy_version')},
+              COALESCE({raw_value_expr('e', execution_cols, 'setup_family', "'legacy'")}, 'legacy') AS setup_family,
+              {raw_select_expr('e', execution_cols, 'strategy_params_json')},
+              {raw_select_expr('e', execution_cols, 'strategy_params_hash')},
+              TRY_CAST({raw_value_expr('e', execution_cols, 'exec_ts_utc')} AS TIMESTAMP) AS exec_ts,
+              CAST(TRY_CAST({raw_value_expr('e', execution_cols, 'exec_ts_utc')} AS TIMESTAMP) AS DATE) AS exec_date,
+              EXTRACT(HOUR FROM TRY_CAST({raw_value_expr('e', execution_cols, 'exec_ts_utc')} AS TIMESTAMP)) AS exec_hour_utc,
               CASE WHEN COALESCE({raw_value_expr('e', execution_cols, 'exec_type')}, '') = 'ENTRY' THEN TRUE ELSE FALSE END AS is_entry,
               CASE WHEN COALESCE({raw_value_expr('e', execution_cols, 'exec_type')}, '') <> 'ENTRY' THEN TRUE ELSE FALSE END AS is_exit
             FROM executions e
@@ -493,6 +518,10 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
                 CREATE VIEW strategy_summary AS
                 SELECT
                   {raw_select_expr('ai', intent_cols, 'strategy_profile')},
+                  COALESCE({raw_value_expr('ai', intent_cols, 'strategy_id', "'legacy'")}, 'legacy') AS strategy_id,
+                  {raw_select_expr('ai', intent_cols, 'strategy_version')},
+                  COALESCE({raw_value_expr('ai', intent_cols, 'setup_family', "'legacy'")}, 'legacy') AS setup_family,
+                  {raw_select_expr('ai', intent_cols, 'strategy_params_hash')},
                   {raw_select_expr('ai', intent_cols, 'tier')},
                   COUNT(*) AS intents_total,
                   COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('ai', intent_cols, 'alert_status')}, '') = 'ALERT_CREATED') AS alerts_created,
@@ -504,8 +533,8 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
                 FROM alerts_intents ai
                 LEFT JOIN alert_context ac
                   ON ai.alert_id = ac.alert_id
-                GROUP BY 1,2
-                ORDER BY 1,2
+                GROUP BY 1,2,3,4,5,6
+                ORDER BY 1,2,3,4,5,6
                 """
             )
         else:
@@ -514,6 +543,10 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
                 CREATE VIEW strategy_summary AS
                 SELECT
                   {raw_select_expr('', intent_cols, 'strategy_profile')},
+                  COALESCE({raw_value_expr('', intent_cols, 'strategy_id', "'legacy'")}, 'legacy') AS strategy_id,
+                  {raw_select_expr('', intent_cols, 'strategy_version')},
+                  COALESCE({raw_value_expr('', intent_cols, 'setup_family', "'legacy'")}, 'legacy') AS setup_family,
+                  {raw_select_expr('', intent_cols, 'strategy_params_hash')},
                   {raw_select_expr('', intent_cols, 'tier')},
                   COUNT(*) AS intents_total,
                   COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('', intent_cols, 'alert_status')}, '') = 'ALERT_CREATED') AS alerts_created,
@@ -523,8 +556,8 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
                   COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('', intent_cols, 'alert_status')}, '') = 'ERROR_ALERT_PIPELINE') AS pipeline_errors,
                   NULL AS avg_score
                 FROM alerts_intents
-                GROUP BY 1,2
-                ORDER BY 1,2
+                GROUP BY 1,2,3,4,5,6
+                ORDER BY 1,2,3,4,5,6
                 """
             )
 
@@ -541,6 +574,10 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
                   SELECT
                     {raw_select_expr('i', intent_cols, 'market_type')},
                     {raw_select_expr('i', intent_cols, 'strategy_profile')},
+                    COALESCE({raw_value_expr('i', intent_cols, 'strategy_id', "'legacy'")}, 'legacy') AS strategy_id,
+                    {raw_select_expr('i', intent_cols, 'strategy_version')},
+                    COALESCE({raw_value_expr('i', intent_cols, 'setup_family', "'legacy'")}, 'legacy') AS setup_family,
+                    {raw_select_expr('i', intent_cols, 'strategy_params_hash')},
                     {raw_select_expr('i', intent_cols, 'tier')},
                     COUNT(*) AS total_intent_rows,
                     COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('i', intent_cols, 'alert_status')}, '') = 'ALERT_CREATED') AS alerts_created,
@@ -549,12 +586,16 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
                     COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('i', intent_cols, 'alert_status')}, '') = 'SKIPPED_TIGHT_STOP') AS skipped_tight_stop,
                     COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('i', intent_cols, 'alert_status')}, '') = 'ERROR_ALERT_PIPELINE') AS pipeline_errors
                   FROM alerts_intents i
-                  GROUP BY 1,2,3
+                  GROUP BY 1,2,3,4,5,6,7
                 ),
                 created_outcomes AS (
                   SELECT
                     {raw_select_expr('i', intent_cols, 'market_type')},
                     {raw_select_expr('i', intent_cols, 'strategy_profile')},
+                    COALESCE({raw_value_expr('i', intent_cols, 'strategy_id', "'legacy'")}, 'legacy') AS strategy_id,
+                    {raw_select_expr('i', intent_cols, 'strategy_version')},
+                    COALESCE({raw_value_expr('i', intent_cols, 'setup_family', "'legacy'")}, 'legacy') AS setup_family,
+                    {raw_select_expr('i', intent_cols, 'strategy_params_hash')},
                     {raw_select_expr('i', intent_cols, 'tier')},
                     COUNT(*) FILTER (WHERE COALESCE({raw_boolean_value_expr('o', outcome_cols, 'entered')}, FALSE)) AS entered_count,
                     COUNT(*) FILTER (WHERE {raw_numeric_value_expr('o', outcome_cols, 'pnl_R')} IS NOT NULL) AS closed_trade_count,
@@ -565,11 +606,15 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
                   FROM alerts_intents i
                   LEFT JOIN outcomes o USING (alert_id)
                   WHERE COALESCE({raw_value_expr('i', intent_cols, 'alert_status')}, '') = 'ALERT_CREATED'
-                  GROUP BY 1,2,3
+                  GROUP BY 1,2,3,4,5,6,7
                 )
                 SELECT
                   ir.market_type,
                   ir.strategy_profile,
+                  ir.strategy_id,
+                  ir.strategy_version,
+                  ir.setup_family,
+                  ir.strategy_params_hash,
                   ir.tier,
                   ir.total_intent_rows,
                   ir.alerts_created,
@@ -587,8 +632,18 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
                 LEFT JOIN created_outcomes co
                   ON ir.market_type = co.market_type
                  AND ir.strategy_profile = co.strategy_profile
+                 AND ir.strategy_id = co.strategy_id
+                 AND (
+                   (ir.strategy_version = co.strategy_version)
+                   OR (ir.strategy_version IS NULL AND co.strategy_version IS NULL)
+                 )
+                 AND ir.setup_family = co.setup_family
+                 AND (
+                   (ir.strategy_params_hash = co.strategy_params_hash)
+                   OR (ir.strategy_params_hash IS NULL AND co.strategy_params_hash IS NULL)
+                 )
                  AND ir.tier = co.tier
-                ORDER BY 1,2,3
+                ORDER BY 1,2,3,4,5,6,7
                 """
             )
         else:
@@ -598,6 +653,10 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
                 SELECT
                   {raw_select_expr('i', intent_cols, 'market_type')},
                   {raw_select_expr('i', intent_cols, 'strategy_profile')},
+                  COALESCE({raw_value_expr('i', intent_cols, 'strategy_id', "'legacy'")}, 'legacy') AS strategy_id,
+                  {raw_select_expr('i', intent_cols, 'strategy_version')},
+                  COALESCE({raw_value_expr('i', intent_cols, 'setup_family', "'legacy'")}, 'legacy') AS setup_family,
+                  {raw_select_expr('i', intent_cols, 'strategy_params_hash')},
                   {raw_select_expr('i', intent_cols, 'tier')},
                   COUNT(*) AS total_intent_rows,
                   COUNT(*) FILTER (WHERE COALESCE({raw_value_expr('i', intent_cols, 'alert_status')}, '') = 'ALERT_CREATED') AS alerts_created,
@@ -612,8 +671,8 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
                   0 AS timeout_exit_count,
                   0 AS t2_exit_count
                 FROM alerts_intents i
-                GROUP BY 1,2,3
-                ORDER BY 1,2,3
+                GROUP BY 1,2,3,4,5,6,7
+                ORDER BY 1,2,3,4,5,6,7
                 """
             )
 
