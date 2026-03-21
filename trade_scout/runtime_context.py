@@ -15,6 +15,16 @@ from .strategies.base import Strategy
 from .strategies.types import StrategyMetadata
 
 
+@dataclass(frozen=True)
+class EnabledStrategy:
+    strategy: Strategy
+    metadata: StrategyMetadata
+
+    @property
+    def strategy_version(self) -> str:
+        return self.metadata.strategy_version
+
+
 def compute_config_hash(profile) -> str:
     payload = {
         "market_type": config.MARKET_TYPE,
@@ -30,9 +40,7 @@ def compute_config_hash(profile) -> str:
 @dataclass
 class RuntimeContext:
     profile: object
-    strategy: Strategy
-    strategy_metadata: StrategyMetadata
-    strategy_version: str
+    strategies: list[EnabledStrategy]
     config_hash: str
     min_needed: int
     max_keep: int

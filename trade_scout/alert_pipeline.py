@@ -13,7 +13,7 @@ from .journal_builders import (
     make_alert_context_row,
     make_intent_core_row,
 )
-from .runtime_context import RuntimeContext
+from .runtime_context import EnabledStrategy, RuntimeContext
 from .strategies.types import SetupCandidate
 from .strategy import Candidate
 
@@ -79,6 +79,7 @@ class AlertPipeline:
     def process(
         self,
         *,
+        enabled_strategy: EnabledStrategy,
         symbol: str,
         now: datetime,
         ts: datetime,
@@ -86,7 +87,8 @@ class AlertPipeline:
         computed_for_log: dict,
     ) -> None:
         profile = self.context.profile
-        strategy_metadata = self.context.strategy_metadata
+        strategy = enabled_strategy.strategy
+        strategy_metadata = enabled_strategy.metadata
         score = float(setup_candidate.score)
         reasons = list(setup_candidate.reasons)
         tier = setup_candidate.tier
@@ -116,14 +118,14 @@ class AlertPipeline:
             strategy_metadata=strategy_metadata,
         )
 
-        if not self.context.cooldown.allowed(symbol, tier, now):
+        if not self.context.cooldown.allowed(symbol, tier, now, strategy_metadata.strategy_id):
             self.context.telemetry.record_cooldown_blocked(tier)
             intent_row = replace(intent_row, alert_status="SKIPPED_COOLDOWN", skip_reason="COOLDOWN")
             self._log_intent_and_context(symbol, intent_row, alert_context_row)
             return
 
         try:
-            trade_plan = self.context.strategy.build_trade_plan(
+            trade_plan = strategy.build_trade_plan(
                 symbol,
                 profile,
                 setup_candidate,
@@ -208,14 +210,14 @@ class AlertPipeline:
                     max_adverse=float(candidate.entry_high),
                     strategy_profile=config.STRATEGY_PROFILE,
                     strategy_id=strategy_metadata.strategy_id,
-                    strategy_version=self.context.strategy_version,
+                    strategy_version=strategy_metadata.strategy_version,
                     setup_family=strategy_metadata.setup_family,
                     config_hash=self.context.config_hash,
                     side="LONG",
                 )
             )
 
-            self.context.cooldown.mark(symbol, tier, now)
+            self.context.cooldown.mark(symbol, tier, now, strategy_metadata.strategy_id)
             print(f"ALERT {symbol} tier={tier} score={score:.2f}")
 
         except Exception as e:

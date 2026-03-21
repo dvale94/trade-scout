@@ -11,7 +11,7 @@ from .telemetry import TelemetryTracker
 from . import watch
 from .bar_processor import BarProcessor
 from .cooldown import Cooldown
-from .runtime_context import RuntimeContext, compute_config_hash
+from .runtime_context import EnabledStrategy, RuntimeContext, compute_config_hash
 from .strategies.registry import load_enabled_strategies
 
 
@@ -48,18 +48,18 @@ def run():
     symbols_to_run = list(dict.fromkeys(config.SYMBOLS + [anchor.anchor_symbol]))  # de-dupe, preserve order
 
     strategies = load_enabled_strategies(config.ENABLED_STRATEGY_IDS, config.STRATEGY_PARAMS)
-    if len(strategies) != 1:
-        raise ValueError(
-            "This runtime currently supports exactly one enabled strategy; "
-            f"got {len(strategies)}: {config.ENABLED_STRATEGY_IDS}"
-        )
-    strategy = strategies[0]
-    strategy_metadata = strategy.metadata_for_journaling()
-    strategy_version = strategy_metadata.strategy_version
+    if not strategies:
+        raise ValueError("At least one enabled strategy is required")
+    enabled_strategies = [
+        EnabledStrategy(strategy=strategy, metadata=strategy.metadata_for_journaling())
+        for strategy in strategies
+    ]
+    strategy_version = ",".join(strategy.strategy_version for strategy in enabled_strategies)
 
     print(
         f"MARKET_TYPE={config.MARKET_TYPE} PROFILE={profile.name} timeframe={profile.timeframe_min}m "
-        f"symbols={symbols_to_run} config_hash={config_hash} strat_ver={strategy_version}"
+        f"symbols={symbols_to_run} config_hash={config_hash} strat_ver={strategy_version} "
+        f"strategies={[strategy.metadata.strategy_id for strategy in enabled_strategies]}"
     )
 
     print("Seeding history...")
@@ -79,9 +79,7 @@ def run():
     telemetry = TelemetryTracker(config.STRATEGY_PROFILE, profile.timeframe_min)
     runtime = RuntimeContext(
         profile=profile,
-        strategy=strategy,
-        strategy_metadata=strategy_metadata,
-        strategy_version=strategy_version,
+        strategies=enabled_strategies,
         config_hash=config_hash,
         min_needed=min_needed,
         max_keep=max_keep,

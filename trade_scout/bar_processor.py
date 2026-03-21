@@ -57,34 +57,38 @@ class BarProcessor:
                 self.context.telemetry.record_insufficient_history()
                 return
 
-            setup_candidate = self.context.strategy.evaluate_candidate(df, self.context.profile)
-            score = float(setup_candidate.score)
-            computed = dict(setup_candidate.computed)
-            self.context.telemetry.record_score(score)
+            anchor_updated = False
+            for enabled_strategy in self.context.strategies:
+                setup_candidate = enabled_strategy.strategy.evaluate_candidate(df, self.context.profile)
+                score = float(setup_candidate.score)
+                computed = dict(setup_candidate.computed)
+                self.context.telemetry.record_score(score)
 
-            if computed.get("ma200") is None or computed.get("atr") is None:
-                self.context.telemetry.record_indicator_missing()
-                return
+                if computed.get("ma200") is None or computed.get("atr") is None:
+                    self.context.telemetry.record_indicator_missing()
+                    continue
 
-            if self.context.anchor.is_anchor(symbol):
-                self.context.anchor.update_from_computed(computed, ts)
-                if symbol not in config.SYMBOLS:
-                    return
+                if self.context.anchor.is_anchor(symbol) and not anchor_updated:
+                    self.context.anchor.update_from_computed(computed, ts)
+                    anchor_updated = True
+                    if symbol not in config.SYMBOLS:
+                        return
 
-            tier = setup_candidate.tier
-            if tier is None:
-                self.context.telemetry.record_below_score()
-                return
-            self.context.telemetry.record_tier_selected(tier)
+                tier = setup_candidate.tier
+                if tier is None:
+                    self.context.telemetry.record_below_score()
+                    continue
+                self.context.telemetry.record_tier_selected(tier)
 
-            computed_for_log = self.context.anchor.inject_into_computed(computed)
-            self.alerts.process(
-                symbol=symbol,
-                now=now,
-                ts=ts,
-                setup_candidate=setup_candidate,
-                computed_for_log=computed_for_log,
-            )
+                computed_for_log = self.context.anchor.inject_into_computed(computed)
+                self.alerts.process(
+                    enabled_strategy=enabled_strategy,
+                    symbol=symbol,
+                    now=now,
+                    ts=ts,
+                    setup_candidate=setup_candidate,
+                    computed_for_log=computed_for_log,
+                )
 
         finally:
             self.context.telemetry.maybe_flush(datetime.now(timezone.utc))
