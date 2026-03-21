@@ -50,6 +50,8 @@ ALERT_INTENT_FIELDS = [
     "qty",
     "reasons",
     "schema_version",
+    "strategy_id",
+    "setup_family",
 ]
 
 ALERT_CONTEXT_FIELDS = [
@@ -92,6 +94,8 @@ ALERT_CONTEXT_FIELDS = [
     "anchor_trend_4h",
     "anchor_trend_1d",
     "score_bucket",
+    "strategy_id",
+    "setup_family",
 ]
 
 OUTCOME_FIELDS = [
@@ -130,6 +134,8 @@ OUTCOME_FIELDS = [
     "avg_spread_bps_seen",
     "entered",
     "schema_version",
+    "strategy_id",
+    "setup_family",
 ]
 
 EXECUTION_FIELDS = [
@@ -149,6 +155,9 @@ EXECUTION_FIELDS = [
     "slippage_bps_estimate",
     "latency_ms",
     "schema_version",
+    "strategy_id",
+    "strategy_version",
+    "setup_family",
 ]
 
 TELEMETRY_FIELDS = [

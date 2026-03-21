@@ -54,7 +54,8 @@ def run():
             f"got {len(strategies)}: {config.ENABLED_STRATEGY_IDS}"
         )
     strategy = strategies[0]
-    strategy_version = strategy.metadata_for_journaling().strategy_version
+    strategy_metadata = strategy.metadata_for_journaling()
+    strategy_version = strategy_metadata.strategy_version
 
     print(
         f"MARKET_TYPE={config.MARKET_TYPE} PROFILE={profile.name} timeframe={profile.timeframe_min}m "
@@ -79,6 +80,7 @@ def run():
     runtime = RuntimeContext(
         profile=profile,
         strategy=strategy,
+        strategy_metadata=strategy_metadata,
         strategy_version=strategy_version,
         config_hash=config_hash,
         min_needed=min_needed,

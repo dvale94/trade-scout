@@ -12,6 +12,7 @@ from . import watch
 from . import anchors
 from .cooldown import Cooldown
 from .strategies.base import Strategy
+from .strategies.types import StrategyMetadata
 
 
 def compute_config_hash(profile) -> str:
@@ -30,6 +31,7 @@ def compute_config_hash(profile) -> str:
 class RuntimeContext:
     profile: object
     strategy: Strategy
+    strategy_metadata: StrategyMetadata
     strategy_version: str
     config_hash: str
     min_needed: int

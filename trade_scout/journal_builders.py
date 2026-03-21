@@ -4,6 +4,7 @@ from datetime import datetime, timezone, timedelta
 
 from . import config
 from .journal_rows import AlertContextRow, AlertIntentRow
+from .strategies.types import StrategyMetadata
 
 
 def _signal_window_fields(bar_ts: datetime, timeframe_min: int) -> tuple[str, str]:
@@ -21,7 +22,7 @@ def make_intent_core_row(
     timeframe_min: int,
     computed_for_log: dict,
     config_hash: str,
-    strategy_version: str,
+    strategy_metadata: StrategyMetadata,
 ) -> AlertIntentRow:
     return AlertIntentRow(
         alert_id=alert_id,
@@ -29,7 +30,7 @@ def make_intent_core_row(
         side="LONG",
         market_type=config.MARKET_TYPE,
         strategy_profile=config.STRATEGY_PROFILE,
-        strategy_version=strategy_version,
+        strategy_version=strategy_metadata.strategy_version,
         config_hash=config_hash,
         tier=tier,
         signal_ts_utc=now.astimezone(timezone.utc).isoformat(),
@@ -53,6 +54,8 @@ def make_intent_core_row(
         qty_model=None,
         qty=None,
         reasons=None,
+        strategy_id=strategy_metadata.strategy_id,
+        setup_family=strategy_metadata.setup_family,
     )
 
 
@@ -65,7 +68,7 @@ def make_alert_context_row(
     score: float,
     computed_for_log: dict,
     config_hash: str,
-    strategy_version: str,
+    strategy_metadata: StrategyMetadata,
 ) -> AlertContextRow:
     bar_start_ts_utc, bar_end_ts_utc = _signal_window_fields(bar_ts, timeframe_min)
     anchor_trend_1h, anchor_trend_4h, anchor_trend_1d = _anchor_trend_snapshot(computed_for_log)
@@ -73,7 +76,7 @@ def make_alert_context_row(
         alert_id=alert_id,
         market_type=config.MARKET_TYPE,
         strategy_profile=config.STRATEGY_PROFILE,
-        strategy_version=strategy_version,
+        strategy_version=strategy_metadata.strategy_version,
         config_hash=config_hash,
         signal_ts_utc=now.astimezone(timezone.utc).isoformat(),
         signal_hour_utc=int(now.astimezone(timezone.utc).hour),
@@ -108,6 +111,8 @@ def make_alert_context_row(
         anchor_trend_4h=anchor_trend_4h,
         anchor_trend_1d=anchor_trend_1d,
         score_bucket=_score_bucket(score),
+        strategy_id=strategy_metadata.strategy_id,
+        setup_family=strategy_metadata.setup_family,
     )
 
 

@@ -61,6 +61,7 @@ class AlertPipeline:
         tier: str,
     ) -> None:
         profile = self.context.profile
+        strategy_metadata = self.context.strategy_metadata
 
         provisional_alert_id = str(uuid4())
         intent_row = make_intent_core_row(
@@ -71,7 +72,7 @@ class AlertPipeline:
             timeframe_min=profile.timeframe_min,
             computed_for_log=computed_for_log,
             config_hash=self.context.config_hash,
-            strategy_version=self.context.strategy_version,
+            strategy_metadata=strategy_metadata,
         )
         alert_context_row = make_alert_context_row(
             alert_id=provisional_alert_id,
@@ -81,7 +82,7 @@ class AlertPipeline:
             score=score,
             computed_for_log=computed_for_log,
             config_hash=self.context.config_hash,
-            strategy_version=self.context.strategy_version,
+            strategy_metadata=strategy_metadata,
         )
 
         if not self.context.cooldown.allowed(symbol, tier, now):
@@ -169,7 +170,9 @@ class AlertPipeline:
                     max_favorable=float(candidate.entry_high),
                     max_adverse=float(candidate.entry_high),
                     strategy_profile=config.STRATEGY_PROFILE,
+                    strategy_id=strategy_metadata.strategy_id,
                     strategy_version=self.context.strategy_version,
+                    setup_family=strategy_metadata.setup_family,
                     config_hash=self.context.config_hash,
                     side="LONG",
                 )

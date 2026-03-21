@@ -43,6 +43,8 @@ class AlertIntentRow:
     qty: float | None
     reasons: str | None
     schema_version: str = "1"
+    strategy_id: str | None = None
+    setup_family: str | None = None
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -91,6 +93,8 @@ class AlertIntentRow:
             "qty": self.qty,
             "reasons": self.reasons,
             "schema_version": self.schema_version,
+            "strategy_id": self.strategy_id,
+            "setup_family": self.setup_family,
         }
 
 
@@ -135,6 +139,8 @@ class AlertContextRow:
     anchor_trend_1d: str | None
     score_bucket: str | None
     schema_version: str = "1"
+    strategy_id: str | None = None
+    setup_family: str | None = None
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -188,6 +194,8 @@ class AlertContextRow:
             "anchor_trend_4h": self.anchor_trend_4h,
             "anchor_trend_1d": self.anchor_trend_1d,
             "score_bucket": self.score_bucket,
+            "strategy_id": self.strategy_id,
+            "setup_family": self.setup_family,
         }
 
 
@@ -209,6 +217,9 @@ class ExecutionRow:
     slippage_bps_estimate: float | None
     latency_ms: int | None
     schema_version: str = "1"
+    strategy_id: str | None = None
+    strategy_version: str | None = None
+    setup_family: str | None = None
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -240,6 +251,9 @@ class ExecutionRow:
             "slippage_bps_estimate": self.slippage_bps_estimate,
             "latency_ms": self.latency_ms,
             "schema_version": self.schema_version,
+            "strategy_id": self.strategy_id,
+            "strategy_version": self.strategy_version,
+            "setup_family": self.setup_family,
         }
 
 
@@ -280,6 +294,8 @@ class OutcomeRow:
     avg_spread_bps_seen: float | None
     entered: bool
     schema_version: str = "1"
+    strategy_id: str | None = None
+    setup_family: str | None = None
 
     def __post_init__(self) -> None:
         for field_name in ("alert_id", "symbol", "side"):
@@ -322,4 +338,6 @@ class OutcomeRow:
             "avg_spread_bps_seen": self.avg_spread_bps_seen,
             "entered": self.entered,
             "schema_version": self.schema_version,
+            "strategy_id": self.strategy_id,
+            "setup_family": self.setup_family,
         }
