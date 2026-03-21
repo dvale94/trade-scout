@@ -14,6 +14,8 @@ from .journal_builders import (
     make_intent_core_row,
 )
 from .runtime_context import RuntimeContext
+from .strategies.types import SetupCandidate
+from .strategy import Candidate
 
 
 def format_alert(candidate, tier: str) -> str:
@@ -37,6 +39,32 @@ def format_alert(candidate, tier: str) -> str:
     )
 
 
+def _candidate_from_trade_plan(
+    *,
+    alert_id: str,
+    symbol: str,
+    now: datetime,
+    setup_candidate: SetupCandidate,
+    trade_plan,
+) -> Candidate:
+    return Candidate(
+        alert_id=alert_id,
+        symbol=symbol,
+        timeframe_min=trade_plan.timeframe_min,
+        score=float(setup_candidate.score),
+        ts=now,
+        entry_low=float(trade_plan.entry_low),
+        entry_high=float(trade_plan.entry_high),
+        stop=float(trade_plan.stop_px),
+        t1=float(trade_plan.t1_px),
+        t2=float(trade_plan.t2_px),
+        r=float(trade_plan.stop_distance),
+        reasons=list(setup_candidate.reasons),
+        news_sentiment=None,
+        news_summary=None,
+    )
+
+
 class AlertPipeline:
     def __init__(self, context: RuntimeContext):
         self.context = context
@@ -54,14 +82,17 @@ class AlertPipeline:
         symbol: str,
         now: datetime,
         ts: datetime,
-        score: float,
-        reasons: list[str],
-        computed: dict,
+        setup_candidate: SetupCandidate,
         computed_for_log: dict,
-        tier: str,
     ) -> None:
         profile = self.context.profile
         strategy_metadata = self.context.strategy_metadata
+        score = float(setup_candidate.score)
+        reasons = list(setup_candidate.reasons)
+        tier = setup_candidate.tier
+
+        if tier is None:
+            raise ValueError("AlertPipeline.process requires a tiered setup candidate")
 
         provisional_alert_id = str(uuid4())
         intent_row = make_intent_core_row(
@@ -92,14 +123,12 @@ class AlertPipeline:
             return
 
         try:
-            candidate = self.context.strategy.build_trade_candidate(
+            trade_plan = self.context.strategy.build_trade_plan(
                 symbol,
                 profile,
-                computed,
-                reasons,
-                score,
+                setup_candidate,
             )
-            if candidate is None:
+            if trade_plan is None:
                 intent_row = replace(
                     intent_row,
                     alert_status="SKIPPED_INVALID_STOP",
@@ -108,6 +137,14 @@ class AlertPipeline:
                 )
                 self._log_intent_and_context(symbol, intent_row, alert_context_row)
                 return
+
+            candidate = _candidate_from_trade_plan(
+                alert_id=str(uuid4()),
+                symbol=symbol,
+                now=now,
+                setup_candidate=setup_candidate,
+                trade_plan=trade_plan,
+            )
 
             intent_row = replace(
                 intent_row,

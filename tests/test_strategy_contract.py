@@ -52,16 +52,6 @@ class _StubStrategy:
             stop_distance=6.0,
         )
 
-    def score_candidate(self, df, profile):
-        candidate = self.evaluate_candidate(df, profile)
-        return candidate.score, list(candidate.reasons), dict(candidate.computed)
-
-    def pick_tier(self, score, df, profile, computed):
-        return "A_CONTINUATION"
-
-    def build_trade_candidate(self, symbol, profile, computed, reasons, score):
-        return None
-
     def metadata_for_journaling(self) -> StrategyMetadata:
         return StrategyMetadata(
             strategy_id=self.strategy_id,

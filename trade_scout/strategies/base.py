@@ -8,7 +8,6 @@ from .types import SetupCandidate, StrategyMetadata, TradePlan
 
 if TYPE_CHECKING:
     import pandas as pd
-    from trade_scout.strategy import Candidate
 
 
 @runtime_checkable
@@ -41,27 +40,4 @@ class Strategy(Protocol):
         ...
 
     def metadata_for_journaling(self) -> StrategyMetadata:
-        ...
-
-    # Temporary compatibility surface for the current runtime orchestration.
-    def score_candidate(self, df: "pd.DataFrame", profile: StrategyProfile) -> tuple[float, list[str], dict]:
-        ...
-
-    def pick_tier(
-        self,
-        score: float,
-        df: "pd.DataFrame",
-        profile: StrategyProfile,
-        computed: dict,
-    ) -> str | None:
-        ...
-
-    def build_trade_candidate(
-        self,
-        symbol: str,
-        profile: StrategyProfile,
-        computed: dict,
-        reasons: list[str],
-        score: float,
-    ) -> "Candidate | None":
         ...
