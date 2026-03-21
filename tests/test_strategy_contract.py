@@ -1,8 +1,19 @@
 from __future__ import annotations
 
+import sys
+import types
 import unittest
 
-from trade_scout.strategies import SetupCandidate, Strategy, StrategyMetadata, TradePlan
+sys.modules.setdefault("numpy", types.SimpleNamespace(isnan=lambda value: False))
+sys.modules.setdefault("pandas", types.SimpleNamespace(DataFrame=object, Series=object))
+
+from trade_scout.strategies import (
+    LongBreakoutContinuationStrategy,
+    SetupCandidate,
+    Strategy,
+    StrategyMetadata,
+    TradePlan,
+)
 from trade_scout.strategy_profiles import PROFILES
 
 
@@ -19,9 +30,8 @@ class _StubStrategy:
     def setup_family(self) -> str:
         return "continuation"
 
-    def evaluate_candidate(self, symbol, df, profile) -> SetupCandidate:
+    def evaluate_candidate(self, df, profile) -> SetupCandidate:
         return SetupCandidate(
-            symbol=symbol,
             score=7.5,
             reasons=("Close > MA50",),
             computed={"close": 101.0, "atr": 2.0},
@@ -41,6 +51,16 @@ class _StubStrategy:
             stop_distance=6.0,
         )
 
+    def score_candidate(self, df, profile):
+        candidate = self.evaluate_candidate(df, profile)
+        return candidate.score, list(candidate.reasons), dict(candidate.computed)
+
+    def pick_tier(self, score, df, profile, computed):
+        return "A_CONTINUATION"
+
+    def build_trade_candidate(self, symbol, profile, computed, reasons, score):
+        return None
+
     def metadata_for_journaling(self) -> StrategyMetadata:
         return StrategyMetadata(
             strategy_id=self.strategy_id,
@@ -58,7 +78,6 @@ class StrategyContractTest(unittest.TestCase):
             journal_metadata={"entry_model": "zone_buffer"},
         )
         candidate = SetupCandidate(
-            symbol="BTC/USD",
             score=7.8,
             reasons=("Close > MA50", "Close > MA200"),
             computed={"close": 101.0, "atr": 2.4, "ma50": 98.5},
@@ -86,7 +105,7 @@ class StrategyContractTest(unittest.TestCase):
 
         self.assertIsInstance(strategy, Strategy)
 
-        candidate = strategy.evaluate_candidate("BTC/USD", None, profile)
+        candidate = strategy.evaluate_candidate(None, profile)
         plan = strategy.build_trade_plan("BTC/USD", profile, candidate)
         metadata = strategy.metadata_for_journaling()
 
@@ -94,6 +113,14 @@ class StrategyContractTest(unittest.TestCase):
         self.assertIsNotNone(plan)
         self.assertEqual(plan.timeframe_min, profile.timeframe_min)
         self.assertEqual(metadata.setup_family, "continuation")
+
+    def test_current_strategy_instantiates_and_preserves_current_shape(self):
+        strategy = LongBreakoutContinuationStrategy()
+        metadata = strategy.metadata_for_journaling()
+
+        self.assertEqual(strategy.strategy_id, "long_breakout_continuation")
+        self.assertEqual(metadata.strategy_version, "v1")
+        self.assertEqual(metadata.setup_family, "breakout_continuation")
 
 
 if __name__ == "__main__":

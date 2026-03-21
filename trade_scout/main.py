@@ -12,7 +12,7 @@ from . import watch
 from .bar_processor import BarProcessor
 from .cooldown import Cooldown
 from .runtime_context import RuntimeContext, compute_config_hash
-from .strategy_engine import CurrentStrategyAdapter
+from .strategies.long_breakout_continuation import LongBreakoutContinuationStrategy
 
 
 def websocket_backoff(attempt: int, base: float = 5.0, cap: float = 120.0) -> float:
@@ -68,10 +68,10 @@ def run():
     print(f"Restored active watches: {sum(len(v) for v in watch_mgr.active.values())}")
 
     telemetry = TelemetryTracker(config.STRATEGY_PROFILE, profile.timeframe_min)
-    strategy_engine = CurrentStrategyAdapter()
+    strategy = LongBreakoutContinuationStrategy()
     runtime = RuntimeContext(
         profile=profile,
-        strategy_engine=strategy_engine,
+        strategy=strategy,
         strategy_version=strategy_version,
         config_hash=config_hash,
         min_needed=min_needed,

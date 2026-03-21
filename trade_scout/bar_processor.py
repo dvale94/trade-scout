@@ -57,7 +57,7 @@ class BarProcessor:
                 self.context.telemetry.record_insufficient_history()
                 return
 
-            score, reasons, computed = self.context.strategy_engine.score_candidate(df, self.context.profile)
+            score, reasons, computed = self.context.strategy.score_candidate(df, self.context.profile)
             self.context.telemetry.record_score(score)
 
             if computed.get("ma200") is None or computed.get("atr") is None:
@@ -69,7 +69,7 @@ class BarProcessor:
                 if symbol not in config.SYMBOLS:
                     return
 
-            tier = self.context.strategy_engine.pick_tier(score, df, self.context.profile, computed)
+            tier = self.context.strategy.pick_tier(score, df, self.context.profile, computed)
             if tier is None:
                 self.context.telemetry.record_below_score()
                 return

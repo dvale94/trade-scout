@@ -91,7 +91,7 @@ class AlertPipeline:
             return
 
         try:
-            candidate = self.context.strategy_engine.build_trade_candidate(
+            candidate = self.context.strategy.build_trade_candidate(
                 symbol,
                 profile,
                 computed,

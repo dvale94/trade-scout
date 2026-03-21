@@ -28,14 +28,10 @@ class StrategyMetadata:
 
 @dataclass(frozen=True)
 class SetupCandidate:
-    symbol: str
     score: float
     reasons: tuple[str, ...]
     computed: ComputedValues
     tier: str | None = None
-
-    def __post_init__(self) -> None:
-        _require_nonempty(self.symbol, "symbol")
 
 
 @dataclass(frozen=True)
