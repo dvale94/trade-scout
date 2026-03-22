@@ -144,6 +144,17 @@ def fetch_pending(conn: sqlite3.Connection, limit: int = 10) -> list[sqlite3.Row
     return list(rows)
 
 
+def get_request_by_id(conn: sqlite3.Connection, request_id: str) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT *
+        FROM execution_requests
+        WHERE request_id = ?
+        """,
+        (request_id,),
+    ).fetchone()
+
+
 def claim_request(conn: sqlite3.Connection, request_id: str, worker_id: str) -> bool:
     cursor = conn.execute(
         """
