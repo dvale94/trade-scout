@@ -372,6 +372,45 @@ def log_execution(row: Union[ExecutionRow, dict[str, Any]]):
     _write_row_with_schema(executions_path(), row, EXECUTION_FIELDS)
 
 
+def load_alert_intent_by_id(alert_id: str) -> dict[str, Any] | None:
+    path = alerts_intents_path()
+    if not os.path.isfile(path) or os.path.getsize(path) == 0:
+        return None
+
+    try:
+        with open(path, "r", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if not row:
+                    continue
+
+                row_alert_id = row.get("alert_id")
+                row_status = row.get("alert_status")
+                signal_ts_utc = row.get("signal_ts_utc")
+                symbol = row.get("symbol")
+                side = row.get("side")
+
+                if not row_alert_id or not row_status:
+                    continue
+                if row_alert_id != alert_id:
+                    continue
+                if row_status != "ALERT_CREATED":
+                    continue
+                if not signal_ts_utc or not symbol or not side:
+                    continue
+
+                return {
+                    "alert_id": row_alert_id,
+                    "created_ts_utc": signal_ts_utc,
+                    "symbol": symbol,
+                    "side": side,
+                }
+    except Exception:
+        return None
+
+    return None
+
+
 def save_active_watches(payload: dict):
     with open(watches_state_path(), "w") as f:
         json.dump(payload, f, indent=2, default=str)

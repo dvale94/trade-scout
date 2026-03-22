@@ -44,6 +44,14 @@ SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", "").split(",") if s.s
 # Logging directory
 LOG_DIR = os.getenv("LOG_DIR", "logs").strip()
 
+# Execution subsystem
+EXECUTION_ENABLED = os.getenv("EXECUTION_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+EXECUTION_DB_PATH = os.getenv("EXECUTION_DB_PATH", "./execution.db").strip()
+EXECUTION_POLL_INTERVAL_SECONDS = float(os.getenv("EXECUTION_POLL_INTERVAL_SECONDS", "5").strip())
+EXECUTION_MAX_ALERT_AGE_SECONDS = int(os.getenv("EXECUTION_MAX_ALERT_AGE_SECONDS", "300").strip())
+EXECUTION_BATCH_SIZE = int(os.getenv("EXECUTION_BATCH_SIZE", "10").strip())
+EXECUTION_WORKER_ID = os.getenv("EXECUTION_WORKER_ID", "execution-worker-1").strip()
+
 # Strategy loading
 ENABLED_STRATEGY_IDS = _csv_env("ENABLED_STRATEGY_IDS") or ["long_breakout_continuation"]
 STRATEGY_PARAMS = {

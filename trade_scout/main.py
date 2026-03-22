@@ -1,5 +1,6 @@
 import time
 import random
+import threading
 
 from . import config
 from . import strategy_profiles
@@ -7,6 +8,8 @@ from . import market
 from . import seed
 from . import anchors
 from . import scheduler_tasks
+from . import journal
+from .execution.worker import ExecutionWorker, ExecutionWorkerConfig
 from .telemetry import TelemetryTracker
 from . import watch
 from .bar_processor import BarProcessor
@@ -99,6 +102,29 @@ def run():
 
     scheduler_tasks.start_scheduler()
     print("Maintenance scheduler started (UTC): 6h backups, daily snapshot, nightly DuckDB, monthly archive")
+
+    execution_worker = ExecutionWorker(
+        ExecutionWorkerConfig(
+            db_path=config.EXECUTION_DB_PATH,
+            poll_interval_seconds=config.EXECUTION_POLL_INTERVAL_SECONDS,
+            batch_size=config.EXECUTION_BATCH_SIZE,
+            max_alert_age_seconds=config.EXECUTION_MAX_ALERT_AGE_SECONDS,
+            worker_id=config.EXECUTION_WORKER_ID,
+            enabled=config.EXECUTION_ENABLED,
+        ),
+        alert_lookup=journal.load_alert_intent_by_id,
+    )
+    if config.EXECUTION_ENABLED:
+        execution_thread = threading.Thread(
+            target=execution_worker.run_forever,
+            name=config.EXECUTION_WORKER_ID,
+            daemon=True,
+        )
+        execution_thread.start()
+        print(
+            "Execution worker started "
+            f"(db_path={config.EXECUTION_DB_PATH}, worker_id={config.EXECUTION_WORKER_ID})"
+        )
 
     while True:
         stream = None
