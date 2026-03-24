@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime, timezone
+from typing import Iterable
 
-from trade_scout.execution.models import ExecutionRequest, ExecutionStatus
+from trade_scout.execution.models import BrokerOrderResult, ExecutionRequest, ExecutionStatus
 
 
 ACTIVE_REQUEST_STATUSES = (
@@ -57,6 +58,32 @@ def init_db(db_path: str) -> None:
             )
             """
         )
+        _add_missing_columns(
+            conn,
+            "execution_requests",
+            (
+                ("broker_order_id", "TEXT"),
+                ("submitted_ts_utc", "TEXT"),
+            ),
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS paper_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id TEXT NOT NULL UNIQUE,
+                alert_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                qty REAL NOT NULL,
+                order_type TEXT NOT NULL,
+                time_in_force TEXT NOT NULL,
+                broker TEXT NOT NULL,
+                broker_order_id TEXT NOT NULL,
+                submitted_ts_utc TEXT NOT NULL,
+                raw_response_json TEXT
+            )
+            """
+        )
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_exec_req_status
@@ -79,6 +106,23 @@ def init_db(db_path: str) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return {str(row["name"]) for row in rows}
+
+
+def _add_missing_columns(
+    conn: sqlite3.Connection,
+    table_name: str,
+    columns: Iterable[tuple[str, str]],
+) -> None:
+    existing_columns = _table_columns(conn, table_name)
+    for column_name, column_type in columns:
+        if column_name in existing_columns:
+            continue
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
 
 
 def insert_request(conn: sqlite3.Connection, request: ExecutionRequest) -> None:
@@ -140,6 +184,20 @@ def fetch_pending(conn: sqlite3.Connection, limit: int = 10) -> list[sqlite3.Row
         LIMIT ?
         """,
         (ExecutionStatus.PENDING.value, limit),
+    ).fetchall()
+    return list(rows)
+
+
+def fetch_validated(conn: sqlite3.Connection, limit: int = 10) -> list[sqlite3.Row]:
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM execution_requests
+        WHERE status = ?
+        ORDER BY validated_ts_utc ASC, requested_ts_utc ASC
+        LIMIT ?
+        """,
+        (ExecutionStatus.VALIDATED.value, limit),
     ).fetchall()
     return list(rows)
 
@@ -219,6 +277,33 @@ def mark_expired(conn: sqlite3.Connection, request_id: str, reason: str) -> None
     conn.commit()
 
 
+def mark_submitted(
+    conn: sqlite3.Connection,
+    request_id: str,
+    broker: str,
+    broker_order_id: str,
+    submitted_ts_utc: str,
+) -> None:
+    conn.execute(
+        """
+        UPDATE execution_requests
+        SET status = ?,
+            broker = ?,
+            broker_order_id = ?,
+            submitted_ts_utc = ?
+        WHERE request_id = ?
+        """,
+        (
+            ExecutionStatus.SUBMITTED.value,
+            broker,
+            broker_order_id,
+            submitted_ts_utc,
+            request_id,
+        ),
+    )
+    conn.commit()
+
+
 def mark_failed(
     conn: sqlite3.Connection, request_id: str, code: str, message: str
 ) -> None:
@@ -231,5 +316,63 @@ def mark_failed(
         WHERE request_id = ?
         """,
         (ExecutionStatus.FAILED.value, code, message, request_id),
+    )
+    conn.commit()
+
+
+def get_paper_order_by_request_id(
+    conn: sqlite3.Connection, request_id: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT *
+        FROM paper_orders
+        WHERE request_id = ?
+        """,
+        (request_id,),
+    ).fetchone()
+
+
+def insert_paper_order(
+    conn: sqlite3.Connection,
+    *,
+    request_id: str,
+    alert_id: str,
+    symbol: str,
+    side: str,
+    qty: float,
+    order_type: str,
+    time_in_force: str,
+    result: BrokerOrderResult,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO paper_orders (
+            request_id,
+            alert_id,
+            symbol,
+            side,
+            qty,
+            order_type,
+            time_in_force,
+            broker,
+            broker_order_id,
+            submitted_ts_utc,
+            raw_response_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            request_id,
+            alert_id,
+            symbol,
+            side,
+            qty,
+            order_type,
+            time_in_force,
+            result.broker,
+            result.broker_order_id,
+            result.submitted_ts_utc,
+            result.raw_response_json,
+        ),
     )
     conn.commit()

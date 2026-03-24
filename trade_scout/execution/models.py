@@ -25,3 +25,11 @@ class ExecutionRequest:
     policy_version: Optional[str] = None
     requested_by: Optional[str] = None
     reason: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class BrokerOrderResult:
+    broker: str
+    broker_order_id: str
+    submitted_ts_utc: str
+    raw_response_json: str

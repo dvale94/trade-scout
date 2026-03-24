@@ -34,7 +34,23 @@ services:
         sync: false
       - key: ALPACA_SECRET_KEY
         sync: false
+      - key: ALPACA_BASE_URL
+        value: https://paper-api.alpaca.markets
       - key: ALPACA_STOCK_FEED
+        sync: false
+      - key: EXECUTION_ENABLED
+        value: "true"
+      - key: EXECUTION_DB_PATH
+        value: /var/data/trade-scout/execution.db
+      - key: EXECUTION_POLL_INTERVAL_SECONDS
+        value: "5"
+      - key: EXECUTION_MAX_ALERT_AGE_SECONDS
+        value: "300"
+      - key: EXECUTION_BATCH_SIZE
+        value: "10"
+      - key: EXECUTION_WORKER_ID
+        value: execution-worker-1
+      - key: EXECUTION_ORDER_QTY
         sync: false
       - key: DISCORD_WEBHOOK_URL
         sync: false
