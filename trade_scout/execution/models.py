@@ -15,6 +15,18 @@ class ExecutionStatus(str, Enum):
     SUBMITTED = "SUBMITTED"
 
 
+class PaperTradePlanStatus(str, Enum):
+    CREATED = "CREATED"
+
+
+class PaperOrderRole(str, Enum):
+    ENTRY = "ENTRY"
+
+
+class PaperOrderStatus(str, Enum):
+    SUBMITTED = "SUBMITTED"
+
+
 @dataclass(frozen=True)
 class ExecutionRequest:
     request_id: str
@@ -33,3 +45,5 @@ class BrokerOrderResult:
     broker_order_id: str
     submitted_ts_utc: str
     raw_response_json: str
+    broker_status_raw: Optional[str] = None
+    accepted_ts_utc: Optional[str] = None

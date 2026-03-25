@@ -3,8 +3,16 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime, timezone
 from typing import Optional
+from uuid import uuid4
 
-from trade_scout.execution.models import BrokerOrderResult, ExecutionRequest, ExecutionStatus
+from trade_scout.execution.models import (
+    BrokerOrderResult,
+    ExecutionRequest,
+    ExecutionStatus,
+    PaperOrderRole,
+    PaperOrderStatus,
+    PaperTradePlanStatus,
+)
 
 
 ACTIVE_REQUEST_STATUSES = (
@@ -12,6 +20,9 @@ ACTIVE_REQUEST_STATUSES = (
     ExecutionStatus.CLAIMED.value,
     ExecutionStatus.VALIDATED.value,
 )
+PAPER_TRADE_PLAN_SCHEMA_VERSION = "1"
+PAPER_ORDER_SCHEMA_VERSION = "1"
+PAPER_TRADE_PLAN_ENTRY_TYPE_MARKET = "MARKET"
 
 
 class ActiveExecutionRequestExistsError(Exception):
@@ -64,20 +75,78 @@ def init_db(db_path: str) -> None:
         )
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS paper_orders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+            CREATE TABLE IF NOT EXISTS paper_trade_plans (
+                plan_id TEXT PRIMARY KEY,
                 request_id TEXT NOT NULL UNIQUE,
                 alert_id TEXT NOT NULL,
+                created_ts_utc TEXT NOT NULL,
                 symbol TEXT NOT NULL,
                 side TEXT NOT NULL,
+                market_type TEXT,
+                strategy_profile TEXT,
+                strategy_version TEXT,
+                config_hash TEXT,
+                strategy_id TEXT,
+                setup_family TEXT,
+                strategy_params_json TEXT,
+                strategy_params_hash TEXT,
+                signal_ts_utc TEXT,
+                tier TEXT,
+                entry_type TEXT NOT NULL,
+                entry_ref_px REAL,
+                entry_low REAL,
+                entry_high REAL,
+                stop_px REAL,
+                t1_px REAL,
+                t2_px REAL,
+                timeout_seconds INTEGER,
+                timeout_ts_utc TEXT,
+                risk_model TEXT,
+                risk_usd REAL,
+                qty_model TEXT,
+                intended_qty REAL,
+                intended_notional REAL,
+                plan_rules_json TEXT,
+                plan_status TEXT NOT NULL,
+                schema_version TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS paper_orders (
+                paper_order_id TEXT PRIMARY KEY,
+                plan_id TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                alert_id TEXT NOT NULL,
+                broker TEXT NOT NULL,
+                broker_order_id TEXT,
+                client_order_id TEXT NOT NULL UNIQUE,
+                parent_paper_order_id TEXT,
+                order_role TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                order_type TEXT NOT NULL,
+                time_in_force TEXT,
                 qty REAL,
                 notional REAL,
-                order_type TEXT NOT NULL,
-                time_in_force TEXT NOT NULL,
-                broker TEXT NOT NULL,
-                broker_order_id TEXT NOT NULL,
+                limit_price REAL,
+                stop_price REAL,
+                trail_price REAL,
+                trail_percent REAL,
+                reduce_only INTEGER NOT NULL DEFAULT 0,
                 submitted_ts_utc TEXT NOT NULL,
-                raw_response_json TEXT
+                accepted_ts_utc TEXT,
+                canceled_ts_utc TEXT,
+                expired_ts_utc TEXT,
+                rejected_ts_utc TEXT,
+                filled_ts_utc TEXT,
+                broker_status_raw TEXT,
+                order_status TEXT NOT NULL,
+                status_reason TEXT,
+                last_broker_update_ts_utc TEXT,
+                raw_response_json TEXT,
+                schema_version TEXT NOT NULL
             )
             """
         )
@@ -91,6 +160,30 @@ def init_db(db_path: str) -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_exec_req_alert_id
             ON execution_requests (alert_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_paper_trade_plans_alert_id
+            ON paper_trade_plans (alert_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_paper_orders_plan_id
+            ON paper_orders (plan_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_paper_orders_request_id
+            ON paper_orders (request_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_paper_orders_broker_order_id
+            ON paper_orders (broker_order_id)
             """
         )
         conn.execute(
@@ -120,8 +213,6 @@ def insert_request(conn: sqlite3.Connection, request: ExecutionRequest) -> None:
             "Active request already exists for alert_id"
         )
 
-    requested_ts_utc = utc_now_iso()
-
     try:
         conn.execute(
             """
@@ -139,7 +230,7 @@ def insert_request(conn: sqlite3.Connection, request: ExecutionRequest) -> None:
             (
                 request.request_id,
                 request.alert_id,
-                requested_ts_utc,
+                request.requested_ts_utc,
                 ExecutionStatus.PENDING.value,
                 request.policy_name,
                 request.policy_version,
@@ -300,62 +391,242 @@ def mark_failed(
     conn.commit()
 
 
-def get_paper_order_by_request_id(
-    conn: sqlite3.Connection, request_id: str
+def get_paper_order_by_request_id_and_role(
+    conn: sqlite3.Connection, request_id: str, order_role: str
 ) -> sqlite3.Row | None:
     return conn.execute(
         """
         SELECT *
         FROM paper_orders
         WHERE request_id = ?
+          AND order_role = ?
+        """,
+        (request_id, order_role),
+    ).fetchone()
+
+
+def get_paper_order_by_client_order_id(
+    conn: sqlite3.Connection, client_order_id: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT *
+        FROM paper_orders
+        WHERE client_order_id = ?
+        """,
+        (client_order_id,),
+    ).fetchone()
+
+
+def get_paper_trade_plan_by_request_id(
+    conn: sqlite3.Connection, request_id: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT *
+        FROM paper_trade_plans
+        WHERE request_id = ?
         """,
         (request_id,),
     ).fetchone()
 
 
-def insert_paper_order(
+def create_paper_trade_plan(
     conn: sqlite3.Connection,
     *,
     request_id: str,
     alert_id: str,
     symbol: str,
     side: str,
-    qty: Optional[float],
-    notional: Optional[float],
-    order_type: str,
-    time_in_force: str,
-    result: BrokerOrderResult,
-) -> None:
+    market_type: str | None = None,
+    strategy_profile: str | None = None,
+    strategy_version: str | None = None,
+    config_hash: str | None = None,
+    strategy_id: str | None = None,
+    setup_family: str | None = None,
+    strategy_params_json: str | None = None,
+    strategy_params_hash: str | None = None,
+    signal_ts_utc: str | None = None,
+    tier: str | None = None,
+    entry_ref_px: float | None = None,
+    entry_low: float | None = None,
+    entry_high: float | None = None,
+    stop_px: float | None = None,
+    t1_px: float | None = None,
+    t2_px: float | None = None,
+    timeout_seconds: int | None = None,
+    timeout_ts_utc: str | None = None,
+    risk_model: str | None = None,
+    risk_usd: float | None = None,
+    qty_model: str | None = None,
+    intended_qty: float | None = None,
+    intended_notional: float | None = None,
+    plan_rules_json: str = "{}",
+    plan_status: str = PaperTradePlanStatus.CREATED.value,
+    schema_version: str = PAPER_TRADE_PLAN_SCHEMA_VERSION,
+) -> sqlite3.Row:
+    existing = get_paper_trade_plan_by_request_id(conn, request_id)
+    if existing is not None:
+        return existing
+
+    plan_id = str(uuid4())
+    created_ts_utc = utc_now_iso()
     conn.execute(
         """
-        INSERT INTO paper_orders (
+        INSERT INTO paper_trade_plans (
+            plan_id,
             request_id,
             alert_id,
+            created_ts_utc,
             symbol,
             side,
-            qty,
-            notional,
-            order_type,
-            time_in_force,
-            broker,
-            broker_order_id,
-            submitted_ts_utc,
-            raw_response_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            market_type,
+            strategy_profile,
+            strategy_version,
+            config_hash,
+            strategy_id,
+            setup_family,
+            strategy_params_json,
+            strategy_params_hash,
+            signal_ts_utc,
+            tier,
+            entry_type,
+            entry_ref_px,
+            entry_low,
+            entry_high,
+            stop_px,
+            t1_px,
+            t2_px,
+            timeout_seconds,
+            timeout_ts_utc,
+            risk_model,
+            risk_usd,
+            qty_model,
+            intended_qty,
+            intended_notional,
+            plan_rules_json,
+            plan_status,
+            schema_version
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
+            plan_id,
             request_id,
             alert_id,
+            created_ts_utc,
             symbol,
             side,
-            qty,
-            notional,
-            order_type,
-            time_in_force,
-            result.broker,
-            result.broker_order_id,
-            result.submitted_ts_utc,
-            result.raw_response_json,
+            market_type,
+            strategy_profile,
+            strategy_version,
+            config_hash,
+            strategy_id,
+            setup_family,
+            strategy_params_json,
+            strategy_params_hash,
+            signal_ts_utc,
+            tier,
+            PAPER_TRADE_PLAN_ENTRY_TYPE_MARKET,
+            entry_ref_px,
+            entry_low,
+            entry_high,
+            stop_px,
+            t1_px,
+            t2_px,
+            timeout_seconds,
+            timeout_ts_utc,
+            risk_model,
+            risk_usd,
+            qty_model,
+            intended_qty,
+            intended_notional,
+            plan_rules_json,
+            plan_status,
+            schema_version,
         ),
     )
     conn.commit()
+    created = get_paper_trade_plan_by_request_id(conn, request_id)
+    if created is None:
+        raise RuntimeError("paper trade plan insert did not persist")
+    return created
+
+
+def insert_paper_order(
+    conn: sqlite3.Connection,
+    *,
+    plan_id: str,
+    request_id: str,
+    alert_id: str,
+    broker: str,
+    client_order_id: str,
+    symbol: str,
+    side: str,
+    qty: Optional[float],
+    notional: Optional[float],
+    order_type: str,
+    time_in_force: Optional[str],
+    result: BrokerOrderResult,
+) -> sqlite3.Row:
+    existing = get_paper_order_by_client_order_id(conn, client_order_id)
+    if existing is not None:
+        return existing
+
+    paper_order_id = str(uuid4())
+    conn.execute(
+        """
+        INSERT INTO paper_orders (
+            paper_order_id,
+            plan_id,
+            request_id,
+            alert_id,
+            broker,
+            broker_order_id,
+            client_order_id,
+            parent_paper_order_id,
+            order_role,
+            symbol,
+            side,
+            order_type,
+            time_in_force,
+            qty,
+            notional,
+            submitted_ts_utc,
+            accepted_ts_utc,
+            broker_status_raw,
+            order_status,
+            last_broker_update_ts_utc,
+            raw_response_json,
+            schema_version
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            paper_order_id,
+            plan_id,
+            request_id,
+            alert_id,
+            broker,
+            result.broker_order_id,
+            client_order_id,
+            None,
+            PaperOrderRole.ENTRY.value,
+            symbol,
+            side,
+            order_type,
+            time_in_force,
+            qty,
+            notional,
+            result.submitted_ts_utc,
+            result.accepted_ts_utc,
+            result.broker_status_raw,
+            PaperOrderStatus.SUBMITTED.value,
+            result.accepted_ts_utc or result.submitted_ts_utc,
+            result.raw_response_json,
+            PAPER_ORDER_SCHEMA_VERSION,
+        ),
+    )
+    conn.commit()
+    inserted = get_paper_order_by_client_order_id(conn, client_order_id)
+    if inserted is None:
+        raise RuntimeError("paper order insert did not persist")
+    return inserted

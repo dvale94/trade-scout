@@ -51,6 +51,8 @@ def _parse_response_json(response: requests.Response) -> Any:
 def _normalize_order_result(response_json: Mapping[str, Any]) -> BrokerOrderResult:
     broker_order_id = str(response_json.get("id", "")).strip()
     submitted_ts_utc = str(response_json.get("submitted_at", "")).strip() or utc_now_iso()
+    accepted_ts_utc = str(response_json.get("accepted_at", "")).strip() or None
+    broker_status_raw = str(response_json.get("status", "")).strip() or None
     if not broker_order_id:
         raise RuntimeError("Alpaca order payload did not include broker order id")
 
@@ -59,6 +61,8 @@ def _normalize_order_result(response_json: Mapping[str, Any]) -> BrokerOrderResu
         broker_order_id=broker_order_id,
         submitted_ts_utc=submitted_ts_utc,
         raw_response_json=json.dumps(response_json, sort_keys=True),
+        broker_status_raw=broker_status_raw,
+        accepted_ts_utc=accepted_ts_utc,
     )
 
 

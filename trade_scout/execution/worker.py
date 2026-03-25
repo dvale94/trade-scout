@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any, Callable, Mapping, Optional
 
 from trade_scout import config
@@ -10,10 +11,12 @@ from trade_scout.execution.broker import find_existing_broker_order, submit_vali
 from trade_scout.execution.policy import validate_execution_request
 from trade_scout.execution.queue import (
     claim_request,
+    create_paper_trade_plan,
     fetch_pending,
     fetch_validated,
     get_connection,
-    get_paper_order_by_request_id,
+    get_paper_order_by_request_id_and_role,
+    get_paper_trade_plan_by_request_id,
     get_request_by_id,
     init_db,
     insert_paper_order,
@@ -23,6 +26,7 @@ from trade_scout.execution.queue import (
     mark_submitted,
     mark_validated,
 )
+from trade_scout.execution.models import PaperOrderRole
 
 
 @dataclass(frozen=True)
@@ -166,8 +170,20 @@ class ExecutionWorker:
             )
             return
 
+        alert_row: Mapping[str, Any] | None = None
+        trade_plan = None
         try:
-            existing_order = get_paper_order_by_request_id(conn, request_id)
+            alert_row = self._require_alert_row(alert_id)
+            trade_plan = self._get_or_create_trade_plan(
+                conn,
+                request_id=request_id,
+                alert_id=alert_id,
+                alert_row=alert_row,
+            )
+
+            existing_order = get_paper_order_by_request_id_and_role(
+                conn, request_id, PaperOrderRole.ENTRY.value
+            )
             if existing_order is not None:
                 self._mark_submitted_from_local_order(conn, request_id, existing_order)
                 print(
@@ -180,9 +196,10 @@ class ExecutionWorker:
             if recovered_remote_order is not None:
                 local_order = self._persist_or_reuse_broker_result(
                     conn,
+                    trade_plan=trade_plan,
                     request_id=request_id,
                     alert_id=alert_id,
-                    alert_row=self._require_alert_row(alert_id),
+                    alert_row=alert_row,
                     result=recovered_remote_order,
                 )
                 self._mark_submitted_from_local_order(conn, request_id, local_order)
@@ -192,8 +209,6 @@ class ExecutionWorker:
                 )
                 return
 
-            alert_row = self._require_alert_row(alert_id)
-
             print(
                 f"[execution-worker] submitting order request_id={request_id} "
                 f"alert_id={alert_id} notional={config.EXECUTION_ORDER_NOTIONAL}"
@@ -201,8 +216,10 @@ class ExecutionWorker:
             result = submit_validated_order(request_id=request_id, alert_row=alert_row)
             local_order = self._persist_or_reuse_broker_result(
                 conn,
+                trade_plan=trade_plan,
                 request_id=request_id,
                 alert_id=alert_id,
+                alert_row=alert_row,
                 result=result,
             )
             self._mark_submitted_from_local_order(conn, request_id, local_order)
@@ -219,11 +236,21 @@ class ExecutionWorker:
 
             if recovered_remote_order is not None:
                 try:
+                    if alert_row is None:
+                        alert_row = self._require_alert_row(alert_id)
+                    if trade_plan is None:
+                        trade_plan = self._get_or_create_trade_plan(
+                            conn,
+                            request_id=request_id,
+                            alert_id=alert_id,
+                            alert_row=alert_row,
+                        )
                     local_order = self._persist_or_reuse_broker_result(
                         conn,
+                        trade_plan=trade_plan,
                         request_id=request_id,
                         alert_id=alert_id,
-                        alert_row=self._require_alert_row(alert_id),
+                        alert_row=alert_row,
                         result=recovered_remote_order,
                     )
                     self._mark_submitted_from_local_order(conn, request_id, local_order)
@@ -253,12 +280,15 @@ class ExecutionWorker:
         self,
         conn,
         *,
+        trade_plan,
         request_id: str,
         alert_id: str,
         result,
         alert_row: Mapping[str, Any] | None = None,
     ):
-        existing_order = get_paper_order_by_request_id(conn, request_id)
+        existing_order = get_paper_order_by_request_id_and_role(
+            conn, request_id, PaperOrderRole.ENTRY.value
+        )
         if existing_order is not None:
             return existing_order
 
@@ -266,10 +296,13 @@ class ExecutionWorker:
             alert_row = self._require_alert_row(alert_id)
 
         try:
-            insert_paper_order(
+            return insert_paper_order(
                 conn,
+                plan_id=str(trade_plan["plan_id"]),
                 request_id=request_id,
                 alert_id=alert_id,
+                broker=result.broker,
+                client_order_id=request_id,
                 symbol=str(alert_row["symbol"]),
                 side=str(alert_row["side"]),
                 qty=None,
@@ -279,7 +312,9 @@ class ExecutionWorker:
                 result=result,
             )
         except sqlite3.IntegrityError:
-            existing_order = get_paper_order_by_request_id(conn, request_id)
+            existing_order = get_paper_order_by_request_id_and_role(
+                conn, request_id, PaperOrderRole.ENTRY.value
+            )
             if existing_order is None:
                 raise
             print(
@@ -288,10 +323,61 @@ class ExecutionWorker:
             )
             return existing_order
 
-        persisted_order = get_paper_order_by_request_id(conn, request_id)
-        if persisted_order is None:
-            raise RuntimeError("paper order insert did not persist broker result")
-        return persisted_order
+    def _get_or_create_trade_plan(
+        self,
+        conn,
+        *,
+        request_id: str,
+        alert_id: str,
+        alert_row: Mapping[str, Any],
+    ):
+        existing_plan = get_paper_trade_plan_by_request_id(conn, request_id)
+        if existing_plan is not None:
+            return existing_plan
+
+        timeout_seconds = self._coerce_int(alert_row.get("timeout_seconds"))
+        signal_ts_utc = self._coerce_optional_str(
+            alert_row.get("signal_ts_utc") or alert_row.get("created_ts_utc")
+        )
+        timeout_ts_utc = None
+        if signal_ts_utc and timeout_seconds is not None:
+            try:
+                timeout_dt = self._parse_iso_datetime(signal_ts_utc)
+            except Exception:
+                timeout_dt = None
+            if timeout_dt is not None:
+                timeout_ts_utc = (timeout_dt + timedelta(seconds=timeout_seconds)).isoformat()
+
+        return create_paper_trade_plan(
+            conn,
+            request_id=request_id,
+            alert_id=alert_id,
+            symbol=str(alert_row["symbol"]),
+            side=str(alert_row["side"]),
+            market_type=self._coerce_optional_str(alert_row.get("market_type")),
+            strategy_profile=self._coerce_optional_str(alert_row.get("strategy_profile")),
+            strategy_version=self._coerce_optional_str(alert_row.get("strategy_version")),
+            config_hash=self._coerce_optional_str(alert_row.get("config_hash")),
+            strategy_id=self._coerce_optional_str(alert_row.get("strategy_id")),
+            setup_family=self._coerce_optional_str(alert_row.get("setup_family")),
+            strategy_params_json=self._coerce_optional_str(alert_row.get("strategy_params_json")),
+            strategy_params_hash=self._coerce_optional_str(alert_row.get("strategy_params_hash")),
+            signal_ts_utc=signal_ts_utc,
+            tier=self._coerce_optional_str(alert_row.get("tier")),
+            entry_ref_px=self._coerce_float(alert_row.get("signal_px")),
+            entry_low=self._coerce_float(alert_row.get("entry_low")),
+            entry_high=self._coerce_float(alert_row.get("entry_high")),
+            stop_px=self._coerce_float(alert_row.get("stop_px")),
+            t1_px=self._coerce_float(alert_row.get("t1_px")),
+            t2_px=self._coerce_float(alert_row.get("t2_px")),
+            timeout_seconds=timeout_seconds,
+            timeout_ts_utc=timeout_ts_utc,
+            risk_model=self._coerce_optional_str(alert_row.get("risk_model")),
+            risk_usd=self._coerce_float(alert_row.get("risk_usd")),
+            qty_model=self._coerce_optional_str(alert_row.get("qty_model")),
+            intended_qty=self._coerce_float(alert_row.get("qty")),
+            intended_notional=config.EXECUTION_ORDER_NOTIONAL,
+        )
 
     @staticmethod
     def _mark_submitted_from_local_order(conn, request_id: str, local_order) -> None:
@@ -310,3 +396,29 @@ class ExecutionWorker:
     @staticmethod
     def _get_alert_id(request_row) -> str:
         return str(request_row["alert_id"])
+
+    @staticmethod
+    def _coerce_optional_str(value: Any) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    @staticmethod
+    def _coerce_float(value: Any) -> float | None:
+        if value is None or value == "":
+            return None
+        return float(value)
+
+    @staticmethod
+    def _coerce_int(value: Any) -> int | None:
+        if value is None or value == "":
+            return None
+        return int(float(value))
+
+    @staticmethod
+    def _parse_iso_datetime(value: str):
+        text = value.strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        return datetime.fromisoformat(text)
