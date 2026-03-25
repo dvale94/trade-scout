@@ -50,7 +50,7 @@ services:
         value: "10"
       - key: EXECUTION_WORKER_ID
         value: execution-worker-1
-      - key: EXECUTION_ORDER_QTY
+      - key: EXECUTION_ORDER_NOTIONAL
         sync: false
       - key: DISCORD_WEBHOOK_URL
         sync: false

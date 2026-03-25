@@ -29,8 +29,8 @@ def _require_alpaca_config() -> None:
         raise RuntimeError("Missing ALPACA_SECRET_KEY for paper execution submission")
     if not config.ALPACA_BASE_URL.strip():
         raise RuntimeError("Missing ALPACA_BASE_URL for paper execution submission")
-    if config.EXECUTION_ORDER_QTY <= 0:
-        raise RuntimeError("EXECUTION_ORDER_QTY must be greater than 0")
+    if config.EXECUTION_ORDER_NOTIONAL <= 0:
+        raise RuntimeError("EXECUTION_ORDER_NOTIONAL must be greater than 0")
 
 
 def _auth_headers() -> dict[str, str]:
@@ -79,7 +79,7 @@ def submit_market_order(
         "side": side,
         "type": "market",
         "time_in_force": "gtc",
-        "qty": config.EXECUTION_ORDER_QTY,
+        "notional": str(config.EXECUTION_ORDER_NOTIONAL),
         "client_order_id": request_id,
     }
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime, timezone
-from typing import Iterable
+from typing import Optional
 
 from trade_scout.execution.models import BrokerOrderResult, ExecutionRequest, ExecutionStatus
 
@@ -30,6 +30,10 @@ def get_connection(db_path: str) -> sqlite3.Connection:
     return conn
 
 
+# NOTE:
+# Execution DB uses a fresh-start schema.
+# Backward compatibility migrations are intentionally removed.
+# If schema changes are needed, recreate the DB.
 def init_db(db_path: str) -> None:
     conn = get_connection(db_path)
     try:
@@ -58,14 +62,6 @@ def init_db(db_path: str) -> None:
             )
             """
         )
-        _add_missing_columns(
-            conn,
-            "execution_requests",
-            (
-                ("broker_order_id", "TEXT"),
-                ("submitted_ts_utc", "TEXT"),
-            ),
-        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS paper_orders (
@@ -74,7 +70,8 @@ def init_db(db_path: str) -> None:
                 alert_id TEXT NOT NULL,
                 symbol TEXT NOT NULL,
                 side TEXT NOT NULL,
-                qty REAL NOT NULL,
+                qty REAL,
+                notional REAL,
                 order_type TEXT NOT NULL,
                 time_in_force TEXT NOT NULL,
                 broker TEXT NOT NULL,
@@ -106,23 +103,6 @@ def init_db(db_path: str) -> None:
         conn.commit()
     finally:
         conn.close()
-
-
-def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
-    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
-    return {str(row["name"]) for row in rows}
-
-
-def _add_missing_columns(
-    conn: sqlite3.Connection,
-    table_name: str,
-    columns: Iterable[tuple[str, str]],
-) -> None:
-    existing_columns = _table_columns(conn, table_name)
-    for column_name, column_type in columns:
-        if column_name in existing_columns:
-            continue
-        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}")
 
 
 def insert_request(conn: sqlite3.Connection, request: ExecutionRequest) -> None:
@@ -340,7 +320,8 @@ def insert_paper_order(
     alert_id: str,
     symbol: str,
     side: str,
-    qty: float,
+    qty: Optional[float],
+    notional: Optional[float],
     order_type: str,
     time_in_force: str,
     result: BrokerOrderResult,
@@ -353,13 +334,14 @@ def insert_paper_order(
             symbol,
             side,
             qty,
+            notional,
             order_type,
             time_in_force,
             broker,
             broker_order_id,
             submitted_ts_utc,
             raw_response_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             request_id,
@@ -367,6 +349,7 @@ def insert_paper_order(
             symbol,
             side,
             qty,
+            notional,
             order_type,
             time_in_force,
             result.broker,

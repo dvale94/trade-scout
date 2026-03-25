@@ -194,7 +194,10 @@ class ExecutionWorker:
 
             alert_row = self._require_alert_row(alert_id)
 
-            print(f"[execution-worker] submitting request_id={request_id} alert_id={alert_id}")
+            print(
+                f"[execution-worker] submitting order request_id={request_id} "
+                f"alert_id={alert_id} notional={config.EXECUTION_ORDER_NOTIONAL}"
+            )
             result = submit_validated_order(request_id=request_id, alert_row=alert_row)
             local_order = self._persist_or_reuse_broker_result(
                 conn,
@@ -269,7 +272,8 @@ class ExecutionWorker:
                 alert_id=alert_id,
                 symbol=str(alert_row["symbol"]),
                 side=str(alert_row["side"]),
-                qty=config.EXECUTION_ORDER_QTY,
+                qty=None,
+                notional=config.EXECUTION_ORDER_NOTIONAL,
                 order_type="market",
                 time_in_force="gtc",
                 result=result,
