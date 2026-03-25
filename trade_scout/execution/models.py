@@ -25,6 +25,12 @@ class PaperOrderRole(str, Enum):
 
 class PaperOrderStatus(str, Enum):
     SUBMITTED = "SUBMITTED"
+    ACCEPTED = "ACCEPTED"
+    PARTIALLY_FILLED = "PARTIALLY_FILLED"
+    FILLED = "FILLED"
+    CANCELED = "CANCELED"
+    REJECTED = "REJECTED"
+    EXPIRED = "EXPIRED"
 
 
 @dataclass(frozen=True)
@@ -47,3 +53,9 @@ class BrokerOrderResult:
     raw_response_json: str
     broker_status_raw: Optional[str] = None
     accepted_ts_utc: Optional[str] = None
+    canceled_ts_utc: Optional[str] = None
+    expired_ts_utc: Optional[str] = None
+    rejected_ts_utc: Optional[str] = None
+    filled_ts_utc: Optional[str] = None
+    status_reason: Optional[str] = None
+    last_broker_update_ts_utc: Optional[str] = None

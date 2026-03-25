@@ -23,6 +23,12 @@ ACTIVE_REQUEST_STATUSES = (
 PAPER_TRADE_PLAN_SCHEMA_VERSION = "1"
 PAPER_ORDER_SCHEMA_VERSION = "1"
 PAPER_TRADE_PLAN_ENTRY_TYPE_MARKET = "MARKET"
+TERMINAL_PAPER_ORDER_STATUSES = (
+    PaperOrderStatus.FILLED.value,
+    PaperOrderStatus.CANCELED.value,
+    PaperOrderStatus.REJECTED.value,
+    PaperOrderStatus.EXPIRED.value,
+)
 
 
 class ActiveExecutionRequestExistsError(Exception):
@@ -418,6 +424,22 @@ def get_paper_order_by_client_order_id(
     ).fetchone()
 
 
+def get_open_paper_orders_for_sync(
+    conn: sqlite3.Connection, limit: int = 50
+) -> list[sqlite3.Row]:
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM paper_orders
+        WHERE order_status NOT IN (?, ?, ?, ?)
+        ORDER BY last_broker_update_ts_utc ASC, submitted_ts_utc ASC
+        LIMIT ?
+        """,
+        (*TERMINAL_PAPER_ORDER_STATUSES, limit),
+    ).fetchall()
+    return list(rows)
+
+
 def get_paper_trade_plan_by_request_id(
     conn: sqlite3.Connection, request_id: str
 ) -> sqlite3.Row | None:
@@ -630,3 +652,61 @@ def insert_paper_order(
     if inserted is None:
         raise RuntimeError("paper order insert did not persist")
     return inserted
+
+
+def reconcile_paper_order_from_broker(
+    conn: sqlite3.Connection,
+    *,
+    paper_order_id: str,
+    broker_snapshot: BrokerOrderResult,
+    order_status: str,
+) -> sqlite3.Row | None:
+    existing_row = conn.execute(
+        """
+        SELECT *
+        FROM paper_orders
+        WHERE paper_order_id = ?
+        """,
+        (paper_order_id,),
+    ).fetchone()
+    if existing_row is None:
+        return None
+
+    conn.execute(
+        """
+        UPDATE paper_orders
+        SET broker_status_raw = ?,
+            order_status = ?,
+            accepted_ts_utc = ?,
+            canceled_ts_utc = ?,
+            expired_ts_utc = ?,
+            rejected_ts_utc = ?,
+            filled_ts_utc = ?,
+            status_reason = ?,
+            last_broker_update_ts_utc = ?,
+            raw_response_json = ?
+        WHERE paper_order_id = ?
+        """,
+        (
+            broker_snapshot.broker_status_raw,
+            order_status,
+            broker_snapshot.accepted_ts_utc or existing_row["accepted_ts_utc"],
+            broker_snapshot.canceled_ts_utc or existing_row["canceled_ts_utc"],
+            broker_snapshot.expired_ts_utc or existing_row["expired_ts_utc"],
+            broker_snapshot.rejected_ts_utc or existing_row["rejected_ts_utc"],
+            broker_snapshot.filled_ts_utc or existing_row["filled_ts_utc"],
+            broker_snapshot.status_reason or existing_row["status_reason"],
+            broker_snapshot.last_broker_update_ts_utc or utc_now_iso(),
+            broker_snapshot.raw_response_json,
+            paper_order_id,
+        ),
+    )
+    conn.commit()
+    return conn.execute(
+        """
+        SELECT *
+        FROM paper_orders
+        WHERE paper_order_id = ?
+        """,
+        (paper_order_id,),
+    ).fetchone()

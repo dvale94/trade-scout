@@ -63,6 +63,16 @@ def _normalize_order_result(response_json: Mapping[str, Any]) -> BrokerOrderResu
         raw_response_json=json.dumps(response_json, sort_keys=True),
         broker_status_raw=broker_status_raw,
         accepted_ts_utc=accepted_ts_utc,
+        canceled_ts_utc=str(response_json.get("canceled_at", "")).strip() or None,
+        expired_ts_utc=str(response_json.get("expired_at", "")).strip() or None,
+        rejected_ts_utc=str(response_json.get("failed_at", "")).strip() or None,
+        filled_ts_utc=str(response_json.get("filled_at", "")).strip() or None,
+        status_reason=str(response_json.get("fail_reason", "")).strip() or None,
+        last_broker_update_ts_utc=(
+            str(response_json.get("updated_at", "")).strip()
+            or accepted_ts_utc
+            or submitted_ts_utc
+        ),
     )
 
 
@@ -119,6 +129,29 @@ def get_order_by_client_order_id(request_id: str) -> BrokerOrderResult | None:
         detail = response_json if isinstance(response_json, dict) else {"response": response_json}
         raise RuntimeError(
             f"Alpaca order lookup failed status={response.status_code} detail={json.dumps(detail, sort_keys=True)}"
+        )
+
+    return _normalize_order_result(response_json)
+
+
+def get_order_by_broker_order_id(broker_order_id: str) -> BrokerOrderResult | None:
+    _require_alpaca_config()
+
+    url = f"{config.ALPACA_BASE_URL.rstrip('/')}/v2/orders/{broker_order_id}"
+    response = requests.get(
+        url,
+        headers=_auth_headers(),
+        timeout=15,
+    )
+    response_json = _parse_response_json(response)
+
+    if response.status_code == 404:
+        return None
+
+    if response.status_code >= 400:
+        detail = response_json if isinstance(response_json, dict) else {"response": response_json}
+        raise RuntimeError(
+            f"Alpaca broker-order lookup failed status={response.status_code} detail={json.dumps(detail, sort_keys=True)}"
         )
 
     return _normalize_order_result(response_json)

@@ -7,7 +7,11 @@ from datetime import datetime, timedelta
 from typing import Any, Callable, Mapping, Optional
 
 from trade_scout import config
-from trade_scout.execution.broker import find_existing_broker_order, submit_validated_order
+from trade_scout.execution.broker import (
+    fetch_broker_order_by_id,
+    find_existing_broker_order,
+    submit_validated_order,
+)
 from trade_scout.execution.policy import validate_execution_request
 from trade_scout.execution.queue import (
     claim_request,
@@ -15,6 +19,7 @@ from trade_scout.execution.queue import (
     fetch_pending,
     fetch_validated,
     get_connection,
+    get_open_paper_orders_for_sync,
     get_paper_order_by_request_id_and_role,
     get_paper_trade_plan_by_request_id,
     get_request_by_id,
@@ -25,8 +30,9 @@ from trade_scout.execution.queue import (
     mark_rejected,
     mark_submitted,
     mark_validated,
+    reconcile_paper_order_from_broker,
 )
-from trade_scout.execution.models import PaperOrderRole
+from trade_scout.execution.models import PaperOrderRole, PaperOrderStatus
 
 
 @dataclass(frozen=True)
@@ -34,6 +40,7 @@ class ExecutionWorkerConfig:
     db_path: str
     poll_interval_seconds: float = 5.0
     batch_size: int = 10
+    sync_batch_size: int = 25
     max_alert_age_seconds: int = 300
     worker_id: str = "execution-worker-1"
     enabled: bool = True
@@ -98,6 +105,8 @@ class ExecutionWorker:
                 for validated_row in validated_rows:
                     attempted_count += 1
                     self.process_validated_request(conn, validated_row)
+
+            self.sync_open_paper_orders(conn, limit=self.config.sync_batch_size)
         finally:
             conn.close()
         return attempted_count
@@ -157,6 +166,53 @@ class ExecutionWorker:
         except Exception as exc:
             mark_failed(conn, request_id, code="PROCESSING_ERROR", message=str(exc))
             print(f"[execution-worker] failed request_id={request_id} error={exc}")
+
+    def sync_open_paper_orders(self, conn, *, limit: int) -> int:
+        synced_count = 0
+        open_orders = get_open_paper_orders_for_sync(conn, limit=limit)
+        for paper_order_row in open_orders:
+            paper_order_id = str(paper_order_row["paper_order_id"])
+            broker_order_id = self._coerce_optional_str(paper_order_row["broker_order_id"])
+            if not broker_order_id:
+                print(
+                    f"[execution-worker] skipped sync paper_order_id={paper_order_id} "
+                    "reason=missing broker_order_id"
+                )
+                continue
+
+            try:
+                broker_snapshot = fetch_broker_order_by_id(broker_order_id)
+                if broker_snapshot is None:
+                    print(
+                        f"[execution-worker] skipped sync paper_order_id={paper_order_id} "
+                        f"broker_order_id={broker_order_id} reason=broker_order_not_found"
+                    )
+                    continue
+
+                reconciled = self.reconcile_paper_order(conn, paper_order_row, broker_snapshot)
+                synced_count += 1
+                print(
+                    f"[execution-worker] synced paper_order_id={paper_order_id} "
+                    f"broker_order_id={broker_order_id} order_status={reconciled['order_status']}"
+                )
+            except Exception as exc:
+                print(
+                    f"[execution-worker] sync failed paper_order_id={paper_order_id} "
+                    f"broker_order_id={broker_order_id} error={exc}"
+                )
+        return synced_count
+
+    def reconcile_paper_order(self, conn, paper_order_row, broker_snapshot):
+        normalized_status = normalize_broker_order_status(broker_snapshot.broker_status_raw)
+        reconciled = reconcile_paper_order_from_broker(
+            conn,
+            paper_order_id=str(paper_order_row["paper_order_id"]),
+            broker_snapshot=broker_snapshot,
+            order_status=normalized_status,
+        )
+        if reconciled is None:
+            raise RuntimeError("paper order reconcile did not persist")
+        return reconciled
 
     def process_validated_request(self, conn, request_row) -> None:
         request_id = self._get_request_id(request_row)
@@ -422,3 +478,22 @@ class ExecutionWorker:
         if text.endswith("Z"):
             text = text[:-1] + "+00:00"
         return datetime.fromisoformat(text)
+
+
+def normalize_broker_order_status(raw_status: Any) -> str:
+    normalized = str(raw_status or "").strip().lower()
+    if normalized in {"submitted", "pending_new"}:
+        return PaperOrderStatus.SUBMITTED.value
+    if normalized in {"new", "accepted", "pending_replace", "accepted_for_bidding"}:
+        return PaperOrderStatus.ACCEPTED.value
+    if normalized == "partially_filled":
+        return PaperOrderStatus.PARTIALLY_FILLED.value
+    if normalized == "filled":
+        return PaperOrderStatus.FILLED.value
+    if normalized in {"canceled", "cancelled"}:
+        return PaperOrderStatus.CANCELED.value
+    if normalized in {"rejected", "suspended", "stopped"}:
+        return PaperOrderStatus.REJECTED.value
+    if normalized in {"expired", "done_for_day"}:
+        return PaperOrderStatus.EXPIRED.value
+    return PaperOrderStatus.SUBMITTED.value

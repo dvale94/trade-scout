@@ -23,12 +23,18 @@ if "requests" not in sys.modules:
 from trade_scout.execution.models import BrokerOrderResult, ExecutionRequest, ExecutionStatus
 from trade_scout.execution.queue import (
     get_connection,
+    get_open_paper_orders_for_sync,
     get_paper_order_by_request_id_and_role,
     init_db,
     insert_request,
+    reconcile_paper_order_from_broker,
     utc_now_iso,
 )
-from trade_scout.execution.worker import ExecutionWorker, ExecutionWorkerConfig
+from trade_scout.execution.worker import (
+    ExecutionWorker,
+    ExecutionWorkerConfig,
+    normalize_broker_order_status,
+)
 
 
 class ExecutionWorkerTest(unittest.TestCase):
@@ -75,6 +81,18 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertIn("client_order_id", order_columns)
         self.assertIn("order_role", order_columns)
         self.assertIn("order_status", order_columns)
+
+    def test_normalize_broker_order_status_maps_expected_values(self) -> None:
+        self.assertEqual("SUBMITTED", normalize_broker_order_status("submitted"))
+        self.assertEqual("SUBMITTED", normalize_broker_order_status("pending_new"))
+        self.assertEqual("ACCEPTED", normalize_broker_order_status("new"))
+        self.assertEqual("ACCEPTED", normalize_broker_order_status("accepted"))
+        self.assertEqual("PARTIALLY_FILLED", normalize_broker_order_status("partially_filled"))
+        self.assertEqual("FILLED", normalize_broker_order_status("filled"))
+        self.assertEqual("CANCELED", normalize_broker_order_status("canceled"))
+        self.assertEqual("REJECTED", normalize_broker_order_status("rejected"))
+        self.assertEqual("EXPIRED", normalize_broker_order_status("expired"))
+        self.assertEqual("SUBMITTED", normalize_broker_order_status("unknown_status"))
 
     def test_run_once_creates_one_trade_plan_and_entry_order(self) -> None:
         self._insert_pending_request(request_id="req-1", alert_id="alert-1")
@@ -203,6 +221,229 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual(1, plan_count)
         self.assertEqual(1, order_count)
 
+    def test_get_open_paper_orders_for_sync_excludes_terminal_statuses(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-open-1",
+                request_id="req-open-1",
+                client_order_id="req-open-1",
+                broker_order_id="broker-open-1",
+                order_status="SUBMITTED",
+            )
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-open-2",
+                request_id="req-open-2",
+                client_order_id="req-open-2",
+                broker_order_id="broker-open-2",
+                order_status="ACCEPTED",
+            )
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-filled",
+                request_id="req-filled",
+                client_order_id="req-filled",
+                broker_order_id="broker-filled",
+                order_status="FILLED",
+            )
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-canceled",
+                request_id="req-canceled",
+                client_order_id="req-canceled",
+                broker_order_id="broker-canceled",
+                order_status="CANCELED",
+            )
+
+            rows = get_open_paper_orders_for_sync(conn, limit=10)
+        finally:
+            conn.close()
+
+        self.assertEqual(["po-open-1", "po-open-2"], [row["paper_order_id"] for row in rows])
+
+    def test_reconcile_paper_order_from_broker_updates_filled_state(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-fill",
+                request_id="req-fill",
+                client_order_id="req-fill",
+                broker_order_id="broker-fill",
+                order_status="SUBMITTED",
+            )
+
+            reconciled = reconcile_paper_order_from_broker(
+                conn,
+                paper_order_id="po-fill",
+                broker_snapshot=self._broker_result(
+                    "broker-fill",
+                    broker_status_raw="filled",
+                    filled_ts_utc="2026-03-25T14:10:00+00:00",
+                    raw_response_json='{"id":"broker-fill","status":"filled"}',
+                ),
+                order_status="FILLED",
+            )
+        finally:
+            conn.close()
+
+        self.assertEqual("filled", reconciled["broker_status_raw"])
+        self.assertEqual("FILLED", reconciled["order_status"])
+        self.assertEqual("2026-03-25T14:10:00+00:00", reconciled["filled_ts_utc"])
+        self.assertEqual('{"id":"broker-fill","status":"filled"}', reconciled["raw_response_json"])
+
+    def test_reconcile_paper_order_from_broker_updates_canceled_state(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-cancel",
+                request_id="req-cancel",
+                client_order_id="req-cancel",
+                broker_order_id="broker-cancel",
+                order_status="ACCEPTED",
+            )
+
+            reconciled = reconcile_paper_order_from_broker(
+                conn,
+                paper_order_id="po-cancel",
+                broker_snapshot=self._broker_result(
+                    "broker-cancel",
+                    broker_status_raw="canceled",
+                    canceled_ts_utc="2026-03-25T14:11:00+00:00",
+                    raw_response_json='{"id":"broker-cancel","status":"canceled"}',
+                ),
+                order_status="CANCELED",
+            )
+        finally:
+            conn.close()
+
+        self.assertEqual("canceled", reconciled["broker_status_raw"])
+        self.assertEqual("CANCELED", reconciled["order_status"])
+        self.assertEqual("2026-03-25T14:11:00+00:00", reconciled["canceled_ts_utc"])
+        self.assertEqual('{"id":"broker-cancel","status":"canceled"}', reconciled["raw_response_json"])
+
+    def test_reconcile_preserves_existing_accepted_timestamp_when_snapshot_omits_it(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-accepted-preserve",
+                request_id="req-accepted-preserve",
+                client_order_id="req-accepted-preserve",
+                broker_order_id="broker-accepted-preserve",
+                order_status="ACCEPTED",
+            )
+            reconciled = reconcile_paper_order_from_broker(
+                conn,
+                paper_order_id="po-accepted-preserve",
+                broker_snapshot=self._broker_result(
+                    "broker-accepted-preserve",
+                    broker_status_raw="accepted",
+                    accepted_ts_utc=None,
+                    raw_response_json='{"id":"broker-accepted-preserve","status":"accepted"}',
+                ),
+                order_status="ACCEPTED",
+            )
+        finally:
+            conn.close()
+
+        self.assertEqual("2026-03-25T14:00:01+00:00", reconciled["accepted_ts_utc"])
+
+    def test_reconcile_preserves_existing_filled_timestamp_when_snapshot_omits_it(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-filled-preserve",
+                request_id="req-filled-preserve",
+                client_order_id="req-filled-preserve",
+                broker_order_id="broker-filled-preserve",
+                order_status="FILLED",
+                filled_ts_utc="2026-03-25T14:30:00+00:00",
+            )
+            reconciled = reconcile_paper_order_from_broker(
+                conn,
+                paper_order_id="po-filled-preserve",
+                broker_snapshot=self._broker_result(
+                    "broker-filled-preserve",
+                    broker_status_raw="filled",
+                    filled_ts_utc=None,
+                    raw_response_json='{"id":"broker-filled-preserve","status":"filled"}',
+                ),
+                order_status="FILLED",
+            )
+        finally:
+            conn.close()
+
+        self.assertEqual("2026-03-25T14:30:00+00:00", reconciled["filled_ts_utc"])
+
+    def test_reconcile_stores_new_accepted_timestamp_when_snapshot_provides_it(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-accepted-replace",
+                request_id="req-accepted-replace",
+                client_order_id="req-accepted-replace",
+                broker_order_id="broker-accepted-replace",
+                order_status="SUBMITTED",
+                accepted_ts_utc=None,
+            )
+            reconciled = reconcile_paper_order_from_broker(
+                conn,
+                paper_order_id="po-accepted-replace",
+                broker_snapshot=self._broker_result(
+                    "broker-accepted-replace",
+                    broker_status_raw="accepted",
+                    accepted_ts_utc="2026-03-25T14:31:00+00:00",
+                    raw_response_json='{"id":"broker-accepted-replace","status":"accepted"}',
+                ),
+                order_status="ACCEPTED",
+            )
+        finally:
+            conn.close()
+
+        self.assertEqual("2026-03-25T14:31:00+00:00", reconciled["accepted_ts_utc"])
+
+    def test_sync_is_idempotent_when_broker_snapshot_is_unchanged(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-idem",
+                request_id="req-idem",
+                client_order_id="req-idem",
+                broker_order_id="broker-idem",
+                order_status="SUBMITTED",
+            )
+
+            snapshot = self._broker_result(
+                "broker-idem",
+                broker_status_raw="filled",
+                filled_ts_utc="2026-03-25T14:12:00+00:00",
+                raw_response_json='{"id":"broker-idem","status":"filled"}',
+                last_broker_update_ts_utc="2026-03-25T14:12:01+00:00",
+            )
+            row = conn.execute(
+                "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+                ("po-idem",),
+            ).fetchone()
+            first = self.worker.reconcile_paper_order(conn, row, snapshot)
+            second_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+                ("po-idem",),
+            ).fetchone()
+            second = self.worker.reconcile_paper_order(conn, second_row, snapshot)
+            row_count = conn.execute("SELECT COUNT(*) AS n FROM paper_orders").fetchone()["n"]
+        finally:
+            conn.close()
+
+        self.assertEqual(1, row_count)
+        self.assertEqual(dict(first), dict(second))
+
     def test_remote_recovery_still_persists_normalized_order_by_client_order_id(self) -> None:
         self._insert_pending_request(request_id="req-3", alert_id="alert-3")
 
@@ -240,6 +481,64 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual("req-3", order_row["client_order_id"])
         self.assertEqual("broker-3", order_row["broker_order_id"])
         self.assertEqual("SUBMITTED", request_row["status"])
+
+    def test_run_once_syncs_existing_open_orders_after_request_processing(self) -> None:
+        self._insert_pending_request(request_id="req-4", alert_id="alert-4")
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-sync",
+                request_id="req-sync",
+                client_order_id="req-sync",
+                broker_order_id="broker-sync",
+                order_status="SUBMITTED",
+                broker_status_raw="submitted",
+            )
+        finally:
+            conn.close()
+
+        with patch(
+            "trade_scout.execution.worker.find_existing_broker_order",
+            return_value=None,
+        ), patch(
+            "trade_scout.execution.worker.submit_validated_order",
+            return_value=self._broker_result("broker-4", broker_status_raw="submitted"),
+        ), patch(
+            "trade_scout.execution.worker.fetch_broker_order_by_id",
+            side_effect=lambda broker_order_id: (
+                self._broker_result(
+                    broker_order_id,
+                    broker_status_raw="filled",
+                    filled_ts_utc="2026-03-25T14:20:00+00:00",
+                    raw_response_json='{"id":"%s","status":"filled"}' % broker_order_id,
+                    last_broker_update_ts_utc="2026-03-25T14:20:01+00:00",
+                )
+                if broker_order_id == "broker-sync"
+                else self._broker_result(broker_order_id, broker_status_raw="submitted")
+            ),
+        ):
+            attempted = self.worker.run_once()
+
+        self.assertEqual(1, attempted)
+
+        conn = get_connection(self.db_path)
+        try:
+            synced_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+                ("po-sync",),
+            ).fetchone()
+            new_request_order = conn.execute(
+                "SELECT * FROM paper_orders WHERE request_id = ?",
+                ("req-4",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual("FILLED", synced_row["order_status"])
+        self.assertEqual("filled", synced_row["broker_status_raw"])
+        self.assertEqual("2026-03-25T14:20:00+00:00", synced_row["filled_ts_utc"])
+        self.assertIsNotNone(new_request_order)
 
     def test_role_aware_lookup_returns_only_entry_order(self) -> None:
         conn = get_connection(self.db_path)
@@ -406,15 +705,102 @@ class ExecutionWorkerTest(unittest.TestCase):
         }
 
     @staticmethod
-    def _broker_result(broker_order_id: str) -> BrokerOrderResult:
+    def _broker_result(
+        broker_order_id: str,
+        *,
+        broker_status_raw: str = "submitted",
+        accepted_ts_utc: str = "2026-03-25T14:00:06+00:00",
+        canceled_ts_utc: str | None = None,
+        expired_ts_utc: str | None = None,
+        rejected_ts_utc: str | None = None,
+        filled_ts_utc: str | None = None,
+        status_reason: str | None = None,
+        raw_response_json: str | None = None,
+        last_broker_update_ts_utc: str = "2026-03-25T14:00:07+00:00",
+    ) -> BrokerOrderResult:
         return BrokerOrderResult(
             broker="alpaca_paper",
             broker_order_id=broker_order_id,
             submitted_ts_utc="2026-03-25T14:00:05+00:00",
-            raw_response_json='{"id":"%s"}' % broker_order_id,
-            broker_status_raw="submitted",
-            accepted_ts_utc="2026-03-25T14:00:06+00:00",
+            raw_response_json=raw_response_json or '{"id":"%s"}' % broker_order_id,
+            broker_status_raw=broker_status_raw,
+            accepted_ts_utc=accepted_ts_utc,
+            canceled_ts_utc=canceled_ts_utc,
+            expired_ts_utc=expired_ts_utc,
+            rejected_ts_utc=rejected_ts_utc,
+            filled_ts_utc=filled_ts_utc,
+            status_reason=status_reason,
+            last_broker_update_ts_utc=last_broker_update_ts_utc,
         )
+
+    @staticmethod
+    def _insert_paper_order_row(
+        conn,
+        *,
+        paper_order_id: str,
+        request_id: str,
+        client_order_id: str,
+        broker_order_id: str,
+        order_status: str,
+        broker_status_raw: str = "submitted",
+        accepted_ts_utc: str | None = "2026-03-25T14:00:01+00:00",
+        filled_ts_utc: str | None = None,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO paper_orders (
+                paper_order_id,
+                plan_id,
+                request_id,
+                alert_id,
+                broker,
+                broker_order_id,
+                client_order_id,
+                parent_paper_order_id,
+                order_role,
+                symbol,
+                side,
+                order_type,
+                time_in_force,
+                qty,
+                notional,
+                submitted_ts_utc,
+                accepted_ts_utc,
+                filled_ts_utc,
+                broker_status_raw,
+                order_status,
+                last_broker_update_ts_utc,
+                raw_response_json,
+                schema_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                paper_order_id,
+                "plan-" + request_id,
+                request_id,
+                "alert-" + request_id,
+                "alpaca_paper",
+                broker_order_id,
+                client_order_id,
+                None,
+                "ENTRY",
+                "AAPL",
+                "LONG",
+                "market",
+                "gtc",
+                None,
+                25.0,
+                "2026-03-25T14:00:00+00:00",
+                accepted_ts_utc,
+                filled_ts_utc,
+                broker_status_raw,
+                order_status,
+                "2026-03-25T14:00:02+00:00",
+                '{"id":"%s","status":"%s"}' % (broker_order_id, broker_status_raw),
+                "1",
+            ),
+        )
+        conn.commit()
 
     @staticmethod
     def _table_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
