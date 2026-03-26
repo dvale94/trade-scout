@@ -19,7 +19,17 @@ class PaperTradePlanStatus(str, Enum):
     CREATED = "CREATED"
 
 
+class PaperTradePlanEntryStatus(str, Enum):
+    PENDING = "PENDING"
+    PARTIALLY_FILLED = "PARTIALLY_FILLED"
+    FILLED = "FILLED"
+
+
 class PaperOrderRole(str, Enum):
+    ENTRY = "ENTRY"
+
+
+class PaperFillRole(str, Enum):
     ENTRY = "ENTRY"
 
 
@@ -57,5 +67,7 @@ class BrokerOrderResult:
     expired_ts_utc: Optional[str] = None
     rejected_ts_utc: Optional[str] = None
     filled_ts_utc: Optional[str] = None
+    filled_qty: Optional[float] = None
+    filled_avg_price: Optional[float] = None
     status_reason: Optional[str] = None
     last_broker_update_ts_utc: Optional[str] = None

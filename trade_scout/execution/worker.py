@@ -31,8 +31,13 @@ from trade_scout.execution.queue import (
     mark_submitted,
     mark_validated,
     reconcile_paper_order_from_broker,
+    upsert_entry_fill_from_broker_snapshot,
 )
-from trade_scout.execution.models import PaperOrderRole, PaperOrderStatus
+from trade_scout.execution.models import (
+    PaperOrderRole,
+    PaperOrderStatus,
+    PaperTradePlanEntryStatus,
+)
 
 
 @dataclass(frozen=True)
@@ -212,7 +217,30 @@ class ExecutionWorker:
         )
         if reconciled is None:
             raise RuntimeError("paper order reconcile did not persist")
+        self.ingest_entry_fill_if_present(conn, reconciled, broker_snapshot)
         return reconciled
+
+    def ingest_entry_fill_if_present(self, conn, paper_order_row, broker_snapshot) -> None:
+        if str(paper_order_row["order_role"]) != PaperOrderRole.ENTRY.value:
+            return
+
+        entry_status = derive_entry_status_from_order_status(str(paper_order_row["order_status"]))
+        if entry_status is None:
+            return
+
+        fill_row = upsert_entry_fill_from_broker_snapshot(
+            conn,
+            paper_order_row=paper_order_row,
+            broker_snapshot=broker_snapshot,
+            entry_status=entry_status,
+        )
+        if fill_row is None:
+            return
+
+        print(
+            f"[execution-worker] ingested fill paper_order_id={paper_order_row['paper_order_id']} "
+            f"paper_fill_id={fill_row['paper_fill_id']} entry_status={entry_status}"
+        )
 
     def process_validated_request(self, conn, request_row) -> None:
         request_id = self._get_request_id(request_row)
@@ -497,3 +525,11 @@ def normalize_broker_order_status(raw_status: Any) -> str:
     if normalized in {"expired", "done_for_day"}:
         return PaperOrderStatus.EXPIRED.value
     return PaperOrderStatus.SUBMITTED.value
+
+
+def derive_entry_status_from_order_status(order_status: str) -> str | None:
+    if order_status == PaperOrderStatus.PARTIALLY_FILLED.value:
+        return PaperTradePlanEntryStatus.PARTIALLY_FILLED.value
+    if order_status == PaperOrderStatus.FILLED.value:
+        return PaperTradePlanEntryStatus.FILLED.value
+    return None

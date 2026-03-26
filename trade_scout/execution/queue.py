@@ -9,8 +9,10 @@ from trade_scout.execution.models import (
     BrokerOrderResult,
     ExecutionRequest,
     ExecutionStatus,
+    PaperFillRole,
     PaperOrderRole,
     PaperOrderStatus,
+    PaperTradePlanEntryStatus,
     PaperTradePlanStatus,
 )
 
@@ -22,6 +24,7 @@ ACTIVE_REQUEST_STATUSES = (
 )
 PAPER_TRADE_PLAN_SCHEMA_VERSION = "1"
 PAPER_ORDER_SCHEMA_VERSION = "1"
+PAPER_FILL_SCHEMA_VERSION = "1"
 PAPER_TRADE_PLAN_ENTRY_TYPE_MARKET = "MARKET"
 TERMINAL_PAPER_ORDER_STATUSES = (
     PaperOrderStatus.FILLED.value,
@@ -114,6 +117,10 @@ def init_db(db_path: str) -> None:
                 intended_notional REAL,
                 plan_rules_json TEXT,
                 plan_status TEXT NOT NULL,
+                entry_status TEXT,
+                entry_filled_qty REAL,
+                entry_avg_fill_px REAL,
+                entry_fill_ts_utc TEXT,
                 schema_version TEXT NOT NULL
             )
             """
@@ -158,6 +165,32 @@ def init_db(db_path: str) -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS paper_fills (
+                paper_fill_id TEXT PRIMARY KEY,
+                plan_id TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                alert_id TEXT NOT NULL,
+                paper_order_id TEXT NOT NULL,
+                broker TEXT NOT NULL,
+                broker_order_id TEXT NOT NULL,
+                broker_fill_id TEXT,
+                fill_role TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                fill_ts_utc TEXT NOT NULL,
+                fill_px REAL NOT NULL,
+                fill_qty REAL NOT NULL,
+                gross_notional REAL,
+                fee REAL,
+                liquidity TEXT,
+                fill_sequence INTEGER,
+                raw_fill_json TEXT,
+                schema_version TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_exec_req_status
             ON execution_requests (status)
             """
@@ -190,6 +223,30 @@ def init_db(db_path: str) -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_paper_orders_broker_order_id
             ON paper_orders (broker_order_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_paper_fills_broker_order_id
+            ON paper_fills (broker_order_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_paper_fills_paper_order_id
+            ON paper_fills (paper_order_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_paper_fills_plan_id
+            ON paper_fills (plan_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_fills_order_role
+            ON paper_fills (paper_order_id, fill_role)
             """
         )
         conn.execute(
@@ -528,8 +585,12 @@ def create_paper_trade_plan(
             intended_notional,
             plan_rules_json,
             plan_status,
+            entry_status,
+            entry_filled_qty,
+            entry_avg_fill_px,
+            entry_fill_ts_utc,
             schema_version
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             plan_id,
@@ -564,6 +625,10 @@ def create_paper_trade_plan(
             intended_notional,
             plan_rules_json,
             plan_status,
+            PaperTradePlanEntryStatus.PENDING.value,
+            None,
+            None,
+            None,
             schema_version,
         ),
     )
@@ -709,4 +774,182 @@ def reconcile_paper_order_from_broker(
         WHERE paper_order_id = ?
         """,
         (paper_order_id,),
+    ).fetchone()
+
+
+def get_paper_fill_by_order_id_and_role(
+    conn: sqlite3.Connection,
+    paper_order_id: str,
+    fill_role: str,
+) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT *
+        FROM paper_fills
+        WHERE paper_order_id = ?
+          AND fill_role = ?
+        """,
+        (paper_order_id, fill_role),
+    ).fetchone()
+
+
+def _resolve_entry_fill_ts_utc(
+    *,
+    broker_snapshot: BrokerOrderResult,
+    existing_fill_row: sqlite3.Row | None,
+    trade_plan_row: sqlite3.Row | None,
+) -> str | None:
+    if broker_snapshot.filled_ts_utc:
+        return broker_snapshot.filled_ts_utc
+    if existing_fill_row is not None and existing_fill_row["fill_ts_utc"]:
+        return str(existing_fill_row["fill_ts_utc"])
+    if trade_plan_row is not None and trade_plan_row["entry_fill_ts_utc"]:
+        return str(trade_plan_row["entry_fill_ts_utc"])
+    if broker_snapshot.last_broker_update_ts_utc:
+        return broker_snapshot.last_broker_update_ts_utc
+    return None
+
+
+def upsert_entry_fill_from_broker_snapshot(
+    conn: sqlite3.Connection,
+    *,
+    paper_order_row: sqlite3.Row,
+    broker_snapshot: BrokerOrderResult,
+    entry_status: str,
+) -> sqlite3.Row | None:
+    if broker_snapshot.filled_qty is None or broker_snapshot.filled_avg_price is None:
+        return None
+
+    paper_order_id = str(paper_order_row["paper_order_id"])
+    fill_role = PaperFillRole.ENTRY.value
+    existing_fill = get_paper_fill_by_order_id_and_role(conn, paper_order_id, fill_role)
+    trade_plan_row = conn.execute(
+        """
+        SELECT *
+        FROM paper_trade_plans
+        WHERE plan_id = ?
+        """,
+        (str(paper_order_row["plan_id"]),),
+    ).fetchone()
+    fill_ts_utc = _resolve_entry_fill_ts_utc(
+        broker_snapshot=broker_snapshot,
+        existing_fill_row=existing_fill,
+        trade_plan_row=trade_plan_row,
+    )
+    if not fill_ts_utc:
+        return None
+
+    paper_fill_id = (
+        str(existing_fill["paper_fill_id"])
+        if existing_fill is not None
+        else f"{paper_order_id}:{fill_role}"
+    )
+    gross_notional = broker_snapshot.filled_qty * broker_snapshot.filled_avg_price
+
+    conn.execute(
+        """
+        INSERT INTO paper_fills (
+            paper_fill_id,
+            plan_id,
+            request_id,
+            alert_id,
+            paper_order_id,
+            broker,
+            broker_order_id,
+            broker_fill_id,
+            fill_role,
+            symbol,
+            side,
+            fill_ts_utc,
+            fill_px,
+            fill_qty,
+            gross_notional,
+            fee,
+            liquidity,
+            fill_sequence,
+            raw_fill_json,
+            schema_version
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(paper_fill_id) DO UPDATE SET
+            broker_fill_id = excluded.broker_fill_id,
+            fill_ts_utc = excluded.fill_ts_utc,
+            fill_px = excluded.fill_px,
+            fill_qty = excluded.fill_qty,
+            gross_notional = excluded.gross_notional,
+            fee = excluded.fee,
+            liquidity = excluded.liquidity,
+            fill_sequence = excluded.fill_sequence,
+            raw_fill_json = excluded.raw_fill_json
+        """,
+        (
+            paper_fill_id,
+            str(paper_order_row["plan_id"]),
+            str(paper_order_row["request_id"]),
+            str(paper_order_row["alert_id"]),
+            paper_order_id,
+            str(paper_order_row["broker"]),
+            str(paper_order_row["broker_order_id"]),
+            None,
+            fill_role,
+            str(paper_order_row["symbol"]),
+            str(paper_order_row["side"]),
+            fill_ts_utc,
+            broker_snapshot.filled_avg_price,
+            broker_snapshot.filled_qty,
+            gross_notional,
+            None,
+            None,
+            1,
+            broker_snapshot.raw_response_json,
+            PAPER_FILL_SCHEMA_VERSION,
+        ),
+    )
+    conn.commit()
+
+    update_trade_plan_entry_summary(
+        conn,
+        plan_id=str(paper_order_row["plan_id"]),
+        entry_status=entry_status,
+        entry_filled_qty=broker_snapshot.filled_qty,
+        entry_avg_fill_px=broker_snapshot.filled_avg_price,
+        entry_fill_ts_utc=fill_ts_utc,
+    )
+
+    return get_paper_fill_by_order_id_and_role(conn, paper_order_id, fill_role)
+
+
+def update_trade_plan_entry_summary(
+    conn: sqlite3.Connection,
+    *,
+    plan_id: str,
+    entry_status: str,
+    entry_filled_qty: float,
+    entry_avg_fill_px: float,
+    entry_fill_ts_utc: str,
+) -> sqlite3.Row | None:
+    conn.execute(
+        """
+        UPDATE paper_trade_plans
+        SET entry_status = ?,
+            entry_filled_qty = ?,
+            entry_avg_fill_px = ?,
+            entry_fill_ts_utc = ?
+        WHERE plan_id = ?
+        """,
+        (
+            entry_status,
+            entry_filled_qty,
+            entry_avg_fill_px,
+            entry_fill_ts_utc,
+            plan_id,
+        ),
+    )
+    conn.commit()
+    return conn.execute(
+        """
+        SELECT *
+        FROM paper_trade_plans
+        WHERE plan_id = ?
+        """,
+        (plan_id,),
     ).fetchone()

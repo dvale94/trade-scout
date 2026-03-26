@@ -48,6 +48,12 @@ def _parse_response_json(response: requests.Response) -> Any:
         return {"raw_text": response.text}
 
 
+def _parse_optional_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    return float(value)
+
+
 def _normalize_order_result(response_json: Mapping[str, Any]) -> BrokerOrderResult:
     broker_order_id = str(response_json.get("id", "")).strip()
     submitted_ts_utc = str(response_json.get("submitted_at", "")).strip() or utc_now_iso()
@@ -67,6 +73,8 @@ def _normalize_order_result(response_json: Mapping[str, Any]) -> BrokerOrderResu
         expired_ts_utc=str(response_json.get("expired_at", "")).strip() or None,
         rejected_ts_utc=str(response_json.get("failed_at", "")).strip() or None,
         filled_ts_utc=str(response_json.get("filled_at", "")).strip() or None,
+        filled_qty=_parse_optional_float(response_json.get("filled_qty")),
+        filled_avg_price=_parse_optional_float(response_json.get("filled_avg_price")),
         status_reason=str(response_json.get("fail_reason", "")).strip() or None,
         last_broker_update_ts_utc=(
             str(response_json.get("updated_at", "")).strip()
