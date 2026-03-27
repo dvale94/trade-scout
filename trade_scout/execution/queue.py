@@ -34,6 +34,7 @@ PAPER_TRADE_PLAN_ENTRY_TYPE_MARKET = "MARKET"
 TERMINAL_PAPER_ORDER_STATUSES = (
     PaperOrderStatus.FILLED.value,
     PaperOrderStatus.CANCELED.value,
+    PaperOrderStatus.REPLACED.value,
     PaperOrderStatus.REJECTED.value,
     PaperOrderStatus.EXPIRED.value,
 )
@@ -150,6 +151,8 @@ def init_db(db_path: str) -> None:
                 broker_order_id TEXT,
                 client_order_id TEXT NOT NULL UNIQUE,
                 parent_paper_order_id TEXT,
+                replaced_from_paper_order_id TEXT,
+                superseded_by_paper_order_id TEXT,
                 order_role TEXT NOT NULL,
                 symbol TEXT NOT NULL,
                 side TEXT NOT NULL,
@@ -555,7 +558,7 @@ def get_open_paper_orders_for_sync(
         """
         SELECT *
         FROM paper_orders
-        WHERE order_status NOT IN (?, ?, ?, ?)
+        WHERE order_status NOT IN (?, ?, ?, ?, ?)
         ORDER BY last_broker_update_ts_utc ASC, submitted_ts_utc ASC
         LIMIT ?
         """,
@@ -740,6 +743,7 @@ def insert_paper_order(
     time_in_force: Optional[str],
     order_role: str = PaperOrderRole.ENTRY.value,
     parent_paper_order_id: str | None = None,
+    replaced_from_paper_order_id: str | None = None,
     limit_price: float | None = None,
     stop_price: float | None = None,
     reduce_only: int = 0,
@@ -761,6 +765,8 @@ def insert_paper_order(
             broker_order_id,
             client_order_id,
             parent_paper_order_id,
+            replaced_from_paper_order_id,
+            superseded_by_paper_order_id,
             order_role,
             symbol,
             side,
@@ -778,7 +784,7 @@ def insert_paper_order(
             last_broker_update_ts_utc,
             raw_response_json,
             schema_version
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             paper_order_id,
@@ -789,6 +795,8 @@ def insert_paper_order(
             result.broker_order_id,
             client_order_id,
             parent_paper_order_id,
+            replaced_from_paper_order_id,
+            None,
             order_role,
             symbol,
             side,
@@ -888,6 +896,52 @@ def get_paper_order_by_plan_id_and_role(
         LIMIT 1
         """,
         (plan_id, order_role),
+    ).fetchone()
+
+
+def get_latest_paper_order_by_plan_id_and_role(
+    conn: sqlite3.Connection,
+    plan_id: str,
+    order_role: str,
+) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT *
+        FROM paper_orders
+        WHERE plan_id = ?
+          AND order_role = ?
+        ORDER BY submitted_ts_utc DESC, paper_order_id DESC
+        LIMIT 1
+        """,
+        (plan_id, order_role),
+    ).fetchone()
+
+
+def get_current_paper_order_by_plan_id_and_role(
+    conn: sqlite3.Connection,
+    plan_id: str,
+    order_role: str,
+) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT *
+        FROM paper_orders
+        WHERE plan_id = ?
+          AND order_role = ?
+          AND order_status NOT IN (?, ?, ?, ?, ?)
+          AND superseded_by_paper_order_id IS NULL
+        ORDER BY submitted_ts_utc DESC, paper_order_id DESC
+        LIMIT 1
+        """,
+        (
+            plan_id,
+            order_role,
+            PaperOrderStatus.FILLED.value,
+            PaperOrderStatus.CANCELED.value,
+            PaperOrderStatus.REPLACED.value,
+            PaperOrderStatus.REJECTED.value,
+            PaperOrderStatus.EXPIRED.value,
+        ),
     ).fetchone()
 
 
@@ -1292,6 +1346,26 @@ def update_trade_plan_tp1_pointer(
     ).fetchone()
 
 
+def clear_trade_plan_protective_stop_pointer(
+    conn: sqlite3.Connection,
+    *,
+    plan_id: str,
+) -> sqlite3.Row | None:
+    conn.execute(
+        """
+        UPDATE paper_trade_plans
+        SET protective_stop_order_id = NULL
+        WHERE plan_id = ?
+        """,
+        (plan_id,),
+    )
+    conn.commit()
+    return conn.execute(
+        "SELECT * FROM paper_trade_plans WHERE plan_id = ?",
+        (plan_id,),
+    ).fetchone()
+
+
 def update_open_stop_order_qty(
     conn: sqlite3.Connection,
     *,
@@ -1303,9 +1377,80 @@ def update_open_stop_order_qty(
         UPDATE paper_orders
         SET qty = ?
         WHERE paper_order_id = ?
-          AND order_status NOT IN (?, ?, ?, ?)
+          AND order_status NOT IN (?, ?, ?, ?, ?)
         """,
         (qty, paper_order_id, *TERMINAL_PAPER_ORDER_STATUSES),
+    )
+    conn.commit()
+    return conn.execute(
+        "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+        (paper_order_id,),
+    ).fetchone()
+
+
+def mark_paper_order_replaced(
+    conn: sqlite3.Connection,
+    *,
+    paper_order_id: str,
+    replacement_paper_order_id: str,
+    canceled_ts_utc: str | None = None,
+    raw_response_json: str | None = None,
+) -> sqlite3.Row | None:
+    effective_canceled_ts_utc = canceled_ts_utc or utc_now_iso()
+    conn.execute(
+        """
+        UPDATE paper_orders
+        SET order_status = ?,
+            canceled_ts_utc = COALESCE(?, canceled_ts_utc),
+            status_reason = ?,
+            superseded_by_paper_order_id = ?,
+            last_broker_update_ts_utc = ?,
+            raw_response_json = COALESCE(?, raw_response_json)
+        WHERE paper_order_id = ?
+        """,
+        (
+            PaperOrderStatus.REPLACED.value,
+            effective_canceled_ts_utc,
+            "REPLACED",
+            replacement_paper_order_id,
+            effective_canceled_ts_utc,
+            raw_response_json,
+            paper_order_id,
+        ),
+    )
+    conn.commit()
+    return conn.execute(
+        "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+        (paper_order_id,),
+    ).fetchone()
+
+
+def mark_paper_order_canceled_for_replace(
+    conn: sqlite3.Connection,
+    *,
+    paper_order_id: str,
+    canceled_ts_utc: str | None = None,
+    raw_response_json: str | None = None,
+) -> sqlite3.Row | None:
+    effective_canceled_ts_utc = canceled_ts_utc or utc_now_iso()
+    conn.execute(
+        """
+        UPDATE paper_orders
+        SET order_status = ?,
+            canceled_ts_utc = COALESCE(?, canceled_ts_utc),
+            status_reason = ?,
+            last_broker_update_ts_utc = ?,
+            raw_response_json = COALESCE(?, raw_response_json)
+        WHERE paper_order_id = ?
+        """,
+        (
+            PaperOrderStatus.CANCELED.value,
+            effective_canceled_ts_utc,
+            "canceled_for_replace",
+            effective_canceled_ts_utc,
+            raw_response_json,
+            paper_order_id,
+        ),
     )
     conn.commit()
     return conn.execute(

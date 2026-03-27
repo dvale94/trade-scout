@@ -8,6 +8,7 @@ from typing import Any, Callable, Mapping, Optional
 
 from trade_scout import config
 from trade_scout.execution.broker import (
+    cancel_broker_order,
     fetch_broker_order_by_id,
     find_broker_order_by_client_order_id,
     find_existing_broker_order,
@@ -18,13 +19,17 @@ from trade_scout.execution.broker import (
 from trade_scout.execution.policy import validate_execution_request
 from trade_scout.execution.queue import (
     claim_request,
+    clear_trade_plan_protective_stop_pointer,
     create_trade_outcome_from_stop_fill,
     create_paper_trade_plan,
     fetch_pending,
     fetch_validated,
     get_connection,
     get_open_paper_orders_for_sync,
+    get_current_paper_order_by_plan_id_and_role,
     get_paper_fill_by_order_id_and_role,
+    get_paper_order_by_client_order_id,
+    get_latest_paper_order_by_plan_id_and_role,
     get_paper_order_by_plan_id_and_role,
     get_paper_order_by_request_id_and_role,
     get_paper_trade_plan_by_request_id,
@@ -34,6 +39,8 @@ from trade_scout.execution.queue import (
     insert_paper_order,
     mark_expired,
     mark_failed,
+    mark_paper_order_canceled_for_replace,
+    mark_paper_order_replaced,
     mark_rejected,
     mark_submitted,
     mark_validated,
@@ -299,7 +306,7 @@ class ExecutionWorker:
             return
 
         # The actual STOP row is stronger local truth than the advisory plan pointer.
-        existing_stop_order = get_paper_order_by_plan_id_and_role(
+        existing_stop_order = get_current_paper_order_by_plan_id_and_role(
             conn,
             str(plan_row["plan_id"]),
             PaperOrderRole.STOP.value,
@@ -541,26 +548,164 @@ class ExecutionWorker:
         self.align_stop_to_remaining_qty(conn, str(plan_row["plan_id"]), remaining_qty)
 
     def align_stop_to_remaining_qty(self, conn, plan_id: str, remaining_qty: float) -> None:
-        stop_order_row = get_paper_order_by_plan_id_and_role(
+        plan_row = self._get_plan_row_by_id(conn, plan_id)
+        if plan_row is None:
+            return
+        if str(plan_row["position_status"]) != "OPEN":
+            return
+        if self._coerce_optional_str(plan_row["partial_exit_status"]) != (
+            PaperTradePlanPartialExitStatus.TP1_PARTIAL.value
+        ):
+            return
+        if remaining_qty <= 0:
+            return
+
+        current_stop_order = get_current_paper_order_by_plan_id_and_role(
             conn,
             plan_id,
             PaperOrderRole.STOP.value,
         )
-        if stop_order_row is None:
-            return
-        current_qty = self._coerce_float(stop_order_row["qty"])
-        if current_qty == remaining_qty:
-            return
-        updated_row = update_open_stop_order_qty(
+        latest_stop_order = current_stop_order or get_latest_paper_order_by_plan_id_and_role(
             conn,
-            paper_order_id=str(stop_order_row["paper_order_id"]),
-            qty=remaining_qty,
+            plan_id,
+            PaperOrderRole.STOP.value,
         )
-        if updated_row is not None:
-            print(
-                f"[execution-worker] aligned local stop qty plan_id={plan_id} "
-                f"paper_order_id={updated_row['paper_order_id']} qty={remaining_qty}"
+        if latest_stop_order is None:
+            return
+
+        if current_stop_order is not None:
+            update_trade_plan_position_open(
+                conn,
+                plan_id=plan_id,
+                protective_stop_order_id=str(current_stop_order["paper_order_id"]),
+                remaining_qty=remaining_qty,
             )
+            current_qty = self._coerce_float(current_stop_order["qty"])
+            if current_qty == remaining_qty:
+                return
+
+        replacement_client_order_id = self._next_stop_replace_client_order_id(
+            str(plan_row["request_id"]),
+            str(latest_stop_order["client_order_id"]),
+        )
+        existing_replacement = get_paper_order_by_client_order_id(conn, replacement_client_order_id)
+        if existing_replacement is not None and str(existing_replacement["order_status"]) not in {
+            PaperOrderStatus.CANCELED.value,
+            PaperOrderStatus.REPLACED.value,
+            PaperOrderStatus.REJECTED.value,
+            PaperOrderStatus.EXPIRED.value,
+            PaperOrderStatus.FILLED.value,
+        }:
+            update_trade_plan_position_open(
+                conn,
+                plan_id=plan_id,
+                protective_stop_order_id=str(existing_replacement["paper_order_id"]),
+                remaining_qty=remaining_qty,
+            )
+            if (
+                current_stop_order is not None
+                and str(current_stop_order["paper_order_id"])
+                != str(existing_replacement["paper_order_id"])
+            ):
+                mark_paper_order_replaced(
+                    conn,
+                    paper_order_id=str(current_stop_order["paper_order_id"]),
+                    replacement_paper_order_id=str(existing_replacement["paper_order_id"]),
+                )
+            return
+
+        recovered_replacement = None
+        try:
+            recovered_replacement = find_broker_order_by_client_order_id(replacement_client_order_id)
+        except Exception:
+            recovered_replacement = None
+
+        stop_side = opposite_trade_side(str(plan_row["side"]))
+        stop_price = self._coerce_float(plan_row["stop_px"])
+        if stop_price is None:
+            return
+
+        if recovered_replacement is None and current_stop_order is not None:
+            broker_order_id = self._coerce_optional_str(current_stop_order["broker_order_id"])
+            if broker_order_id:
+                cancel_result = cancel_broker_order(broker_order_id)
+                mark_paper_order_canceled_for_replace(
+                    conn,
+                    paper_order_id=str(current_stop_order["paper_order_id"]),
+                    canceled_ts_utc=cancel_result.canceled_ts_utc,
+                    raw_response_json=cancel_result.raw_response_json,
+                )
+                clear_trade_plan_protective_stop_pointer(
+                    conn,
+                    plan_id=plan_id,
+                )
+            else:
+                cancel_result = None
+        else:
+            cancel_result = None
+
+        if recovered_replacement is None:
+            try:
+                replacement_result = submit_stop_order(
+                    client_order_id=replacement_client_order_id,
+                    symbol=str(plan_row["symbol"]),
+                    side=stop_side,
+                    qty=remaining_qty,
+                    stop_price=stop_price,
+                )
+            except Exception as exc:
+                recovered_replacement = find_broker_order_by_client_order_id(
+                    replacement_client_order_id
+                )
+                if recovered_replacement is None:
+                    raise exc
+                replacement_result = recovered_replacement
+        else:
+            replacement_result = recovered_replacement
+
+        replacement_order = insert_paper_order(
+            conn,
+            plan_id=plan_id,
+            request_id=str(plan_row["request_id"]),
+            alert_id=str(plan_row["alert_id"]),
+            broker=replacement_result.broker,
+            client_order_id=replacement_client_order_id,
+            symbol=str(plan_row["symbol"]),
+            side=stop_side,
+            qty=remaining_qty,
+            notional=None,
+            order_type="stop",
+            time_in_force="gtc",
+            order_role=PaperOrderRole.STOP.value,
+            parent_paper_order_id=str(latest_stop_order["parent_paper_order_id"])
+            if latest_stop_order["parent_paper_order_id"]
+            else None,
+            replaced_from_paper_order_id=str(latest_stop_order["paper_order_id"]),
+            stop_price=stop_price,
+            result=replacement_result,
+        )
+        if current_stop_order is not None:
+            mark_paper_order_replaced(
+                conn,
+                paper_order_id=str(current_stop_order["paper_order_id"]),
+                replacement_paper_order_id=str(replacement_order["paper_order_id"]),
+                canceled_ts_utc=(
+                    cancel_result.canceled_ts_utc if cancel_result is not None else None
+                ),
+                raw_response_json=(
+                    cancel_result.raw_response_json if cancel_result is not None else None
+                ),
+            )
+        update_trade_plan_position_open(
+            conn,
+            plan_id=plan_id,
+            protective_stop_order_id=str(replacement_order["paper_order_id"]),
+            remaining_qty=remaining_qty,
+        )
+        print(
+            f"[execution-worker] replaced protective stop plan_id={plan_id} "
+            f"paper_order_id={replacement_order['paper_order_id']} qty={remaining_qty}"
+        )
 
     def handle_closed_trade_from_stop_fill(self, conn, stop_order_row) -> None:
         stop_fill_row = get_paper_fill_by_order_id_and_role(
@@ -871,6 +1016,21 @@ class ExecutionWorker:
     @staticmethod
     def _protective_stop_client_order_id(request_id: str) -> str:
         return f"{request_id}:STOP"
+
+    @classmethod
+    def _next_stop_replace_client_order_id(
+        cls,
+        request_id: str,
+        current_client_order_id: str,
+    ) -> str:
+        base_client_order_id = cls._protective_stop_client_order_id(request_id)
+        suffix = current_client_order_id.removeprefix(base_client_order_id)
+        if not suffix:
+            return f"{base_client_order_id}:R2"
+        revision_text = suffix.removeprefix(":R")
+        if revision_text.isdigit():
+            return f"{base_client_order_id}:R{int(revision_text) + 1}"
+        return f"{base_client_order_id}:R2"
 
     @staticmethod
     def _tp1_client_order_id(request_id: str) -> str:

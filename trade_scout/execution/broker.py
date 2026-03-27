@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from trade_scout.execution.alpaca_adapter import (
+    cancel_order_by_broker_order_id as cancel_alpaca_order_by_broker_order_id,
     get_order_by_broker_order_id,
     get_order_by_client_order_id,
     submit_market_order,
@@ -64,3 +65,7 @@ def submit_limit_order(
         qty=qty,
         limit_price=limit_price,
     )
+
+
+def cancel_broker_order(broker_order_id: str) -> BrokerOrderResult:
+    return cancel_alpaca_order_by_broker_order_id(broker_order_id)

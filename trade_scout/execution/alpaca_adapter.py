@@ -202,6 +202,53 @@ def submit_limit_order(
     return _normalize_order_result(response_json)
 
 
+def cancel_order_by_broker_order_id(broker_order_id: str) -> BrokerOrderResult:
+    _require_alpaca_config()
+
+    url = f"{config.ALPACA_BASE_URL.rstrip('/')}/v2/orders/{broker_order_id}"
+    response = requests.delete(
+        url,
+        headers=_auth_headers(),
+        timeout=15,
+    )
+    response_json = _parse_response_json(response)
+
+    if response.status_code == 204:
+        canceled_ts_utc = utc_now_iso()
+        return BrokerOrderResult(
+            broker=ALPACA_BROKER_NAME,
+            broker_order_id=broker_order_id,
+            submitted_ts_utc=canceled_ts_utc,
+            raw_response_json=json.dumps(
+                {"action": "cancel", "broker_order_id": broker_order_id, "status": "canceled"},
+                sort_keys=True,
+            ),
+            broker_status_raw="canceled",
+            canceled_ts_utc=canceled_ts_utc,
+            last_broker_update_ts_utc=canceled_ts_utc,
+        )
+
+    if response.status_code >= 400:
+        detail = response_json if isinstance(response_json, dict) else {"response": response_json}
+        raise RuntimeError(
+            f"Alpaca cancel failed status={response.status_code} detail={json.dumps(detail, sort_keys=True)}"
+        )
+
+    if isinstance(response_json, dict):
+        return _normalize_order_result(response_json)
+
+    canceled_ts_utc = utc_now_iso()
+    return BrokerOrderResult(
+        broker=ALPACA_BROKER_NAME,
+        broker_order_id=broker_order_id,
+        submitted_ts_utc=canceled_ts_utc,
+        raw_response_json=json.dumps({"response": response_json}, sort_keys=True),
+        broker_status_raw="canceled",
+        canceled_ts_utc=canceled_ts_utc,
+        last_broker_update_ts_utc=canceled_ts_utc,
+    )
+
+
 def get_order_by_client_order_id(request_id: str) -> BrokerOrderResult | None:
     _require_alpaca_config()
 
