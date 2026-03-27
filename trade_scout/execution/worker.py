@@ -9,19 +9,25 @@ from typing import Any, Callable, Mapping, Optional
 from trade_scout import config
 from trade_scout.execution.broker import (
     fetch_broker_order_by_id,
+    find_broker_order_by_client_order_id,
     find_existing_broker_order,
+    submit_stop_order,
     submit_validated_order,
 )
 from trade_scout.execution.policy import validate_execution_request
 from trade_scout.execution.queue import (
     claim_request,
+    create_trade_outcome_from_stop_fill,
     create_paper_trade_plan,
     fetch_pending,
     fetch_validated,
     get_connection,
     get_open_paper_orders_for_sync,
+    get_paper_fill_by_order_id_and_role,
+    get_paper_order_by_plan_id_and_role,
     get_paper_order_by_request_id_and_role,
     get_paper_trade_plan_by_request_id,
+    get_trade_outcome_by_plan_id,
     get_request_by_id,
     init_db,
     insert_paper_order,
@@ -31,9 +37,13 @@ from trade_scout.execution.queue import (
     mark_submitted,
     mark_validated,
     reconcile_paper_order_from_broker,
+    update_trade_plan_position_closed,
+    update_trade_plan_position_open,
+    upsert_paper_fill_from_broker_snapshot,
     upsert_entry_fill_from_broker_snapshot,
 )
 from trade_scout.execution.models import (
+    PaperFillRole,
     PaperOrderRole,
     PaperOrderStatus,
     PaperTradePlanEntryStatus,
@@ -217,29 +227,180 @@ class ExecutionWorker:
         )
         if reconciled is None:
             raise RuntimeError("paper order reconcile did not persist")
-        self.ingest_entry_fill_if_present(conn, reconciled, broker_snapshot)
+        self.ingest_order_fill_if_present(conn, reconciled, broker_snapshot)
+        self.handle_reconciled_order_lifecycle(conn, reconciled)
         return reconciled
 
-    def ingest_entry_fill_if_present(self, conn, paper_order_row, broker_snapshot) -> None:
-        if str(paper_order_row["order_role"]) != PaperOrderRole.ENTRY.value:
+    def ingest_order_fill_if_present(self, conn, paper_order_row, broker_snapshot) -> None:
+        order_role = str(paper_order_row["order_role"])
+        order_status = str(paper_order_row["order_status"])
+        if order_role == PaperOrderRole.ENTRY.value:
+            entry_status = derive_entry_status_from_order_status(order_status)
+            if entry_status is None:
+                return
+            fill_row = upsert_entry_fill_from_broker_snapshot(
+                conn,
+                paper_order_row=paper_order_row,
+                broker_snapshot=broker_snapshot,
+                entry_status=entry_status,
+            )
+        elif order_role == PaperOrderRole.STOP.value and order_status == PaperOrderStatus.FILLED.value:
+            fill_row = upsert_paper_fill_from_broker_snapshot(
+                conn,
+                paper_order_row=paper_order_row,
+                broker_snapshot=broker_snapshot,
+                fill_role=PaperFillRole.STOP.value,
+            )
+        else:
             return
 
-        entry_status = derive_entry_status_from_order_status(str(paper_order_row["order_status"]))
-        if entry_status is None:
-            return
-
-        fill_row = upsert_entry_fill_from_broker_snapshot(
-            conn,
-            paper_order_row=paper_order_row,
-            broker_snapshot=broker_snapshot,
-            entry_status=entry_status,
-        )
         if fill_row is None:
             return
 
         print(
             f"[execution-worker] ingested fill paper_order_id={paper_order_row['paper_order_id']} "
-            f"paper_fill_id={fill_row['paper_fill_id']} entry_status={entry_status}"
+            f"paper_fill_id={fill_row['paper_fill_id']} order_role={order_role}"
+        )
+
+    def handle_reconciled_order_lifecycle(self, conn, paper_order_row) -> None:
+        order_role = str(paper_order_row["order_role"])
+        order_status = str(paper_order_row["order_status"])
+        if order_role == PaperOrderRole.ENTRY.value and order_status == PaperOrderStatus.FILLED.value:
+            self.ensure_protective_stop_for_entry_fill(conn, paper_order_row)
+            return
+        if order_role == PaperOrderRole.STOP.value and order_status == PaperOrderStatus.FILLED.value:
+            self.handle_closed_trade_from_stop_fill(conn, paper_order_row)
+
+    def ensure_protective_stop_for_entry_fill(self, conn, entry_order_row) -> None:
+        plan_row = self._get_plan_row_by_id(conn, str(entry_order_row["plan_id"]))
+        if plan_row is None:
+            return
+
+        # The actual STOP row is stronger local truth than the advisory plan pointer.
+        existing_stop_order = get_paper_order_by_plan_id_and_role(
+            conn,
+            str(plan_row["plan_id"]),
+            PaperOrderRole.STOP.value,
+        )
+        if existing_stop_order is not None:
+            update_trade_plan_position_open(
+                conn,
+                plan_id=str(plan_row["plan_id"]),
+                protective_stop_order_id=str(existing_stop_order["paper_order_id"]),
+            )
+            return
+
+        stop_price = self._coerce_float(plan_row["stop_px"])
+        qty = self._coerce_float(plan_row["entry_filled_qty"])
+        if stop_price is None or qty is None or qty <= 0:
+            return
+
+        client_order_id = self._protective_stop_client_order_id(str(plan_row["request_id"]))
+        stop_side = opposite_trade_side(str(plan_row["side"]))
+        try:
+            recovered = find_broker_order_by_client_order_id(client_order_id)
+        except Exception:
+            recovered = None
+        if recovered is not None:
+            stop_order = insert_paper_order(
+                conn,
+                plan_id=str(plan_row["plan_id"]),
+                request_id=str(plan_row["request_id"]),
+                alert_id=str(plan_row["alert_id"]),
+                broker=recovered.broker,
+                client_order_id=client_order_id,
+                symbol=str(plan_row["symbol"]),
+                side=stop_side,
+                qty=qty,
+                notional=None,
+                order_type="stop",
+                time_in_force="gtc",
+                order_role=PaperOrderRole.STOP.value,
+                parent_paper_order_id=str(entry_order_row["paper_order_id"]),
+                stop_price=stop_price,
+                result=recovered,
+            )
+            update_trade_plan_position_open(
+                conn,
+                plan_id=str(plan_row["plan_id"]),
+                protective_stop_order_id=str(stop_order["paper_order_id"]),
+            )
+            print(
+                f"[execution-worker] recovered protective stop plan_id={plan_row['plan_id']} "
+                f"paper_order_id={stop_order['paper_order_id']}"
+            )
+            return
+
+        try:
+            result = submit_stop_order(
+                client_order_id=client_order_id,
+                symbol=str(plan_row["symbol"]),
+                side=stop_side,
+                qty=qty,
+                stop_price=stop_price,
+            )
+        except Exception as exc:
+            recovered = find_broker_order_by_client_order_id(client_order_id)
+            if recovered is None:
+                raise exc
+            result = recovered
+
+        stop_order = insert_paper_order(
+            conn,
+            plan_id=str(plan_row["plan_id"]),
+            request_id=str(plan_row["request_id"]),
+            alert_id=str(plan_row["alert_id"]),
+            broker=result.broker,
+            client_order_id=client_order_id,
+            symbol=str(plan_row["symbol"]),
+            side=stop_side,
+            qty=qty,
+            notional=None,
+            order_type="stop",
+            time_in_force="gtc",
+            order_role=PaperOrderRole.STOP.value,
+            parent_paper_order_id=str(entry_order_row["paper_order_id"]),
+            stop_price=stop_price,
+            result=result,
+        )
+        update_trade_plan_position_open(
+            conn,
+            plan_id=str(plan_row["plan_id"]),
+            protective_stop_order_id=str(stop_order["paper_order_id"]),
+        )
+        print(
+            f"[execution-worker] submitted protective stop plan_id={plan_row['plan_id']} "
+            f"paper_order_id={stop_order['paper_order_id']}"
+        )
+
+    def handle_closed_trade_from_stop_fill(self, conn, stop_order_row) -> None:
+        stop_fill_row = get_paper_fill_by_order_id_and_role(
+            conn,
+            str(stop_order_row["paper_order_id"]),
+            PaperFillRole.STOP.value,
+        )
+        if stop_fill_row is None:
+            return
+
+        plan_row = update_trade_plan_position_closed(
+            conn,
+            plan_id=str(stop_order_row["plan_id"]),
+            closed_ts_utc=str(stop_fill_row["fill_ts_utc"]),
+        )
+        if plan_row is None:
+            return
+
+        if get_trade_outcome_by_plan_id(conn, str(plan_row["plan_id"])) is not None:
+            return
+
+        outcome_row = create_trade_outcome_from_stop_fill(
+            conn,
+            plan_row=plan_row,
+            stop_fill_row=stop_fill_row,
+        )
+        print(
+            f"[execution-worker] created outcome plan_id={plan_row['plan_id']} "
+            f"outcome_id={outcome_row['outcome_id']}"
         )
 
     def process_validated_request(self, conn, request_row) -> None:
@@ -507,6 +668,21 @@ class ExecutionWorker:
             text = text[:-1] + "+00:00"
         return datetime.fromisoformat(text)
 
+    @staticmethod
+    def _get_plan_row_by_id(conn, plan_id: str):
+        return conn.execute(
+            """
+            SELECT *
+            FROM paper_trade_plans
+            WHERE plan_id = ?
+            """,
+            (plan_id,),
+        ).fetchone()
+
+    @staticmethod
+    def _protective_stop_client_order_id(request_id: str) -> str:
+        return f"{request_id}:STOP"
+
 
 def normalize_broker_order_status(raw_status: Any) -> str:
     normalized = str(raw_status or "").strip().lower()
@@ -533,3 +709,11 @@ def derive_entry_status_from_order_status(order_status: str) -> str | None:
     if order_status == PaperOrderStatus.FILLED.value:
         return PaperTradePlanEntryStatus.FILLED.value
     return None
+
+
+def opposite_trade_side(side: str) -> str:
+    if side == "LONG":
+        return "SHORT"
+    if side == "SHORT":
+        return "LONG"
+    raise ValueError(f"Unsupported side for protective stop: {side}")

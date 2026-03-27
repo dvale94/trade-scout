@@ -25,6 +25,7 @@ from trade_scout.execution.queue import (
     get_connection,
     get_open_paper_orders_for_sync,
     get_paper_fill_by_order_id_and_role,
+    get_paper_order_by_plan_id_and_role,
     get_paper_order_by_request_id_and_role,
     init_db,
     insert_request,
@@ -68,10 +69,12 @@ class ExecutionWorkerTest(unittest.TestCase):
             self.assertIn("paper_trade_plans", table_names)
             self.assertIn("paper_orders", table_names)
             self.assertIn("paper_fills", table_names)
+            self.assertIn("paper_trade_outcomes", table_names)
 
             plan_columns = self._table_columns(conn, "paper_trade_plans")
             order_columns = self._table_columns(conn, "paper_orders")
             fill_columns = self._table_columns(conn, "paper_fills")
+            outcome_columns = self._table_columns(conn, "paper_trade_outcomes")
         finally:
             conn.close()
 
@@ -83,6 +86,9 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertIn("entry_filled_qty", plan_columns)
         self.assertIn("entry_avg_fill_px", plan_columns)
         self.assertIn("entry_fill_ts_utc", plan_columns)
+        self.assertIn("position_status", plan_columns)
+        self.assertIn("protective_stop_order_id", plan_columns)
+        self.assertIn("closed_ts_utc", plan_columns)
 
         self.assertIn("paper_order_id", order_columns)
         self.assertIn("plan_id", order_columns)
@@ -97,6 +103,12 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertIn("fill_ts_utc", fill_columns)
         self.assertIn("fill_px", fill_columns)
         self.assertIn("fill_qty", fill_columns)
+
+        self.assertIn("outcome_id", outcome_columns)
+        self.assertIn("plan_id", outcome_columns)
+        self.assertIn("exit_reason", outcome_columns)
+        self.assertIn("gross_pnl", outcome_columns)
+        self.assertIn("realized_r", outcome_columns)
 
     def test_normalize_broker_order_status_maps_expected_values(self) -> None:
         self.assertEqual("SUBMITTED", normalize_broker_order_status("submitted"))
@@ -170,6 +182,7 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual("submitted", order_row["broker_status_raw"])
         self.assertEqual("PENDING", plan_row["entry_status"])
         self.assertIsNone(plan_row["entry_filled_qty"])
+        self.assertEqual("PENDING_ENTRY", plan_row["position_status"])
 
         self.assertEqual("SUBMITTED", request_row["status"])
         self.assertEqual("broker-1", request_row["broker_order_id"])
@@ -348,6 +361,35 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual("2026-03-25T14:11:00+00:00", reconciled["canceled_ts_utc"])
         self.assertEqual('{"id":"broker-cancel","status":"canceled"}', reconciled["raw_response_json"])
 
+    def test_get_paper_order_by_plan_id_and_role_returns_expected_stop_or_entry_row(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-plan-entry",
+                request_id="req-plan-role",
+                client_order_id="req-plan-role",
+                broker_order_id="broker-plan-entry",
+                order_status="SUBMITTED",
+            )
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-plan-stop",
+                request_id="req-plan-role",
+                client_order_id="req-plan-role-stop",
+                broker_order_id="broker-plan-stop",
+                order_status="SUBMITTED",
+                order_role="STOP",
+                parent_paper_order_id="po-plan-entry",
+            )
+            entry_row = get_paper_order_by_plan_id_and_role(conn, "plan-req-plan-role", "ENTRY")
+            stop_row = get_paper_order_by_plan_id_and_role(conn, "plan-req-plan-role", "STOP")
+        finally:
+            conn.close()
+
+        self.assertEqual("po-plan-entry", entry_row["paper_order_id"])
+        self.assertEqual("po-plan-stop", stop_row["paper_order_id"])
+
     def test_reconcile_preserves_existing_accepted_timestamp_when_snapshot_omits_it(self) -> None:
         conn = get_connection(self.db_path)
         try:
@@ -457,12 +499,16 @@ class ExecutionWorkerTest(unittest.TestCase):
                 "SELECT * FROM paper_orders WHERE paper_order_id = ?",
                 ("po-idem",),
             ).fetchone()
-            first = self.worker.reconcile_paper_order(conn, row, snapshot)
-            second_row = conn.execute(
-                "SELECT * FROM paper_orders WHERE paper_order_id = ?",
-                ("po-idem",),
-            ).fetchone()
-            second = self.worker.reconcile_paper_order(conn, second_row, snapshot)
+            with patch(
+                "trade_scout.execution.worker.submit_stop_order",
+                return_value=self._broker_result("broker-stop-idem", broker_status_raw="submitted"),
+            ):
+                first = self.worker.reconcile_paper_order(conn, row, snapshot)
+                second_row = conn.execute(
+                    "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+                    ("po-idem",),
+                ).fetchone()
+                second = self.worker.reconcile_paper_order(conn, second_row, snapshot)
             row_count = conn.execute("SELECT COUNT(*) AS n FROM paper_orders").fetchone()["n"]
             fill_count = conn.execute("SELECT COUNT(*) AS n FROM paper_fills").fetchone()["n"]
             plan_row = conn.execute(
@@ -472,12 +518,14 @@ class ExecutionWorkerTest(unittest.TestCase):
         finally:
             conn.close()
 
-        self.assertEqual(1, row_count)
+        self.assertEqual(2, row_count)
         self.assertEqual(1, fill_count)
         self.assertEqual(dict(first), dict(second))
         self.assertEqual("FILLED", plan_row["entry_status"])
         self.assertEqual(0.75, plan_row["entry_filled_qty"])
         self.assertEqual(101.25, plan_row["entry_avg_fill_px"])
+        self.assertEqual("OPEN", plan_row["position_status"])
+        self.assertIsNotNone(plan_row["protective_stop_order_id"])
 
     def test_filled_order_ingests_one_entry_fill_and_updates_plan_summary(self) -> None:
         conn = get_connection(self.db_path)
@@ -496,18 +544,22 @@ class ExecutionWorkerTest(unittest.TestCase):
                 ("po-fill-sync",),
             ).fetchone()
 
-            reconciled = self.worker.reconcile_paper_order(
-                conn,
-                order_row,
-                self._broker_result(
-                    "broker-fill-sync",
-                    broker_status_raw="filled",
-                    filled_ts_utc="2026-03-25T14:40:00+00:00",
-                    filled_qty=0.8,
-                    filled_avg_price=103.5,
-                    raw_response_json='{"id":"broker-fill-sync","status":"filled"}',
-                ),
-            )
+            with patch(
+                "trade_scout.execution.worker.submit_stop_order",
+                return_value=self._broker_result("broker-stop-fill-sync", broker_status_raw="submitted"),
+            ):
+                reconciled = self.worker.reconcile_paper_order(
+                    conn,
+                    order_row,
+                    self._broker_result(
+                        "broker-fill-sync",
+                        broker_status_raw="filled",
+                        filled_ts_utc="2026-03-25T14:40:00+00:00",
+                        filled_qty=0.8,
+                        filled_avg_price=103.5,
+                        raw_response_json='{"id":"broker-fill-sync","status":"filled"}',
+                    ),
+                )
             fill_row = get_paper_fill_by_order_id_and_role(conn, "po-fill-sync", "ENTRY")
             plan_row = conn.execute(
                 "SELECT * FROM paper_trade_plans WHERE request_id = ?",
@@ -526,6 +578,233 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual(0.8, plan_row["entry_filled_qty"])
         self.assertEqual(103.5, plan_row["entry_avg_fill_px"])
         self.assertEqual("2026-03-25T14:40:00+00:00", plan_row["entry_fill_ts_utc"])
+        self.assertEqual("OPEN", plan_row["position_status"])
+        self.assertIsNotNone(plan_row["protective_stop_order_id"])
+
+    def test_filled_entry_creates_one_protective_stop_and_marks_plan_open(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-stop", stop_px=95.0)
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-entry-stop",
+                request_id="req-stop",
+                client_order_id="req-stop",
+                broker_order_id="broker-entry-stop",
+                order_status="SUBMITTED",
+            )
+            entry_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+                ("po-entry-stop",),
+            ).fetchone()
+
+            with patch(
+                "trade_scout.execution.worker.submit_stop_order",
+                return_value=self._broker_result("broker-stop-1", broker_status_raw="submitted"),
+            ) as submit_stop_mock:
+                self.worker.reconcile_paper_order(
+                    conn,
+                    entry_row,
+                    self._broker_result(
+                        "broker-entry-stop",
+                        broker_status_raw="filled",
+                        filled_ts_utc="2026-03-26T14:00:00+00:00",
+                        filled_qty=1.0,
+                        filled_avg_price=100.0,
+                    ),
+                )
+                second_entry_row = conn.execute(
+                    "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+                    ("po-entry-stop",),
+                ).fetchone()
+                self.worker.reconcile_paper_order(
+                    conn,
+                    second_entry_row,
+                    self._broker_result(
+                        "broker-entry-stop",
+                        broker_status_raw="filled",
+                        filled_ts_utc="2026-03-26T14:00:00+00:00",
+                        filled_qty=1.0,
+                        filled_avg_price=100.0,
+                    ),
+                )
+
+            stop_orders = conn.execute(
+                "SELECT * FROM paper_orders WHERE plan_id = ? AND order_role = ?",
+                ("plan-req-stop", "STOP"),
+            ).fetchall()
+            plan_row = conn.execute(
+                "SELECT * FROM paper_trade_plans WHERE request_id = ?",
+                ("req-stop",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(1, submit_stop_mock.call_count)
+        self.assertEqual(1, len(stop_orders))
+        self.assertEqual("OPEN", plan_row["position_status"])
+        self.assertEqual(stop_orders[0]["paper_order_id"], plan_row["protective_stop_order_id"])
+
+    def test_existing_stop_row_wins_over_plan_pointer_and_realigns_pointer(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(
+                conn,
+                request_id="req-pointer-align",
+                entry_status="FILLED",
+                entry_filled_qty=1.0,
+                entry_avg_fill_px=100.0,
+                entry_fill_ts_utc="2026-03-26T10:00:00+00:00",
+                position_status="OPEN",
+                protective_stop_order_id="stale-pointer",
+            )
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-entry-pointer-align",
+                request_id="req-pointer-align",
+                client_order_id="req-pointer-align",
+                broker_order_id="broker-entry-pointer-align",
+                order_status="FILLED",
+            )
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-stop-pointer-align",
+                request_id="req-pointer-align",
+                client_order_id="req-pointer-align:STOP",
+                broker_order_id="broker-stop-pointer-align",
+                order_status="SUBMITTED",
+                order_role="STOP",
+                parent_paper_order_id="po-entry-pointer-align",
+                side="SHORT",
+                stop_price=95.0,
+            )
+            entry_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+                ("po-entry-pointer-align",),
+            ).fetchone()
+
+            with patch(
+                "trade_scout.execution.worker.submit_stop_order",
+                side_effect=AssertionError("submit_stop_order should not be called"),
+            ):
+                self.worker.ensure_protective_stop_for_entry_fill(conn, entry_row)
+
+            stop_count = conn.execute(
+                "SELECT COUNT(*) AS n FROM paper_orders WHERE plan_id = ? AND order_role = ?",
+                ("plan-req-pointer-align", "STOP"),
+            ).fetchone()["n"]
+            plan_row = conn.execute(
+                "SELECT * FROM paper_trade_plans WHERE request_id = ?",
+                ("req-pointer-align",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(1, stop_count)
+        self.assertEqual("po-stop-pointer-align", plan_row["protective_stop_order_id"])
+
+    def test_stale_plan_pointer_does_not_block_stop_recovery_or_placement(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(
+                conn,
+                request_id="req-stale-pointer",
+                entry_status="FILLED",
+                entry_filled_qty=1.0,
+                entry_avg_fill_px=100.0,
+                entry_fill_ts_utc="2026-03-26T10:05:00+00:00",
+                position_status="OPEN",
+                protective_stop_order_id="stale-pointer-only",
+            )
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-entry-stale-pointer",
+                request_id="req-stale-pointer",
+                client_order_id="req-stale-pointer",
+                broker_order_id="broker-entry-stale-pointer",
+                order_status="FILLED",
+            )
+            entry_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+                ("po-entry-stale-pointer",),
+            ).fetchone()
+
+            with patch(
+                "trade_scout.execution.worker.find_broker_order_by_client_order_id",
+                return_value=None,
+            ), patch(
+                "trade_scout.execution.worker.submit_stop_order",
+                return_value=self._broker_result("broker-stop-stale-pointer", broker_status_raw="submitted"),
+            ) as submit_stop_mock:
+                self.worker.ensure_protective_stop_for_entry_fill(conn, entry_row)
+                refreshed_entry_row = conn.execute(
+                    "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+                    ("po-entry-stale-pointer",),
+                ).fetchone()
+                self.worker.ensure_protective_stop_for_entry_fill(conn, refreshed_entry_row)
+
+            stop_rows = conn.execute(
+                "SELECT * FROM paper_orders WHERE plan_id = ? AND order_role = ?",
+                ("plan-req-stale-pointer", "STOP"),
+            ).fetchall()
+            plan_row = conn.execute(
+                "SELECT * FROM paper_trade_plans WHERE request_id = ?",
+                ("req-stale-pointer",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(1, submit_stop_mock.call_count)
+        self.assertEqual(1, len(stop_rows))
+        self.assertEqual(stop_rows[0]["paper_order_id"], plan_row["protective_stop_order_id"])
+
+    def test_partially_filled_entry_does_not_create_stop(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-no-stop")
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-entry-no-stop",
+                request_id="req-no-stop",
+                client_order_id="req-no-stop",
+                broker_order_id="broker-entry-no-stop",
+                order_status="SUBMITTED",
+            )
+            entry_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+                ("po-entry-no-stop",),
+            ).fetchone()
+
+            with patch(
+                "trade_scout.execution.worker.submit_stop_order",
+                side_effect=AssertionError("submit_stop_order should not be called"),
+            ):
+                self.worker.reconcile_paper_order(
+                    conn,
+                    entry_row,
+                    self._broker_result(
+                        "broker-entry-no-stop",
+                        broker_status_raw="partially_filled",
+                        filled_ts_utc=None,
+                        filled_qty=0.3,
+                        filled_avg_price=100.0,
+                        last_broker_update_ts_utc="2026-03-26T14:05:00+00:00",
+                    ),
+                )
+
+            stop_orders = conn.execute(
+                "SELECT COUNT(*) AS n FROM paper_orders WHERE plan_id = ? AND order_role = ?",
+                ("plan-req-no-stop", "STOP"),
+            ).fetchone()["n"]
+            plan_row = conn.execute(
+                "SELECT * FROM paper_trade_plans WHERE request_id = ?",
+                ("req-no-stop",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(0, stop_orders)
+        self.assertEqual("PENDING_ENTRY", plan_row["position_status"])
 
     def test_partial_fill_ingests_or_updates_entry_fill_and_plan_summary(self) -> None:
         conn = get_connection(self.db_path)
@@ -569,6 +848,7 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual("PARTIALLY_FILLED", plan_row["entry_status"])
         self.assertEqual(0.25, plan_row["entry_filled_qty"])
         self.assertEqual(102.0, plan_row["entry_avg_fill_px"])
+        self.assertEqual("PENDING_ENTRY", plan_row["position_status"])
 
     def test_partial_fill_timestamp_preserves_first_fallback_timestamp(self) -> None:
         conn = get_connection(self.db_path)
@@ -660,18 +940,22 @@ class ExecutionWorkerTest(unittest.TestCase):
                 "SELECT * FROM paper_orders WHERE paper_order_id = ?",
                 ("po-fill-ts",),
             ).fetchone()
-            self.worker.reconcile_paper_order(
-                conn,
-                second_order_row,
-                self._broker_result(
-                    "broker-fill-ts",
-                    broker_status_raw="filled",
-                    filled_ts_utc="2026-03-25T15:05:00+00:00",
-                    filled_qty=0.5,
-                    filled_avg_price=101.5,
-                    last_broker_update_ts_utc="2026-03-25T15:06:00+00:00",
-                ),
-            )
+            with patch(
+                "trade_scout.execution.worker.submit_stop_order",
+                return_value=self._broker_result("broker-stop-fill-ts", broker_status_raw="submitted"),
+            ):
+                self.worker.reconcile_paper_order(
+                    conn,
+                    second_order_row,
+                    self._broker_result(
+                        "broker-fill-ts",
+                        broker_status_raw="filled",
+                        filled_ts_utc="2026-03-25T15:05:00+00:00",
+                        filled_qty=0.5,
+                        filled_avg_price=101.5,
+                        last_broker_update_ts_utc="2026-03-25T15:06:00+00:00",
+                    ),
+                )
 
             fill_row = get_paper_fill_by_order_id_and_role(conn, "po-fill-ts", "ENTRY")
             plan_row = conn.execute(
@@ -786,6 +1070,9 @@ class ExecutionWorkerTest(unittest.TestCase):
             "trade_scout.execution.worker.submit_validated_order",
             return_value=self._broker_result("broker-4", broker_status_raw="submitted"),
         ), patch(
+            "trade_scout.execution.worker.submit_stop_order",
+            return_value=self._broker_result("broker-stop-sync", broker_status_raw="submitted"),
+        ), patch(
             "trade_scout.execution.worker.fetch_broker_order_by_id",
             side_effect=lambda broker_order_id: (
                 self._broker_result(
@@ -816,6 +1103,10 @@ class ExecutionWorkerTest(unittest.TestCase):
                 "SELECT * FROM paper_trade_plans WHERE request_id = ?",
                 ("req-sync",),
             ).fetchone()
+            synced_stop_order = conn.execute(
+                "SELECT * FROM paper_orders WHERE plan_id = ? AND order_role = ?",
+                ("plan-req-sync", "STOP"),
+            ).fetchone()
             new_request_order = conn.execute(
                 "SELECT * FROM paper_orders WHERE request_id = ?",
                 ("req-4",),
@@ -830,7 +1121,122 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual(0.5, synced_fill["fill_qty"])
         self.assertEqual(105.0, synced_fill["fill_px"])
         self.assertEqual("FILLED", synced_plan["entry_status"])
+        self.assertEqual("OPEN", synced_plan["position_status"])
+        self.assertIsNotNone(synced_stop_order)
         self.assertIsNotNone(new_request_order)
+
+    def test_stop_fill_creates_outcome_and_closes_plan(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(
+                conn,
+                request_id="req-close",
+                entry_status="FILLED",
+                entry_filled_qty=1.0,
+                entry_avg_fill_px=100.0,
+                entry_fill_ts_utc="2026-03-26T14:00:00+00:00",
+                position_status="OPEN",
+            )
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-stop-close",
+                request_id="req-close",
+                client_order_id="req-close:STOP",
+                broker_order_id="broker-stop-close",
+                order_status="SUBMITTED",
+                order_role="STOP",
+                parent_paper_order_id="po-entry-close",
+                side="SHORT",
+                stop_price=95.0,
+            )
+            stop_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+                ("po-stop-close",),
+            ).fetchone()
+
+            reconciled = self.worker.reconcile_paper_order(
+                conn,
+                stop_row,
+                self._broker_result(
+                    "broker-stop-close",
+                    broker_status_raw="filled",
+                    filled_ts_utc="2026-03-26T14:10:00+00:00",
+                    filled_qty=1.0,
+                    filled_avg_price=95.0,
+                ),
+            )
+            stop_fill = get_paper_fill_by_order_id_and_role(conn, "po-stop-close", "STOP")
+            outcome_row = conn.execute(
+                "SELECT * FROM paper_trade_outcomes WHERE plan_id = ?",
+                ("plan-req-close",),
+            ).fetchone()
+            plan_row = conn.execute(
+                "SELECT * FROM paper_trade_plans WHERE request_id = ?",
+                ("req-close",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual("FILLED", reconciled["order_status"])
+        self.assertIsNotNone(stop_fill)
+        self.assertEqual("STOP", stop_fill["fill_role"])
+        self.assertIsNotNone(outcome_row)
+        self.assertEqual("STOP", outcome_row["exit_reason"])
+        self.assertEqual(1, outcome_row["closed"])
+        self.assertEqual(-5.0, outcome_row["gross_pnl"])
+        self.assertEqual(-1.0, outcome_row["realized_r"])
+        self.assertEqual("CLOSED", plan_row["position_status"])
+        self.assertEqual("2026-03-26T14:10:00+00:00", plan_row["closed_ts_utc"])
+
+    def test_stop_filled_snapshot_is_outcome_idempotent(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(
+                conn,
+                request_id="req-close-idem",
+                entry_status="FILLED",
+                entry_filled_qty=1.0,
+                entry_avg_fill_px=100.0,
+                entry_fill_ts_utc="2026-03-26T14:00:00+00:00",
+                position_status="OPEN",
+            )
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-stop-close-idem",
+                request_id="req-close-idem",
+                client_order_id="req-close-idem:STOP",
+                broker_order_id="broker-stop-close-idem",
+                order_status="SUBMITTED",
+                order_role="STOP",
+                parent_paper_order_id="po-entry-close-idem",
+                side="SHORT",
+                stop_price=95.0,
+            )
+            stop_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+                ("po-stop-close-idem",),
+            ).fetchone()
+            snapshot = self._broker_result(
+                "broker-stop-close-idem",
+                broker_status_raw="filled",
+                filled_ts_utc="2026-03-26T14:15:00+00:00",
+                filled_qty=1.0,
+                filled_avg_price=95.0,
+            )
+            self.worker.reconcile_paper_order(conn, stop_row, snapshot)
+            second_stop_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+                ("po-stop-close-idem",),
+            ).fetchone()
+            self.worker.reconcile_paper_order(conn, second_stop_row, snapshot)
+            outcome_count = conn.execute(
+                "SELECT COUNT(*) AS n FROM paper_trade_outcomes WHERE plan_id = ?",
+                ("plan-req-close-idem",),
+            ).fetchone()["n"]
+        finally:
+            conn.close()
+
+        self.assertEqual(1, outcome_count)
 
     def test_role_aware_lookup_returns_only_entry_order(self) -> None:
         conn = get_connection(self.db_path)
@@ -1035,6 +1441,13 @@ class ExecutionWorkerTest(unittest.TestCase):
         *,
         request_id: str,
         entry_status: str = "PENDING",
+        entry_filled_qty: float | None = None,
+        entry_avg_fill_px: float | None = None,
+        entry_fill_ts_utc: str | None = None,
+        position_status: str = "PENDING_ENTRY",
+        protective_stop_order_id: str | None = None,
+        closed_ts_utc: str | None = None,
+        stop_px: float | None = 95.0,
     ) -> None:
         conn.execute(
             """
@@ -1046,14 +1459,18 @@ class ExecutionWorkerTest(unittest.TestCase):
                 symbol,
                 side,
                 entry_type,
+                stop_px,
                 plan_rules_json,
                 plan_status,
                 entry_status,
                 entry_filled_qty,
                 entry_avg_fill_px,
                 entry_fill_ts_utc,
+                position_status,
+                protective_stop_order_id,
+                closed_ts_utc,
                 schema_version
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 "plan-" + request_id,
@@ -1063,12 +1480,16 @@ class ExecutionWorkerTest(unittest.TestCase):
                 "AAPL",
                 "LONG",
                 "MARKET",
+                stop_px,
                 "{}",
                 "CREATED",
                 entry_status,
-                None,
-                None,
-                None,
+                entry_filled_qty,
+                entry_avg_fill_px,
+                entry_fill_ts_utc,
+                position_status,
+                protective_stop_order_id,
+                closed_ts_utc,
                 "1",
             ),
         )
@@ -1086,6 +1507,10 @@ class ExecutionWorkerTest(unittest.TestCase):
         broker_status_raw: str = "submitted",
         accepted_ts_utc: str | None = "2026-03-25T14:00:01+00:00",
         filled_ts_utc: str | None = None,
+        order_role: str = "ENTRY",
+        parent_paper_order_id: str | None = None,
+        side: str = "LONG",
+        stop_price: float | None = None,
     ) -> None:
         conn.execute(
             """
@@ -1105,6 +1530,7 @@ class ExecutionWorkerTest(unittest.TestCase):
                 time_in_force,
                 qty,
                 notional,
+                stop_price,
                 submitted_ts_utc,
                 accepted_ts_utc,
                 filled_ts_utc,
@@ -1113,7 +1539,7 @@ class ExecutionWorkerTest(unittest.TestCase):
                 last_broker_update_ts_utc,
                 raw_response_json,
                 schema_version
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 paper_order_id,
@@ -1123,14 +1549,15 @@ class ExecutionWorkerTest(unittest.TestCase):
                 "alpaca_paper",
                 broker_order_id,
                 client_order_id,
-                None,
-                "ENTRY",
+                parent_paper_order_id,
+                order_role,
                 "AAPL",
-                "LONG",
+                side,
                 "market",
                 "gtc",
                 None,
                 25.0,
+                stop_price,
                 "2026-03-25T14:00:00+00:00",
                 accepted_ts_utc,
                 filled_ts_utc,

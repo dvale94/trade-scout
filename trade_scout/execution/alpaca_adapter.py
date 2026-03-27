@@ -118,6 +118,48 @@ def submit_market_order(
     return _normalize_order_result(response_json)
 
 
+def submit_stop_order(
+    *,
+    client_order_id: str,
+    symbol: str,
+    side: str,
+    qty: float,
+    stop_price: float,
+) -> BrokerOrderResult:
+    _require_alpaca_config()
+
+    normalized_symbol = str(symbol).strip()
+    normalized_side = _map_side(side)
+    if not normalized_symbol:
+        raise RuntimeError("Stop order is missing symbol for Alpaca submission")
+    if qty <= 0:
+        raise RuntimeError("Stop order qty must be greater than 0")
+    if stop_price <= 0:
+        raise RuntimeError("Stop order stop_price must be greater than 0")
+
+    payload = {
+        "symbol": normalized_symbol,
+        "side": normalized_side,
+        "type": "stop",
+        "time_in_force": "gtc",
+        "qty": str(qty),
+        "stop_price": str(stop_price),
+        "client_order_id": client_order_id,
+    }
+
+    url = f"{config.ALPACA_BASE_URL.rstrip('/')}/v2/orders"
+    response = requests.post(url, json=payload, headers=_auth_headers(), timeout=15)
+    response_json = _parse_response_json(response)
+
+    if response.status_code >= 400:
+        detail = response_json if isinstance(response_json, dict) else {"response": response_json}
+        raise RuntimeError(
+            f"Alpaca stop submission failed status={response.status_code} detail={json.dumps(detail, sort_keys=True)}"
+        )
+
+    return _normalize_order_result(response_json)
+
+
 def get_order_by_client_order_id(request_id: str) -> BrokerOrderResult | None:
     _require_alpaca_config()
 

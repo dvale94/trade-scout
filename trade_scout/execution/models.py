@@ -25,12 +25,20 @@ class PaperTradePlanEntryStatus(str, Enum):
     FILLED = "FILLED"
 
 
+class PaperTradePlanPositionStatus(str, Enum):
+    PENDING_ENTRY = "PENDING_ENTRY"
+    OPEN = "OPEN"
+    CLOSED = "CLOSED"
+
+
 class PaperOrderRole(str, Enum):
     ENTRY = "ENTRY"
+    STOP = "STOP"
 
 
 class PaperFillRole(str, Enum):
     ENTRY = "ENTRY"
+    STOP = "STOP"
 
 
 class PaperOrderStatus(str, Enum):
@@ -41,6 +49,10 @@ class PaperOrderStatus(str, Enum):
     CANCELED = "CANCELED"
     REJECTED = "REJECTED"
     EXPIRED = "EXPIRED"
+
+
+class PaperTradeOutcomeStatus(str, Enum):
+    CLOSED = "CLOSED"
 
 
 @dataclass(frozen=True)

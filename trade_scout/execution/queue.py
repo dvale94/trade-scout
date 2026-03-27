@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timezone
 from typing import Optional
@@ -13,7 +14,9 @@ from trade_scout.execution.models import (
     PaperOrderRole,
     PaperOrderStatus,
     PaperTradePlanEntryStatus,
+    PaperTradePlanPositionStatus,
     PaperTradePlanStatus,
+    PaperTradeOutcomeStatus,
 )
 
 
@@ -25,6 +28,7 @@ ACTIVE_REQUEST_STATUSES = (
 PAPER_TRADE_PLAN_SCHEMA_VERSION = "1"
 PAPER_ORDER_SCHEMA_VERSION = "1"
 PAPER_FILL_SCHEMA_VERSION = "1"
+PAPER_TRADE_OUTCOME_SCHEMA_VERSION = "1"
 PAPER_TRADE_PLAN_ENTRY_TYPE_MARKET = "MARKET"
 TERMINAL_PAPER_ORDER_STATUSES = (
     PaperOrderStatus.FILLED.value,
@@ -121,6 +125,9 @@ def init_db(db_path: str) -> None:
                 entry_filled_qty REAL,
                 entry_avg_fill_px REAL,
                 entry_fill_ts_utc TEXT,
+                position_status TEXT,
+                protective_stop_order_id TEXT,
+                closed_ts_utc TEXT,
                 schema_version TEXT NOT NULL
             )
             """
@@ -191,6 +198,47 @@ def init_db(db_path: str) -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS paper_trade_outcomes (
+                outcome_id TEXT PRIMARY KEY,
+                plan_id TEXT NOT NULL UNIQUE,
+                request_id TEXT NOT NULL,
+                alert_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                market_type TEXT,
+                strategy_profile TEXT,
+                strategy_version TEXT,
+                config_hash TEXT,
+                strategy_id TEXT,
+                setup_family TEXT,
+                strategy_params_json TEXT,
+                strategy_params_hash TEXT,
+                opened_ts_utc TEXT,
+                closed_ts_utc TEXT,
+                entry_fill_ts_utc TEXT,
+                entry_avg_px REAL,
+                entry_qty REAL,
+                exit_fill_ts_utc TEXT,
+                exit_avg_px REAL,
+                exit_qty REAL,
+                exit_reason TEXT NOT NULL,
+                gross_pnl REAL,
+                fees REAL,
+                net_pnl REAL,
+                planned_stop_px REAL,
+                planned_t1_px REAL,
+                planned_t2_px REAL,
+                realized_r REAL,
+                entered INTEGER NOT NULL,
+                closed INTEGER NOT NULL,
+                outcome_status TEXT NOT NULL,
+                raw_summary_json TEXT,
+                schema_version TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_exec_req_status
             ON execution_requests (status)
             """
@@ -241,6 +289,18 @@ def init_db(db_path: str) -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_paper_fills_plan_id
             ON paper_fills (plan_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_paper_trade_outcomes_request_id
+            ON paper_trade_outcomes (request_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_paper_trade_outcomes_alert_id
+            ON paper_trade_outcomes (alert_id)
             """
         )
         conn.execute(
@@ -589,8 +649,11 @@ def create_paper_trade_plan(
             entry_filled_qty,
             entry_avg_fill_px,
             entry_fill_ts_utc,
+            position_status,
+            protective_stop_order_id,
+            closed_ts_utc,
             schema_version
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             plan_id,
@@ -629,6 +692,9 @@ def create_paper_trade_plan(
             None,
             None,
             None,
+            PaperTradePlanPositionStatus.PENDING_ENTRY.value,
+            None,
+            None,
             schema_version,
         ),
     )
@@ -653,6 +719,9 @@ def insert_paper_order(
     notional: Optional[float],
     order_type: str,
     time_in_force: Optional[str],
+    order_role: str = PaperOrderRole.ENTRY.value,
+    parent_paper_order_id: str | None = None,
+    stop_price: float | None = None,
     result: BrokerOrderResult,
 ) -> sqlite3.Row:
     existing = get_paper_order_by_client_order_id(conn, client_order_id)
@@ -678,6 +747,7 @@ def insert_paper_order(
             time_in_force,
             qty,
             notional,
+            stop_price,
             submitted_ts_utc,
             accepted_ts_utc,
             broker_status_raw,
@@ -685,7 +755,7 @@ def insert_paper_order(
             last_broker_update_ts_utc,
             raw_response_json,
             schema_version
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             paper_order_id,
@@ -695,14 +765,15 @@ def insert_paper_order(
             broker,
             result.broker_order_id,
             client_order_id,
-            None,
-            PaperOrderRole.ENTRY.value,
+            parent_paper_order_id,
+            order_role,
             symbol,
             side,
             order_type,
             time_in_force,
             qty,
             notional,
+            stop_price,
             result.submitted_ts_utc,
             result.accepted_ts_utc,
             result.broker_status_raw,
@@ -774,6 +845,24 @@ def reconcile_paper_order_from_broker(
         WHERE paper_order_id = ?
         """,
         (paper_order_id,),
+    ).fetchone()
+
+
+def get_paper_order_by_plan_id_and_role(
+    conn: sqlite3.Connection,
+    plan_id: str,
+    order_role: str,
+) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT *
+        FROM paper_orders
+        WHERE plan_id = ?
+          AND order_role = ?
+        ORDER BY submitted_ts_utc ASC
+        LIMIT 1
+        """,
+        (plan_id, order_role),
     ).fetchone()
 
 
@@ -918,6 +1007,99 @@ def upsert_entry_fill_from_broker_snapshot(
     return get_paper_fill_by_order_id_and_role(conn, paper_order_id, fill_role)
 
 
+def upsert_paper_fill_from_broker_snapshot(
+    conn: sqlite3.Connection,
+    *,
+    paper_order_row: sqlite3.Row,
+    broker_snapshot: BrokerOrderResult,
+    fill_role: str,
+    entry_status: str | None = None,
+) -> sqlite3.Row | None:
+    if fill_role == PaperFillRole.ENTRY.value:
+        return upsert_entry_fill_from_broker_snapshot(
+            conn,
+            paper_order_row=paper_order_row,
+            broker_snapshot=broker_snapshot,
+            entry_status=entry_status or PaperTradePlanEntryStatus.FILLED.value,
+        )
+
+    if broker_snapshot.filled_qty is None or broker_snapshot.filled_avg_price is None:
+        return None
+    fill_ts_utc = broker_snapshot.filled_ts_utc or broker_snapshot.last_broker_update_ts_utc
+    if not fill_ts_utc:
+        return None
+
+    paper_order_id = str(paper_order_row["paper_order_id"])
+    existing_fill = get_paper_fill_by_order_id_and_role(conn, paper_order_id, fill_role)
+    paper_fill_id = (
+        str(existing_fill["paper_fill_id"])
+        if existing_fill is not None
+        else f"{paper_order_id}:{fill_role}"
+    )
+    gross_notional = broker_snapshot.filled_qty * broker_snapshot.filled_avg_price
+
+    conn.execute(
+        """
+        INSERT INTO paper_fills (
+            paper_fill_id,
+            plan_id,
+            request_id,
+            alert_id,
+            paper_order_id,
+            broker,
+            broker_order_id,
+            broker_fill_id,
+            fill_role,
+            symbol,
+            side,
+            fill_ts_utc,
+            fill_px,
+            fill_qty,
+            gross_notional,
+            fee,
+            liquidity,
+            fill_sequence,
+            raw_fill_json,
+            schema_version
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(paper_fill_id) DO UPDATE SET
+            broker_fill_id = excluded.broker_fill_id,
+            fill_ts_utc = excluded.fill_ts_utc,
+            fill_px = excluded.fill_px,
+            fill_qty = excluded.fill_qty,
+            gross_notional = excluded.gross_notional,
+            fee = excluded.fee,
+            liquidity = excluded.liquidity,
+            fill_sequence = excluded.fill_sequence,
+            raw_fill_json = excluded.raw_fill_json
+        """,
+        (
+            paper_fill_id,
+            str(paper_order_row["plan_id"]),
+            str(paper_order_row["request_id"]),
+            str(paper_order_row["alert_id"]),
+            paper_order_id,
+            str(paper_order_row["broker"]),
+            str(paper_order_row["broker_order_id"]),
+            None,
+            fill_role,
+            str(paper_order_row["symbol"]),
+            str(paper_order_row["side"]),
+            fill_ts_utc,
+            broker_snapshot.filled_avg_price,
+            broker_snapshot.filled_qty,
+            gross_notional,
+            None,
+            None,
+            1,
+            broker_snapshot.raw_response_json,
+            PAPER_FILL_SCHEMA_VERSION,
+        ),
+    )
+    conn.commit()
+    return get_paper_fill_by_order_id_and_role(conn, paper_order_id, fill_role)
+
+
 def update_trade_plan_entry_summary(
     conn: sqlite3.Connection,
     *,
@@ -953,3 +1135,262 @@ def update_trade_plan_entry_summary(
         """,
         (plan_id,),
     ).fetchone()
+
+
+def update_trade_plan_position_open(
+    conn: sqlite3.Connection,
+    *,
+    plan_id: str,
+    protective_stop_order_id: str | None = None,
+) -> sqlite3.Row | None:
+    conn.execute(
+        """
+        UPDATE paper_trade_plans
+        SET position_status = ?,
+            protective_stop_order_id = COALESCE(?, protective_stop_order_id)
+        WHERE plan_id = ?
+        """,
+        (
+            PaperTradePlanPositionStatus.OPEN.value,
+            protective_stop_order_id,
+            plan_id,
+        ),
+    )
+    conn.commit()
+    return conn.execute(
+        "SELECT * FROM paper_trade_plans WHERE plan_id = ?",
+        (plan_id,),
+    ).fetchone()
+
+
+def update_trade_plan_position_closed(
+    conn: sqlite3.Connection,
+    *,
+    plan_id: str,
+    closed_ts_utc: str,
+) -> sqlite3.Row | None:
+    conn.execute(
+        """
+        UPDATE paper_trade_plans
+        SET position_status = ?,
+            closed_ts_utc = ?
+        WHERE plan_id = ?
+        """,
+        (
+            PaperTradePlanPositionStatus.CLOSED.value,
+            closed_ts_utc,
+            plan_id,
+        ),
+    )
+    conn.commit()
+    return conn.execute(
+        "SELECT * FROM paper_trade_plans WHERE plan_id = ?",
+        (plan_id,),
+    ).fetchone()
+
+
+def get_trade_outcome_by_plan_id(
+    conn: sqlite3.Connection,
+    plan_id: str,
+) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT *
+        FROM paper_trade_outcomes
+        WHERE plan_id = ?
+        """,
+        (plan_id,),
+    ).fetchone()
+
+
+def create_trade_outcome_from_stop_fill(
+    conn: sqlite3.Connection,
+    *,
+    plan_row: sqlite3.Row,
+    stop_fill_row: sqlite3.Row,
+) -> sqlite3.Row:
+    existing = get_trade_outcome_by_plan_id(conn, str(plan_row["plan_id"]))
+    if existing is not None:
+        return existing
+
+    entry_qty = _optional_float(plan_row["entry_filled_qty"])
+    entry_avg_px = _optional_float(plan_row["entry_avg_fill_px"])
+    exit_qty = _optional_float(stop_fill_row["fill_qty"])
+    exit_avg_px = _optional_float(stop_fill_row["fill_px"])
+    planned_stop_px = _optional_float(plan_row["stop_px"])
+    gross_pnl = _compute_gross_pnl(
+        side=str(plan_row["side"]),
+        entry_avg_px=entry_avg_px,
+        exit_avg_px=exit_avg_px,
+        exit_qty=exit_qty,
+    )
+    realized_r = _compute_realized_r(
+        side=str(plan_row["side"]),
+        entry_avg_px=entry_avg_px,
+        entry_qty=entry_qty,
+        exit_avg_px=exit_avg_px,
+        exit_qty=exit_qty,
+        planned_stop_px=planned_stop_px,
+    )
+    closed_ts_utc = str(stop_fill_row["fill_ts_utc"])
+    entry_order_row = get_paper_order_by_plan_id_and_role(
+        conn,
+        str(plan_row["plan_id"]),
+        PaperOrderRole.ENTRY.value,
+    )
+    entry_fill_id = None
+    if entry_order_row is not None:
+        entry_fill_row = get_paper_fill_by_order_id_and_role(
+            conn,
+            str(entry_order_row["paper_order_id"]),
+            PaperFillRole.ENTRY.value,
+        )
+        if entry_fill_row is not None:
+            entry_fill_id = str(entry_fill_row["paper_fill_id"])
+    raw_summary_json = json.dumps(
+        {
+            "entry_fill_id": entry_fill_id,
+            "exit_fill_id": str(stop_fill_row["paper_fill_id"]),
+            "exit_reason": "STOP",
+        },
+        sort_keys=True,
+    )
+    outcome_id = f"{plan_row['plan_id']}:OUTCOME"
+    conn.execute(
+        """
+        INSERT INTO paper_trade_outcomes (
+            outcome_id,
+            plan_id,
+            request_id,
+            alert_id,
+            symbol,
+            side,
+            market_type,
+            strategy_profile,
+            strategy_version,
+            config_hash,
+            strategy_id,
+            setup_family,
+            strategy_params_json,
+            strategy_params_hash,
+            opened_ts_utc,
+            closed_ts_utc,
+            entry_fill_ts_utc,
+            entry_avg_px,
+            entry_qty,
+            exit_fill_ts_utc,
+            exit_avg_px,
+            exit_qty,
+            exit_reason,
+            gross_pnl,
+            fees,
+            net_pnl,
+            planned_stop_px,
+            planned_t1_px,
+            planned_t2_px,
+            realized_r,
+            entered,
+            closed,
+            outcome_status,
+            raw_summary_json,
+            schema_version
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            outcome_id,
+            str(plan_row["plan_id"]),
+            str(plan_row["request_id"]),
+            str(plan_row["alert_id"]),
+            str(plan_row["symbol"]),
+            str(plan_row["side"]),
+            _optional_str(plan_row["market_type"]),
+            _optional_str(plan_row["strategy_profile"]),
+            _optional_str(plan_row["strategy_version"]),
+            _optional_str(plan_row["config_hash"]),
+            _optional_str(plan_row["strategy_id"]),
+            _optional_str(plan_row["setup_family"]),
+            _optional_str(plan_row["strategy_params_json"]),
+            _optional_str(plan_row["strategy_params_hash"]),
+            _optional_str(plan_row["entry_fill_ts_utc"]),
+            closed_ts_utc,
+            _optional_str(plan_row["entry_fill_ts_utc"]),
+            entry_avg_px,
+            entry_qty,
+            closed_ts_utc,
+            exit_avg_px,
+            exit_qty,
+            "STOP",
+            gross_pnl,
+            None,
+            gross_pnl,
+            planned_stop_px,
+            _optional_float(plan_row["t1_px"]),
+            _optional_float(plan_row["t2_px"]),
+            realized_r,
+            1 if entry_qty is not None and entry_avg_px is not None else 0,
+            1,
+            PaperTradeOutcomeStatus.CLOSED.value,
+            raw_summary_json,
+            PAPER_TRADE_OUTCOME_SCHEMA_VERSION,
+        ),
+    )
+    conn.commit()
+    return get_trade_outcome_by_plan_id(conn, str(plan_row["plan_id"]))
+
+
+def _optional_str(value) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _optional_float(value) -> float | None:
+    if value is None or value == "":
+        return None
+    return float(value)
+
+
+def _compute_gross_pnl(
+    *,
+    side: str,
+    entry_avg_px: float | None,
+    exit_avg_px: float | None,
+    exit_qty: float | None,
+) -> float | None:
+    if entry_avg_px is None or exit_avg_px is None or exit_qty is None:
+        return None
+    if side == "LONG":
+        return (exit_avg_px - entry_avg_px) * exit_qty
+    if side == "SHORT":
+        return (entry_avg_px - exit_avg_px) * exit_qty
+    return None
+
+
+def _compute_realized_r(
+    *,
+    side: str,
+    entry_avg_px: float | None,
+    entry_qty: float | None,
+    exit_avg_px: float | None,
+    exit_qty: float | None,
+    planned_stop_px: float | None,
+) -> float | None:
+    gross_pnl = _compute_gross_pnl(
+        side=side,
+        entry_avg_px=entry_avg_px,
+        exit_avg_px=exit_avg_px,
+        exit_qty=exit_qty,
+    )
+    if gross_pnl is None or entry_avg_px is None or entry_qty is None or planned_stop_px is None:
+        return None
+    if side == "LONG":
+        risk_per_unit = entry_avg_px - planned_stop_px
+    elif side == "SHORT":
+        risk_per_unit = planned_stop_px - entry_avg_px
+    else:
+        return None
+    denominator = risk_per_unit * entry_qty
+    if denominator <= 0:
+        return None
+    return gross_pnl / denominator
