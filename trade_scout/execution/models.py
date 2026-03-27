@@ -34,11 +34,13 @@ class PaperTradePlanPositionStatus(str, Enum):
 class PaperOrderRole(str, Enum):
     ENTRY = "ENTRY"
     STOP = "STOP"
+    TP1 = "TP1"
 
 
 class PaperFillRole(str, Enum):
     ENTRY = "ENTRY"
     STOP = "STOP"
+    TP1 = "TP1"
 
 
 class PaperOrderStatus(str, Enum):
@@ -53,6 +55,12 @@ class PaperOrderStatus(str, Enum):
 
 class PaperTradeOutcomeStatus(str, Enum):
     CLOSED = "CLOSED"
+
+
+class PaperTradePlanPartialExitStatus(str, Enum):
+    NONE = "NONE"
+    TP1_PARTIAL = "TP1_PARTIAL"
+    FULLY_EXITED = "FULLY_EXITED"
 
 
 @dataclass(frozen=True)

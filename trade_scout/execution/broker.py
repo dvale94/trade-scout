@@ -6,6 +6,7 @@ from trade_scout.execution.alpaca_adapter import (
     get_order_by_broker_order_id,
     get_order_by_client_order_id,
     submit_market_order,
+    submit_limit_order as submit_alpaca_limit_order,
     submit_stop_order as submit_alpaca_stop_order,
 )
 from trade_scout.execution.models import BrokerOrderResult
@@ -45,4 +46,21 @@ def submit_stop_order(
         side=side,
         qty=qty,
         stop_price=stop_price,
+    )
+
+
+def submit_limit_order(
+    *,
+    client_order_id: str,
+    symbol: str,
+    side: str,
+    qty: float,
+    limit_price: float,
+) -> BrokerOrderResult:
+    return submit_alpaca_limit_order(
+        client_order_id=client_order_id,
+        symbol=symbol,
+        side=side,
+        qty=qty,
+        limit_price=limit_price,
     )

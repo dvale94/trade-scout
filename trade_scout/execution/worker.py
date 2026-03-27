@@ -11,6 +11,7 @@ from trade_scout.execution.broker import (
     fetch_broker_order_by_id,
     find_broker_order_by_client_order_id,
     find_existing_broker_order,
+    submit_limit_order,
     submit_stop_order,
     submit_validated_order,
 )
@@ -37,8 +38,11 @@ from trade_scout.execution.queue import (
     mark_submitted,
     mark_validated,
     reconcile_paper_order_from_broker,
+    update_open_stop_order_qty,
+    update_trade_plan_after_tp1_fill,
     update_trade_plan_position_closed,
     update_trade_plan_position_open,
+    update_trade_plan_tp1_pointer,
     upsert_paper_fill_from_broker_snapshot,
     upsert_entry_fill_from_broker_snapshot,
 )
@@ -47,6 +51,7 @@ from trade_scout.execution.models import (
     PaperOrderRole,
     PaperOrderStatus,
     PaperTradePlanEntryStatus,
+    PaperTradePlanPartialExitStatus,
 )
 
 
@@ -251,6 +256,16 @@ class ExecutionWorker:
                 broker_snapshot=broker_snapshot,
                 fill_role=PaperFillRole.STOP.value,
             )
+        elif order_role == PaperOrderRole.TP1.value and order_status in {
+            PaperOrderStatus.PARTIALLY_FILLED.value,
+            PaperOrderStatus.FILLED.value,
+        }:
+            fill_row = upsert_paper_fill_from_broker_snapshot(
+                conn,
+                paper_order_row=paper_order_row,
+                broker_snapshot=broker_snapshot,
+                fill_role=PaperFillRole.TP1.value,
+            )
         else:
             return
 
@@ -267,6 +282,13 @@ class ExecutionWorker:
         order_status = str(paper_order_row["order_status"])
         if order_role == PaperOrderRole.ENTRY.value and order_status == PaperOrderStatus.FILLED.value:
             self.ensure_protective_stop_for_entry_fill(conn, paper_order_row)
+            self.ensure_tp1_order_for_entry_fill(conn, paper_order_row)
+            return
+        if order_role == PaperOrderRole.TP1.value and order_status in {
+            PaperOrderStatus.PARTIALLY_FILLED.value,
+            PaperOrderStatus.FILLED.value,
+        }:
+            self.handle_tp1_fill(conn, paper_order_row)
             return
         if order_role == PaperOrderRole.STOP.value and order_status == PaperOrderStatus.FILLED.value:
             self.handle_closed_trade_from_stop_fill(conn, paper_order_row)
@@ -282,11 +304,13 @@ class ExecutionWorker:
             str(plan_row["plan_id"]),
             PaperOrderRole.STOP.value,
         )
+        remaining_qty = self._coerce_float(plan_row["entry_filled_qty"])
         if existing_stop_order is not None:
             update_trade_plan_position_open(
                 conn,
                 plan_id=str(plan_row["plan_id"]),
                 protective_stop_order_id=str(existing_stop_order["paper_order_id"]),
+                remaining_qty=remaining_qty,
             )
             return
 
@@ -324,6 +348,7 @@ class ExecutionWorker:
                 conn,
                 plan_id=str(plan_row["plan_id"]),
                 protective_stop_order_id=str(stop_order["paper_order_id"]),
+                remaining_qty=remaining_qty,
             )
             print(
                 f"[execution-worker] recovered protective stop plan_id={plan_row['plan_id']} "
@@ -367,11 +392,175 @@ class ExecutionWorker:
             conn,
             plan_id=str(plan_row["plan_id"]),
             protective_stop_order_id=str(stop_order["paper_order_id"]),
+            remaining_qty=remaining_qty,
         )
         print(
             f"[execution-worker] submitted protective stop plan_id={plan_row['plan_id']} "
             f"paper_order_id={stop_order['paper_order_id']}"
         )
+
+    def ensure_tp1_order_for_entry_fill(self, conn, entry_order_row) -> None:
+        plan_row = self._get_plan_row_by_id(conn, str(entry_order_row["plan_id"]))
+        if plan_row is None:
+            return
+
+        existing_tp1_order = get_paper_order_by_plan_id_and_role(
+            conn,
+            str(plan_row["plan_id"]),
+            PaperOrderRole.TP1.value,
+        )
+        if existing_tp1_order is not None:
+            update_trade_plan_tp1_pointer(
+                conn,
+                plan_id=str(plan_row["plan_id"]),
+                tp1_order_id=str(existing_tp1_order["paper_order_id"]),
+            )
+            return
+
+        t1_px = self._coerce_float(plan_row["t1_px"])
+        entry_filled_qty = self._coerce_float(plan_row["entry_filled_qty"])
+        tp1_qty = self._compute_tp1_qty(entry_filled_qty)
+        if t1_px is None or tp1_qty is None:
+            return
+
+        client_order_id = self._tp1_client_order_id(str(plan_row["request_id"]))
+        tp1_side = opposite_trade_side(str(plan_row["side"]))
+        try:
+            recovered = find_broker_order_by_client_order_id(client_order_id)
+        except Exception:
+            recovered = None
+        if recovered is not None:
+            tp1_order = insert_paper_order(
+                conn,
+                plan_id=str(plan_row["plan_id"]),
+                request_id=str(plan_row["request_id"]),
+                alert_id=str(plan_row["alert_id"]),
+                broker=recovered.broker,
+                client_order_id=client_order_id,
+                symbol=str(plan_row["symbol"]),
+                side=tp1_side,
+                qty=tp1_qty,
+                notional=None,
+                order_type="limit",
+                time_in_force="gtc",
+                order_role=PaperOrderRole.TP1.value,
+                parent_paper_order_id=str(entry_order_row["paper_order_id"]),
+                limit_price=t1_px,
+                reduce_only=1,
+                result=recovered,
+            )
+            update_trade_plan_tp1_pointer(
+                conn,
+                plan_id=str(plan_row["plan_id"]),
+                tp1_order_id=str(tp1_order["paper_order_id"]),
+            )
+            print(
+                f"[execution-worker] recovered tp1 order plan_id={plan_row['plan_id']} "
+                f"paper_order_id={tp1_order['paper_order_id']}"
+            )
+            return
+
+        try:
+            result = submit_limit_order(
+                client_order_id=client_order_id,
+                symbol=str(plan_row["symbol"]),
+                side=tp1_side,
+                qty=tp1_qty,
+                limit_price=t1_px,
+            )
+        except Exception as exc:
+            recovered = find_broker_order_by_client_order_id(client_order_id)
+            if recovered is None:
+                raise exc
+            result = recovered
+        tp1_order = insert_paper_order(
+            conn,
+            plan_id=str(plan_row["plan_id"]),
+            request_id=str(plan_row["request_id"]),
+            alert_id=str(plan_row["alert_id"]),
+            broker=result.broker,
+            client_order_id=client_order_id,
+            symbol=str(plan_row["symbol"]),
+            side=tp1_side,
+            qty=tp1_qty,
+            notional=None,
+            order_type="limit",
+            time_in_force="gtc",
+            order_role=PaperOrderRole.TP1.value,
+            parent_paper_order_id=str(entry_order_row["paper_order_id"]),
+            limit_price=t1_px,
+            reduce_only=1,
+            result=result,
+        )
+        update_trade_plan_tp1_pointer(
+            conn,
+            plan_id=str(plan_row["plan_id"]),
+            tp1_order_id=str(tp1_order["paper_order_id"]),
+        )
+        print(
+            f"[execution-worker] submitted tp1 order plan_id={plan_row['plan_id']} "
+            f"paper_order_id={tp1_order['paper_order_id']}"
+        )
+
+    def handle_tp1_fill(self, conn, tp1_order_row) -> None:
+        tp1_fill_row = get_paper_fill_by_order_id_and_role(
+            conn,
+            str(tp1_order_row["paper_order_id"]),
+            PaperFillRole.TP1.value,
+        )
+        if tp1_fill_row is None:
+            return
+
+        plan_row = self._get_plan_row_by_id(conn, str(tp1_order_row["plan_id"]))
+        if plan_row is None:
+            return
+
+        entry_filled_qty = self._coerce_float(plan_row["entry_filled_qty"])
+        tp1_filled_qty = self._coerce_float(tp1_fill_row["fill_qty"])
+        tp1_avg_fill_px = self._coerce_float(tp1_fill_row["fill_px"])
+        tp1_fill_ts_utc = self._coerce_optional_str(tp1_fill_row["fill_ts_utc"])
+        if entry_filled_qty is None or tp1_filled_qty is None or tp1_avg_fill_px is None or not tp1_fill_ts_utc:
+            return
+
+        remaining_qty = max(entry_filled_qty - tp1_filled_qty, 0.0)
+        partial_exit_status = (
+            PaperTradePlanPartialExitStatus.TP1_PARTIAL.value
+            if remaining_qty > 0
+            else PaperTradePlanPartialExitStatus.FULLY_EXITED.value
+        )
+        update_trade_plan_after_tp1_fill(
+            conn,
+            plan_id=str(plan_row["plan_id"]),
+            tp1_order_id=str(tp1_order_row["paper_order_id"]),
+            tp1_filled_qty=tp1_filled_qty,
+            tp1_avg_fill_px=tp1_avg_fill_px,
+            tp1_fill_ts_utc=tp1_fill_ts_utc,
+            remaining_qty=remaining_qty,
+            partial_exit_status=partial_exit_status,
+        )
+        self.align_stop_to_remaining_qty(conn, str(plan_row["plan_id"]), remaining_qty)
+
+    def align_stop_to_remaining_qty(self, conn, plan_id: str, remaining_qty: float) -> None:
+        stop_order_row = get_paper_order_by_plan_id_and_role(
+            conn,
+            plan_id,
+            PaperOrderRole.STOP.value,
+        )
+        if stop_order_row is None:
+            return
+        current_qty = self._coerce_float(stop_order_row["qty"])
+        if current_qty == remaining_qty:
+            return
+        updated_row = update_open_stop_order_qty(
+            conn,
+            paper_order_id=str(stop_order_row["paper_order_id"]),
+            qty=remaining_qty,
+        )
+        if updated_row is not None:
+            print(
+                f"[execution-worker] aligned local stop qty plan_id={plan_id} "
+                f"paper_order_id={updated_row['paper_order_id']} qty={remaining_qty}"
+            )
 
     def handle_closed_trade_from_stop_fill(self, conn, stop_order_row) -> None:
         stop_fill_row = get_paper_fill_by_order_id_and_role(
@@ -682,6 +871,19 @@ class ExecutionWorker:
     @staticmethod
     def _protective_stop_client_order_id(request_id: str) -> str:
         return f"{request_id}:STOP"
+
+    @staticmethod
+    def _tp1_client_order_id(request_id: str) -> str:
+        return f"{request_id}:TP1"
+
+    @staticmethod
+    def _compute_tp1_qty(entry_filled_qty: float | None) -> float | None:
+        if entry_filled_qty is None or entry_filled_qty <= 0:
+            return None
+        tp1_qty = entry_filled_qty / 2.0
+        if tp1_qty <= 0:
+            return None
+        return tp1_qty
 
 
 def normalize_broker_order_status(raw_status: Any) -> str:
