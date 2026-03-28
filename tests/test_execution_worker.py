@@ -1064,7 +1064,7 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual("PENDING", plan_row["entry_status"])
         self.assertIsNone(plan_row["entry_filled_qty"])
 
-    def test_tp1_fill_replaces_broker_stop_to_remaining_qty(self) -> None:
+    def test_tp1_fill_replaces_broker_stop_to_breakeven_remaining_qty(self) -> None:
         conn = get_connection(self.db_path)
         try:
             self._insert_trade_plan_row(
@@ -1174,6 +1174,7 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual(replacement_stop_row["paper_order_id"], old_stop_row["superseded_by_paper_order_id"])
         self.assertEqual("po-stop-tp1-fill", replacement_stop_row["replaced_from_paper_order_id"])
         self.assertEqual(5.0, replacement_stop_row["qty"])
+        self.assertEqual(100.05, replacement_stop_row["stop_price"])
         self.assertEqual(replacement_stop_row["paper_order_id"], plan_row["protective_stop_order_id"])
         self.assertEqual(0, outcome_count)
 
@@ -1276,6 +1277,7 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual(2, len(stop_order_rows))
         self.assertEqual("REPLACED", stop_order_rows[0]["order_status"])
         self.assertEqual("SUBMITTED", stop_order_rows[1]["order_status"])
+        self.assertEqual(100.05, stop_order_rows[1]["stop_price"])
         self.assertEqual(0, outcome_count)
 
     def test_cancel_success_and_replacement_failure_leaves_truthful_unprotected_state(self) -> None:
@@ -1322,7 +1324,7 @@ class ExecutionWorkerTest(unittest.TestCase):
                 return_value=None,
             ):
                 with self.assertRaisesRegex(RuntimeError, "replacement submit failed"):
-                    self.worker.align_stop_to_remaining_qty(conn, "plan-req-stop-fail", 5.0)
+                    self.worker.maybe_move_stop_to_breakeven(conn, "plan-req-stop-fail", 5.0)
 
             old_stop_row = conn.execute(
                 "SELECT * FROM paper_orders WHERE paper_order_id = ?",
@@ -1348,7 +1350,7 @@ class ExecutionWorkerTest(unittest.TestCase):
                 "trade_scout.execution.worker.find_broker_order_by_client_order_id",
                 return_value=None,
             ):
-                self.worker.align_stop_to_remaining_qty(conn, "plan-req-stop-fail", 5.0)
+                self.worker.maybe_move_stop_to_breakeven(conn, "plan-req-stop-fail", 5.0)
 
             replacement_stop_row = conn.execute(
                 "SELECT * FROM paper_orders WHERE client_order_id = ?",
@@ -1366,6 +1368,7 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertIsNone(plan_row["protective_stop_order_id"])
         self.assertIsNone(current_stop_row)
         self.assertIsNotNone(replacement_stop_row)
+        self.assertEqual(100.05, replacement_stop_row["stop_price"])
         self.assertEqual(replacement_stop_row["paper_order_id"], refreshed_plan_row["protective_stop_order_id"])
 
     def test_current_stop_selection_ignores_canceled_stop_after_replace_cancel(self) -> None:
@@ -1407,7 +1410,7 @@ class ExecutionWorkerTest(unittest.TestCase):
 
         self.assertIsNone(current_stop_row)
 
-    def test_no_stop_replace_when_current_stop_already_matches_remaining_qty(self) -> None:
+    def test_no_stop_replace_when_current_stop_already_matches_remaining_qty_and_breakeven(self) -> None:
         conn = get_connection(self.db_path)
         try:
             self._insert_trade_plan_row(
@@ -1447,7 +1450,7 @@ class ExecutionWorkerTest(unittest.TestCase):
                 parent_paper_order_id="po-entry-stop-aligned",
                 side="SHORT",
                 qty=5.0,
-                stop_price=95.0,
+                stop_price=100.05,
                 replaced_from_paper_order_id="po-stop-aligned-old",
             )
 
@@ -1458,7 +1461,7 @@ class ExecutionWorkerTest(unittest.TestCase):
                 "trade_scout.execution.worker.submit_stop_order",
                 side_effect=AssertionError("submit_stop_order should not be called"),
             ):
-                self.worker.align_stop_to_remaining_qty(conn, "plan-req-stop-aligned", 5.0)
+                self.worker.maybe_move_stop_to_breakeven(conn, "plan-req-stop-aligned", 5.0)
 
             plan_row = conn.execute(
                 "SELECT * FROM paper_trade_plans WHERE request_id = ?",
@@ -1514,7 +1517,7 @@ class ExecutionWorkerTest(unittest.TestCase):
                 parent_paper_order_id="po-entry-stop-recover",
                 side="SHORT",
                 qty=5.0,
-                stop_price=95.0,
+                stop_price=100.05,
                 replaced_from_paper_order_id="po-stop-recover-old",
             )
 
@@ -1525,7 +1528,7 @@ class ExecutionWorkerTest(unittest.TestCase):
                 "trade_scout.execution.worker.submit_stop_order",
                 side_effect=AssertionError("submit_stop_order should not be called"),
             ):
-                self.worker.align_stop_to_remaining_qty(conn, "plan-req-stop-recover", 5.0)
+                self.worker.maybe_move_stop_to_breakeven(conn, "plan-req-stop-recover", 5.0)
 
             plan_row = conn.execute(
                 "SELECT * FROM paper_trade_plans WHERE request_id = ?",
@@ -1535,6 +1538,163 @@ class ExecutionWorkerTest(unittest.TestCase):
             conn.close()
 
         self.assertEqual("po-stop-recover-r2", plan_row["protective_stop_order_id"])
+
+    def test_no_breakeven_replace_before_tp1_partial_exit(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(
+                conn,
+                request_id="req-no-breakeven",
+                entry_status="FILLED",
+                entry_filled_qty=10.0,
+                entry_avg_fill_px=100.0,
+                entry_fill_ts_utc="2026-03-26T14:00:00+00:00",
+                position_status="OPEN",
+                protective_stop_order_id="po-stop-no-breakeven",
+                remaining_qty=10.0,
+                partial_exit_status="NONE",
+            )
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-stop-no-breakeven",
+                request_id="req-no-breakeven",
+                client_order_id="req-no-breakeven:STOP",
+                broker_order_id="broker-stop-no-breakeven",
+                order_status="SUBMITTED",
+                order_role="STOP",
+                parent_paper_order_id="po-entry-no-breakeven",
+                side="SHORT",
+                qty=10.0,
+                stop_price=95.0,
+            )
+
+            with patch(
+                "trade_scout.execution.worker.cancel_broker_order",
+                side_effect=AssertionError("cancel_broker_order should not be called"),
+            ), patch(
+                "trade_scout.execution.worker.submit_stop_order",
+                side_effect=AssertionError("submit_stop_order should not be called"),
+            ):
+                self.worker.maybe_move_stop_to_breakeven(
+                    conn,
+                    "plan-req-no-breakeven",
+                    10.0,
+                )
+
+            stop_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+                ("po-stop-no-breakeven",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(95.0, stop_row["stop_price"])
+
+    def test_short_trade_tp1_fill_moves_stop_to_breakeven(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            conn.execute(
+                """
+                INSERT INTO paper_trade_plans (
+                    plan_id,
+                    request_id,
+                    alert_id,
+                    created_ts_utc,
+                    symbol,
+                    side,
+                    entry_type,
+                    stop_px,
+                    t1_px,
+                    plan_rules_json,
+                    plan_status,
+                    entry_status,
+                    entry_filled_qty,
+                    entry_avg_fill_px,
+                    entry_fill_ts_utc,
+                    position_status,
+                    protective_stop_order_id,
+                    tp1_order_id,
+                    tp1_filled_qty,
+                    tp1_avg_fill_px,
+                    tp1_fill_ts_utc,
+                    remaining_qty,
+                    partial_exit_status,
+                    closed_ts_utc,
+                    schema_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "plan-req-short-breakeven",
+                    "req-short-breakeven",
+                    "alert-req-short-breakeven",
+                    "2026-03-25T14:00:00+00:00",
+                    "AAPL",
+                    "SHORT",
+                    "MARKET",
+                    105.0,
+                    90.0,
+                    "{}",
+                    "CREATED",
+                    "FILLED",
+                    10.0,
+                    100.0,
+                    "2026-03-26T14:00:00+00:00",
+                    "OPEN",
+                    "po-stop-short-breakeven",
+                    "po-tp1-short-breakeven",
+                    5.0,
+                    90.0,
+                    "2026-03-26T14:05:00+00:00",
+                    5.0,
+                    "TP1_PARTIAL",
+                    None,
+                    "1",
+                ),
+            )
+            conn.commit()
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-stop-short-breakeven",
+                request_id="req-short-breakeven",
+                client_order_id="req-short-breakeven:STOP",
+                broker_order_id="broker-stop-short-breakeven",
+                order_status="SUBMITTED",
+                order_role="STOP",
+                parent_paper_order_id="po-entry-short-breakeven",
+                side="LONG",
+                qty=10.0,
+                stop_price=105.0,
+            )
+
+            with patch(
+                "trade_scout.execution.worker.cancel_broker_order",
+                return_value=self._broker_result(
+                    "broker-stop-short-breakeven",
+                    broker_status_raw="canceled",
+                    canceled_ts_utc="2026-03-26T14:10:01+00:00",
+                ),
+            ), patch(
+                "trade_scout.execution.worker.submit_stop_order",
+                return_value=self._broker_result(
+                    "broker-stop-short-breakeven-r2",
+                    broker_status_raw="submitted",
+                ),
+            ):
+                self.worker.maybe_move_stop_to_breakeven(
+                    conn,
+                    "plan-req-short-breakeven",
+                    5.0,
+                )
+
+            replacement_stop_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE client_order_id = ?",
+                ("req-short-breakeven:STOP:R2",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(5.0, replacement_stop_row["qty"])
+        self.assertEqual(99.95, replacement_stop_row["stop_price"])
 
     def test_remote_recovery_still_persists_normalized_order_by_client_order_id(self) -> None:
         self._insert_pending_request(request_id="req-3", alert_id="alert-3")

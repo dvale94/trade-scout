@@ -62,6 +62,9 @@ from trade_scout.execution.models import (
 )
 
 
+BREAKEVEN_BUFFER_BPS = 5.0
+
+
 @dataclass(frozen=True)
 class ExecutionWorkerConfig:
     db_path: str
@@ -545,9 +548,9 @@ class ExecutionWorker:
             remaining_qty=remaining_qty,
             partial_exit_status=partial_exit_status,
         )
-        self.align_stop_to_remaining_qty(conn, str(plan_row["plan_id"]), remaining_qty)
+        self.maybe_move_stop_to_breakeven(conn, str(plan_row["plan_id"]), remaining_qty)
 
-    def align_stop_to_remaining_qty(self, conn, plan_id: str, remaining_qty: float) -> None:
+    def maybe_move_stop_to_breakeven(self, conn, plan_id: str, remaining_qty: float) -> None:
         plan_row = self._get_plan_row_by_id(conn, plan_id)
         if plan_row is None:
             return
@@ -559,7 +562,43 @@ class ExecutionWorker:
             return
         if remaining_qty <= 0:
             return
+        breakeven_stop_price = self.get_breakeven_stop_price(plan_row)
+        if breakeven_stop_price is None:
+            return
+        self.align_stop_to_protection_target(
+            conn,
+            plan_id=plan_id,
+            desired_qty=remaining_qty,
+            desired_stop_price=breakeven_stop_price,
+        )
 
+    def align_stop_to_remaining_qty(self, conn, plan_id: str, remaining_qty: float) -> None:
+        plan_row = self._get_plan_row_by_id(conn, plan_id)
+        if plan_row is None:
+            return
+        stop_price = self._coerce_float(plan_row["stop_px"])
+        if stop_price is None:
+            return
+        self.align_stop_to_protection_target(
+            conn,
+            plan_id=plan_id,
+            desired_qty=remaining_qty,
+            desired_stop_price=stop_price,
+        )
+
+    def align_stop_to_protection_target(
+        self,
+        conn,
+        *,
+        plan_id: str,
+        desired_qty: float,
+        desired_stop_price: float,
+    ) -> None:
+        if desired_qty <= 0 or desired_stop_price <= 0:
+            return
+        plan_row = self._get_plan_row_by_id(conn, plan_id)
+        if plan_row is None:
+            return
         current_stop_order = get_current_paper_order_by_plan_id_and_role(
             conn,
             plan_id,
@@ -578,10 +617,11 @@ class ExecutionWorker:
                 conn,
                 plan_id=plan_id,
                 protective_stop_order_id=str(current_stop_order["paper_order_id"]),
-                remaining_qty=remaining_qty,
+                remaining_qty=desired_qty,
             )
             current_qty = self._coerce_float(current_stop_order["qty"])
-            if current_qty == remaining_qty:
+            current_stop_price = self._coerce_float(current_stop_order["stop_price"])
+            if current_qty == desired_qty and current_stop_price == desired_stop_price:
                 return
 
         replacement_client_order_id = self._next_stop_replace_client_order_id(
@@ -600,7 +640,7 @@ class ExecutionWorker:
                 conn,
                 plan_id=plan_id,
                 protective_stop_order_id=str(existing_replacement["paper_order_id"]),
-                remaining_qty=remaining_qty,
+                remaining_qty=desired_qty,
             )
             if (
                 current_stop_order is not None
@@ -621,9 +661,6 @@ class ExecutionWorker:
             recovered_replacement = None
 
         stop_side = opposite_trade_side(str(plan_row["side"]))
-        stop_price = self._coerce_float(plan_row["stop_px"])
-        if stop_price is None:
-            return
 
         if recovered_replacement is None and current_stop_order is not None:
             broker_order_id = self._coerce_optional_str(current_stop_order["broker_order_id"])
@@ -650,8 +687,8 @@ class ExecutionWorker:
                     client_order_id=replacement_client_order_id,
                     symbol=str(plan_row["symbol"]),
                     side=stop_side,
-                    qty=remaining_qty,
-                    stop_price=stop_price,
+                    qty=desired_qty,
+                    stop_price=desired_stop_price,
                 )
             except Exception as exc:
                 recovered_replacement = find_broker_order_by_client_order_id(
@@ -672,7 +709,7 @@ class ExecutionWorker:
             client_order_id=replacement_client_order_id,
             symbol=str(plan_row["symbol"]),
             side=stop_side,
-            qty=remaining_qty,
+            qty=desired_qty,
             notional=None,
             order_type="stop",
             time_in_force="gtc",
@@ -681,7 +718,7 @@ class ExecutionWorker:
             if latest_stop_order["parent_paper_order_id"]
             else None,
             replaced_from_paper_order_id=str(latest_stop_order["paper_order_id"]),
-            stop_price=stop_price,
+            stop_price=desired_stop_price,
             result=replacement_result,
         )
         if current_stop_order is not None:
@@ -700,12 +737,34 @@ class ExecutionWorker:
             conn,
             plan_id=plan_id,
             protective_stop_order_id=str(replacement_order["paper_order_id"]),
-            remaining_qty=remaining_qty,
+            remaining_qty=desired_qty,
         )
         print(
             f"[execution-worker] replaced protective stop plan_id={plan_id} "
-            f"paper_order_id={replacement_order['paper_order_id']} qty={remaining_qty}"
+            f"paper_order_id={replacement_order['paper_order_id']} "
+            f"qty={desired_qty} stop_price={desired_stop_price}"
         )
+
+    def get_breakeven_stop_price(self, plan_row) -> float | None:
+        remaining_qty = self._coerce_float(plan_row["remaining_qty"])
+        if remaining_qty is None or remaining_qty <= 0:
+            return None
+        if str(plan_row["position_status"]) != "OPEN":
+            return None
+        if self._coerce_optional_str(plan_row["partial_exit_status"]) != (
+            PaperTradePlanPartialExitStatus.TP1_PARTIAL.value
+        ):
+            return None
+        entry_avg_fill_px = self._coerce_float(plan_row["entry_avg_fill_px"])
+        if entry_avg_fill_px is None or entry_avg_fill_px <= 0:
+            return None
+        buffer_multiplier = BREAKEVEN_BUFFER_BPS / 10000.0
+        side = str(plan_row["side"])
+        if side == "LONG":
+            return entry_avg_fill_px * (1.0 + buffer_multiplier)
+        if side == "SHORT":
+            return entry_avg_fill_px * (1.0 - buffer_multiplier)
+        return None
 
     def handle_closed_trade_from_stop_fill(self, conn, stop_order_row) -> None:
         stop_fill_row = get_paper_fill_by_order_id_and_role(
