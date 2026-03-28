@@ -95,6 +95,10 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertIn("tp1_filled_qty", plan_columns)
         self.assertIn("tp1_avg_fill_px", plan_columns)
         self.assertIn("tp1_fill_ts_utc", plan_columns)
+        self.assertIn("tp2_order_id", plan_columns)
+        self.assertIn("tp2_filled_qty", plan_columns)
+        self.assertIn("tp2_avg_fill_px", plan_columns)
+        self.assertIn("tp2_fill_ts_utc", plan_columns)
         self.assertIn("remaining_qty", plan_columns)
         self.assertIn("partial_exit_status", plan_columns)
         self.assertIn("closed_ts_utc", plan_columns)
@@ -542,7 +546,7 @@ class ExecutionWorkerTest(unittest.TestCase):
         finally:
             conn.close()
 
-        self.assertEqual(3, row_count)
+        self.assertEqual(4, row_count)
         self.assertEqual(1, fill_count)
         self.assertEqual(dict(first), dict(second))
         self.assertEqual("FILLED", plan_row["entry_status"])
@@ -551,6 +555,7 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual("OPEN", plan_row["position_status"])
         self.assertIsNotNone(plan_row["protective_stop_order_id"])
         self.assertIsNotNone(plan_row["tp1_order_id"])
+        self.assertIsNotNone(plan_row["tp2_order_id"])
         self.assertEqual(0.75, plan_row["remaining_qty"])
 
     def test_filled_order_ingests_one_entry_fill_and_updates_plan_summary(self) -> None:
@@ -610,6 +615,7 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual("OPEN", plan_row["position_status"])
         self.assertIsNotNone(plan_row["protective_stop_order_id"])
         self.assertIsNotNone(plan_row["tp1_order_id"])
+        self.assertIsNotNone(plan_row["tp2_order_id"])
         self.assertEqual(0.8, plan_row["remaining_qty"])
 
     def test_filled_entry_creates_one_protective_stop_and_marks_plan_open(self) -> None:
@@ -671,6 +677,10 @@ class ExecutionWorkerTest(unittest.TestCase):
                 "SELECT * FROM paper_orders WHERE plan_id = ? AND order_role = ?",
                 ("plan-req-stop", "TP1"),
             ).fetchall()
+            tp2_orders = conn.execute(
+                "SELECT * FROM paper_orders WHERE plan_id = ? AND order_role = ?",
+                ("plan-req-stop", "TP2"),
+            ).fetchall()
             plan_row = conn.execute(
                 "SELECT * FROM paper_trade_plans WHERE request_id = ?",
                 ("req-stop",),
@@ -679,12 +689,14 @@ class ExecutionWorkerTest(unittest.TestCase):
             conn.close()
 
         self.assertEqual(1, submit_stop_mock.call_count)
-        self.assertEqual(1, submit_tp1_mock.call_count)
+        self.assertEqual(2, submit_tp1_mock.call_count)
         self.assertEqual(1, len(stop_orders))
         self.assertEqual(1, len(tp1_orders))
+        self.assertEqual(1, len(tp2_orders))
         self.assertEqual("OPEN", plan_row["position_status"])
         self.assertEqual(stop_orders[0]["paper_order_id"], plan_row["protective_stop_order_id"])
         self.assertEqual(tp1_orders[0]["paper_order_id"], plan_row["tp1_order_id"])
+        self.assertEqual(tp2_orders[0]["paper_order_id"], plan_row["tp2_order_id"])
         self.assertEqual(1.0, plan_row["remaining_qty"])
 
     def test_existing_stop_row_wins_over_plan_pointer_and_realigns_pointer(self) -> None:
@@ -848,6 +860,10 @@ class ExecutionWorkerTest(unittest.TestCase):
                 "SELECT COUNT(*) AS n FROM paper_orders WHERE plan_id = ? AND order_role = ?",
                 ("plan-req-no-stop", "TP1"),
             ).fetchone()["n"]
+            tp2_orders = conn.execute(
+                "SELECT COUNT(*) AS n FROM paper_orders WHERE plan_id = ? AND order_role = ?",
+                ("plan-req-no-stop", "TP2"),
+            ).fetchone()["n"]
             plan_row = conn.execute(
                 "SELECT * FROM paper_trade_plans WHERE request_id = ?",
                 ("req-no-stop",),
@@ -858,6 +874,7 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual(0, stop_orders)
         self.assertEqual("PENDING_ENTRY", plan_row["position_status"])
         self.assertEqual(0, tp1_orders)
+        self.assertEqual(0, tp2_orders)
 
     def test_partial_fill_ingests_or_updates_entry_fill_and_plan_summary(self) -> None:
         conn = get_connection(self.db_path)
@@ -1278,6 +1295,284 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual("REPLACED", stop_order_rows[0]["order_status"])
         self.assertEqual("SUBMITTED", stop_order_rows[1]["order_status"])
         self.assertEqual(100.05, stop_order_rows[1]["stop_price"])
+        self.assertEqual(0, outcome_count)
+
+    def test_tp2_fill_updates_plan_summary_and_closes_trade(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(
+                conn,
+                request_id="req-tp2-close",
+                entry_status="FILLED",
+                entry_filled_qty=10.0,
+                entry_avg_fill_px=100.0,
+                entry_fill_ts_utc="2026-03-26T14:00:00+00:00",
+                position_status="OPEN",
+                protective_stop_order_id="po-stop-tp2-close-r2",
+                tp1_order_id="po-tp1-tp2-close",
+                tp1_filled_qty=5.0,
+                tp1_avg_fill_px=110.0,
+                tp1_fill_ts_utc="2026-03-26T14:05:00+00:00",
+                tp2_order_id="po-tp2-close",
+                remaining_qty=5.0,
+                partial_exit_status="TP1_PARTIAL",
+            )
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-entry-tp2-close",
+                request_id="req-tp2-close",
+                client_order_id="req-tp2-close",
+                broker_order_id="broker-entry-tp2-close",
+                order_status="FILLED",
+                qty=10.0,
+            )
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-tp1-tp2-close",
+                request_id="req-tp2-close",
+                client_order_id="req-tp2-close:TP1",
+                broker_order_id="broker-tp1-tp2-close",
+                order_status="FILLED",
+                order_role="TP1",
+                parent_paper_order_id="po-entry-tp2-close",
+                side="SHORT",
+                qty=5.0,
+                limit_price=110.0,
+                reduce_only=1,
+            )
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-stop-tp2-close-r2",
+                request_id="req-tp2-close",
+                client_order_id="req-tp2-close:STOP:R2",
+                broker_order_id="broker-stop-tp2-close-r2",
+                order_status="SUBMITTED",
+                order_role="STOP",
+                parent_paper_order_id="po-entry-tp2-close",
+                side="SHORT",
+                qty=5.0,
+                stop_price=100.05,
+                replaced_from_paper_order_id="po-stop-tp2-close",
+            )
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-tp2-close",
+                request_id="req-tp2-close",
+                client_order_id="req-tp2-close:TP2",
+                broker_order_id="broker-tp2-close",
+                order_status="SUBMITTED",
+                order_role="TP2",
+                parent_paper_order_id="po-entry-tp2-close",
+                side="SHORT",
+                qty=5.0,
+                limit_price=115.0,
+                reduce_only=1,
+            )
+            conn.execute(
+                """
+                INSERT INTO paper_fills (
+                    paper_fill_id, plan_id, request_id, alert_id, paper_order_id, broker, broker_order_id,
+                    broker_fill_id, fill_role, symbol, side, fill_ts_utc, fill_px, fill_qty, gross_notional,
+                    fee, liquidity, fill_sequence, raw_fill_json, schema_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "po-entry-tp2-close:ENTRY",
+                    "plan-req-tp2-close",
+                    "req-tp2-close",
+                    "alert-req-tp2-close",
+                    "po-entry-tp2-close",
+                    "alpaca_paper",
+                    "broker-entry-tp2-close",
+                    None,
+                    "ENTRY",
+                    "AAPL",
+                    "LONG",
+                    "2026-03-26T14:00:00+00:00",
+                    100.0,
+                    10.0,
+                    1000.0,
+                    None,
+                    None,
+                    1,
+                    '{"id":"broker-entry-tp2-close"}',
+                    "1",
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO paper_fills (
+                    paper_fill_id, plan_id, request_id, alert_id, paper_order_id, broker, broker_order_id,
+                    broker_fill_id, fill_role, symbol, side, fill_ts_utc, fill_px, fill_qty, gross_notional,
+                    fee, liquidity, fill_sequence, raw_fill_json, schema_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "po-tp1-tp2-close:TP1",
+                    "plan-req-tp2-close",
+                    "req-tp2-close",
+                    "alert-req-tp2-close",
+                    "po-tp1-tp2-close",
+                    "alpaca_paper",
+                    "broker-tp1-tp2-close",
+                    None,
+                    "TP1",
+                    "AAPL",
+                    "SHORT",
+                    "2026-03-26T14:05:00+00:00",
+                    110.0,
+                    5.0,
+                    550.0,
+                    None,
+                    None,
+                    1,
+                    '{"id":"broker-tp1-tp2-close"}',
+                    "1",
+                ),
+            )
+            conn.commit()
+            tp2_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+                ("po-tp2-close",),
+            ).fetchone()
+
+            reconciled = self.worker.reconcile_paper_order(
+                conn,
+                tp2_row,
+                self._broker_result(
+                    "broker-tp2-close",
+                    broker_status_raw="filled",
+                    filled_ts_utc="2026-03-26T14:10:00+00:00",
+                    filled_qty=5.0,
+                    filled_avg_price=115.0,
+                ),
+            )
+            tp2_fill = get_paper_fill_by_order_id_and_role(conn, "po-tp2-close", "TP2")
+            plan_row = conn.execute(
+                "SELECT * FROM paper_trade_plans WHERE request_id = ?",
+                ("req-tp2-close",),
+            ).fetchone()
+            outcome_row = conn.execute(
+                "SELECT * FROM paper_trade_outcomes WHERE plan_id = ?",
+                ("plan-req-tp2-close",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual("FILLED", reconciled["order_status"])
+        self.assertIsNotNone(tp2_fill)
+        self.assertEqual("TP2", tp2_fill["fill_role"])
+        self.assertEqual(5.0, tp2_fill["fill_qty"])
+        self.assertEqual(115.0, tp2_fill["fill_px"])
+        self.assertEqual("po-tp2-close", plan_row["tp2_order_id"])
+        self.assertEqual(5.0, plan_row["tp2_filled_qty"])
+        self.assertEqual(115.0, plan_row["tp2_avg_fill_px"])
+        self.assertEqual("2026-03-26T14:10:00+00:00", plan_row["tp2_fill_ts_utc"])
+        self.assertEqual(0.0, plan_row["remaining_qty"])
+        self.assertEqual("FULLY_EXITED", plan_row["partial_exit_status"])
+        self.assertEqual("CLOSED", plan_row["position_status"])
+        self.assertEqual("2026-03-26T14:10:00+00:00", plan_row["closed_ts_utc"])
+        self.assertIsNotNone(outcome_row)
+        self.assertEqual("TP2", outcome_row["exit_reason"])
+        self.assertEqual(10.0, outcome_row["exit_qty"])
+        self.assertEqual(112.5, outcome_row["exit_avg_px"])
+        self.assertEqual(125.0, outcome_row["gross_pnl"])
+        self.assertEqual(2.5, outcome_row["realized_r"])
+
+    def test_tp2_partial_fill_does_not_close_trade(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(
+                conn,
+                request_id="req-tp2-partial",
+                entry_status="FILLED",
+                entry_filled_qty=10.0,
+                entry_avg_fill_px=100.0,
+                entry_fill_ts_utc="2026-03-26T14:00:00+00:00",
+                position_status="OPEN",
+                tp1_order_id="po-tp1-tp2-partial",
+                tp1_filled_qty=5.0,
+                tp1_avg_fill_px=110.0,
+                tp1_fill_ts_utc="2026-03-26T14:05:00+00:00",
+                tp2_order_id="po-tp2-partial",
+                remaining_qty=5.0,
+                partial_exit_status="TP1_PARTIAL",
+            )
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-tp2-partial",
+                request_id="req-tp2-partial",
+                client_order_id="req-tp2-partial:TP2",
+                broker_order_id="broker-tp2-partial",
+                order_status="SUBMITTED",
+                order_role="TP2",
+                parent_paper_order_id="po-entry-tp2-partial",
+                side="SHORT",
+                qty=5.0,
+                limit_price=115.0,
+                reduce_only=1,
+            )
+            conn.execute(
+                """
+                INSERT INTO paper_fills (
+                    paper_fill_id, plan_id, request_id, alert_id, paper_order_id, broker, broker_order_id,
+                    broker_fill_id, fill_role, symbol, side, fill_ts_utc, fill_px, fill_qty, gross_notional,
+                    fee, liquidity, fill_sequence, raw_fill_json, schema_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "po-tp1-tp2-partial:TP1",
+                    "plan-req-tp2-partial",
+                    "req-tp2-partial",
+                    "alert-req-tp2-partial",
+                    "po-tp1-tp2-partial",
+                    "alpaca_paper",
+                    "broker-tp1-tp2-partial",
+                    None,
+                    "TP1",
+                    "AAPL",
+                    "SHORT",
+                    "2026-03-26T14:05:00+00:00",
+                    110.0,
+                    5.0,
+                    550.0,
+                    None,
+                    None,
+                    1,
+                    '{"id":"broker-tp1-tp2-partial"}',
+                    "1",
+                ),
+            )
+            conn.commit()
+            tp2_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+                ("po-tp2-partial",),
+            ).fetchone()
+
+            self.worker.reconcile_paper_order(
+                conn,
+                tp2_row,
+                self._broker_result(
+                    "broker-tp2-partial",
+                    broker_status_raw="partially_filled",
+                    filled_ts_utc="2026-03-26T14:10:00+00:00",
+                    filled_qty=2.0,
+                    filled_avg_price=115.0,
+                ),
+            )
+            plan_row = conn.execute(
+                "SELECT * FROM paper_trade_plans WHERE request_id = ?",
+                ("req-tp2-partial",),
+            ).fetchone()
+            outcome_count = conn.execute(
+                "SELECT COUNT(*) AS n FROM paper_trade_outcomes WHERE plan_id = ?",
+                ("plan-req-tp2-partial",),
+            ).fetchone()["n"]
+        finally:
+            conn.close()
+
+        self.assertEqual("OPEN", plan_row["position_status"])
+        self.assertEqual(3.0, plan_row["remaining_qty"])
         self.assertEqual(0, outcome_count)
 
     def test_cancel_success_and_replacement_failure_leaves_truthful_unprotected_state(self) -> None:
@@ -1802,6 +2097,10 @@ class ExecutionWorkerTest(unittest.TestCase):
                 "SELECT * FROM paper_orders WHERE plan_id = ? AND order_role = ?",
                 ("plan-req-sync", "TP1"),
             ).fetchone()
+            synced_tp2_order = conn.execute(
+                "SELECT * FROM paper_orders WHERE plan_id = ? AND order_role = ?",
+                ("plan-req-sync", "TP2"),
+            ).fetchone()
             new_request_order = conn.execute(
                 "SELECT * FROM paper_orders WHERE request_id = ?",
                 ("req-4",),
@@ -1819,6 +2118,7 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual("OPEN", synced_plan["position_status"])
         self.assertIsNotNone(synced_stop_order)
         self.assertIsNotNone(synced_tp1_order)
+        self.assertIsNotNone(synced_tp2_order)
         self.assertIsNotNone(new_request_order)
 
     def test_stop_fill_creates_outcome_and_closes_plan(self) -> None:
@@ -1891,6 +2191,96 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual(95.0, summary["weighted_exit_avg_px"])
         self.assertEqual(-5.0, summary["realized_gross_pnl"])
         self.assertEqual(1, len(summary["exit_legs"]))
+
+    def test_replacement_stop_fill_uses_actual_closing_stop_for_outcome(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(
+                conn,
+                request_id="req-close-stop-replaced",
+                entry_status="FILLED",
+                entry_filled_qty=5.0,
+                entry_avg_fill_px=100.0,
+                entry_fill_ts_utc="2026-03-26T14:00:00+00:00",
+                position_status="OPEN",
+                protective_stop_order_id="po-stop-close-stop-replaced-r2",
+                remaining_qty=5.0,
+            )
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-entry-close-stop-replaced",
+                request_id="req-close-stop-replaced",
+                client_order_id="req-close-stop-replaced",
+                broker_order_id="broker-entry-close-stop-replaced",
+                order_status="FILLED",
+                qty=5.0,
+            )
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-stop-close-stop-replaced",
+                request_id="req-close-stop-replaced",
+                client_order_id="req-close-stop-replaced:STOP",
+                broker_order_id="broker-stop-close-stop-replaced",
+                order_status="REPLACED",
+                order_role="STOP",
+                parent_paper_order_id="po-entry-close-stop-replaced",
+                side="SHORT",
+                qty=5.0,
+                stop_price=95.0,
+                superseded_by_paper_order_id="po-stop-close-stop-replaced-r2",
+            )
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-stop-close-stop-replaced-r2",
+                request_id="req-close-stop-replaced",
+                client_order_id="req-close-stop-replaced:STOP:R2",
+                broker_order_id="broker-stop-close-stop-replaced-r2",
+                order_status="SUBMITTED",
+                order_role="STOP",
+                parent_paper_order_id="po-entry-close-stop-replaced",
+                replaced_from_paper_order_id="po-stop-close-stop-replaced",
+                side="SHORT",
+                qty=5.0,
+                stop_price=100.05,
+            )
+            current_stop_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+                ("po-stop-close-stop-replaced-r2",),
+            ).fetchone()
+
+            self.worker.reconcile_paper_order(
+                conn,
+                current_stop_row,
+                self._broker_result(
+                    "broker-stop-close-stop-replaced-r2",
+                    broker_status_raw="filled",
+                    filled_ts_utc="2026-03-26T14:10:00+00:00",
+                    filled_qty=5.0,
+                    filled_avg_price=100.05,
+                ),
+            )
+            plan_row = conn.execute(
+                "SELECT * FROM paper_trade_plans WHERE request_id = ?",
+                ("req-close-stop-replaced",),
+            ).fetchone()
+            outcome_row = conn.execute(
+                "SELECT * FROM paper_trade_outcomes WHERE plan_id = ?",
+                ("plan-req-close-stop-replaced",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual("CLOSED", plan_row["position_status"])
+        self.assertIsNotNone(outcome_row)
+        self.assertEqual("STOP", outcome_row["exit_reason"])
+        summary = json.loads(outcome_row["raw_summary_json"])
+        self.assertEqual(
+            ["po-stop-close-stop-replaced-r2:STOP"],
+            summary["exit_fill_ids"],
+        )
+        self.assertEqual("STOP", summary["exit_legs"][0]["role"])
+        self.assertEqual(5.0, summary["exit_legs"][0]["qty"])
+        self.assertEqual(100.05, summary["exit_legs"][0]["px"])
 
     def test_tp1_and_stop_fills_aggregate_into_final_outcome(self) -> None:
         conn = get_connection(self.db_path)
@@ -2345,11 +2735,16 @@ class ExecutionWorkerTest(unittest.TestCase):
         tp1_filled_qty: float | None = None,
         tp1_avg_fill_px: float | None = None,
         tp1_fill_ts_utc: str | None = None,
+        tp2_order_id: str | None = None,
+        tp2_filled_qty: float | None = None,
+        tp2_avg_fill_px: float | None = None,
+        tp2_fill_ts_utc: str | None = None,
         remaining_qty: float | None = None,
         partial_exit_status: str = "NONE",
         closed_ts_utc: str | None = None,
         stop_px: float | None = 95.0,
         t1_px: float | None = 110.0,
+        t2_px: float | None = 115.0,
     ) -> None:
         conn.execute(
             """
@@ -2363,6 +2758,7 @@ class ExecutionWorkerTest(unittest.TestCase):
                 entry_type,
                 stop_px,
                 t1_px,
+                t2_px,
                 plan_rules_json,
                 plan_status,
                 entry_status,
@@ -2375,11 +2771,15 @@ class ExecutionWorkerTest(unittest.TestCase):
                 tp1_filled_qty,
                 tp1_avg_fill_px,
                 tp1_fill_ts_utc,
+                tp2_order_id,
+                tp2_filled_qty,
+                tp2_avg_fill_px,
+                tp2_fill_ts_utc,
                 remaining_qty,
                 partial_exit_status,
                 closed_ts_utc,
                 schema_version
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 "plan-" + request_id,
@@ -2391,6 +2791,7 @@ class ExecutionWorkerTest(unittest.TestCase):
                 "MARKET",
                 stop_px,
                 t1_px,
+                t2_px,
                 "{}",
                 "CREATED",
                 entry_status,
@@ -2403,6 +2804,10 @@ class ExecutionWorkerTest(unittest.TestCase):
                 tp1_filled_qty,
                 tp1_avg_fill_px,
                 tp1_fill_ts_utc,
+                tp2_order_id,
+                tp2_filled_qty,
+                tp2_avg_fill_px,
+                tp2_fill_ts_utc,
                 remaining_qty,
                 partial_exit_status,
                 closed_ts_utc,
@@ -2480,7 +2885,7 @@ class ExecutionWorkerTest(unittest.TestCase):
                 order_role,
                 "AAPL",
                 side,
-                "limit" if order_role == "TP1" else "market",
+                "limit" if order_role in {"TP1", "TP2"} else "market",
                 "gtc",
                 qty,
                 25.0,

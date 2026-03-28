@@ -35,12 +35,14 @@ class PaperOrderRole(str, Enum):
     ENTRY = "ENTRY"
     STOP = "STOP"
     TP1 = "TP1"
+    TP2 = "TP2"
 
 
 class PaperFillRole(str, Enum):
     ENTRY = "ENTRY"
     STOP = "STOP"
     TP1 = "TP1"
+    TP2 = "TP2"
 
 
 class PaperOrderStatus(str, Enum):

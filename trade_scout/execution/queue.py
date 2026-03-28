@@ -133,6 +133,10 @@ def init_db(db_path: str) -> None:
                 tp1_filled_qty REAL,
                 tp1_avg_fill_px REAL,
                 tp1_fill_ts_utc TEXT,
+                tp2_order_id TEXT,
+                tp2_filled_qty REAL,
+                tp2_avg_fill_px REAL,
+                tp2_fill_ts_utc TEXT,
                 remaining_qty REAL,
                 partial_exit_status TEXT,
                 closed_ts_utc TEXT,
@@ -665,11 +669,15 @@ def create_paper_trade_plan(
             tp1_filled_qty,
             tp1_avg_fill_px,
             tp1_fill_ts_utc,
+            tp2_order_id,
+            tp2_filled_qty,
+            tp2_avg_fill_px,
+            tp2_fill_ts_utc,
             remaining_qty,
             partial_exit_status,
             closed_ts_utc,
             schema_version
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             plan_id,
@@ -709,6 +717,10 @@ def create_paper_trade_plan(
             None,
             None,
             PaperTradePlanPositionStatus.PENDING_ENTRY.value,
+            None,
+            None,
+            None,
+            None,
             None,
             None,
             None,
@@ -1325,6 +1337,51 @@ def update_trade_plan_after_tp1_fill(
     ).fetchone()
 
 
+def update_trade_plan_after_tp2_fill(
+    conn: sqlite3.Connection,
+    *,
+    plan_id: str,
+    tp2_order_id: str,
+    tp2_filled_qty: float,
+    tp2_avg_fill_px: float,
+    tp2_fill_ts_utc: str,
+    remaining_qty: float,
+    partial_exit_status: str,
+) -> sqlite3.Row | None:
+    conn.execute(
+        """
+        UPDATE paper_trade_plans
+        SET tp2_order_id = ?,
+            tp2_filled_qty = ?,
+            tp2_avg_fill_px = ?,
+            tp2_fill_ts_utc = ?,
+            remaining_qty = ?,
+            partial_exit_status = ?,
+            position_status = CASE
+                WHEN position_status = ? THEN position_status
+                ELSE ?
+            END
+        WHERE plan_id = ?
+        """,
+        (
+            tp2_order_id,
+            tp2_filled_qty,
+            tp2_avg_fill_px,
+            tp2_fill_ts_utc,
+            remaining_qty,
+            partial_exit_status,
+            PaperTradePlanPositionStatus.CLOSED.value,
+            PaperTradePlanPositionStatus.OPEN.value,
+            plan_id,
+        ),
+    )
+    conn.commit()
+    return conn.execute(
+        "SELECT * FROM paper_trade_plans WHERE plan_id = ?",
+        (plan_id,),
+    ).fetchone()
+
+
 def update_trade_plan_tp1_pointer(
     conn: sqlite3.Connection,
     *,
@@ -1338,6 +1395,27 @@ def update_trade_plan_tp1_pointer(
         WHERE plan_id = ?
         """,
         (tp1_order_id, plan_id),
+    )
+    conn.commit()
+    return conn.execute(
+        "SELECT * FROM paper_trade_plans WHERE plan_id = ?",
+        (plan_id,),
+    ).fetchone()
+
+
+def update_trade_plan_tp2_pointer(
+    conn: sqlite3.Connection,
+    *,
+    plan_id: str,
+    tp2_order_id: str,
+) -> sqlite3.Row | None:
+    conn.execute(
+        """
+        UPDATE paper_trade_plans
+        SET tp2_order_id = ?
+        WHERE plan_id = ?
+        """,
+        (tp2_order_id, plan_id),
     )
     conn.commit()
     return conn.execute(
@@ -1367,6 +1445,28 @@ def clear_trade_plan_protective_stop_pointer(
 
 
 def update_open_stop_order_qty(
+    conn: sqlite3.Connection,
+    *,
+    paper_order_id: str,
+    qty: float,
+) -> sqlite3.Row | None:
+    conn.execute(
+        """
+        UPDATE paper_orders
+        SET qty = ?
+        WHERE paper_order_id = ?
+          AND order_status NOT IN (?, ?, ?, ?, ?)
+        """,
+        (qty, paper_order_id, *TERMINAL_PAPER_ORDER_STATUSES),
+    )
+    conn.commit()
+    return conn.execute(
+        "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+        (paper_order_id,),
+    ).fetchone()
+
+
+def update_open_paper_order_qty(
     conn: sqlite3.Connection,
     *,
     paper_order_id: str,
@@ -1482,12 +1582,13 @@ def list_exit_fills_by_plan_id(
         SELECT *
         FROM paper_fills
         WHERE plan_id = ?
-          AND fill_role IN (?, ?)
+          AND fill_role IN (?, ?, ?)
         ORDER BY fill_ts_utc ASC, fill_sequence ASC, paper_fill_id ASC
         """,
         (
             plan_id,
             PaperFillRole.TP1.value,
+            PaperFillRole.TP2.value,
             PaperFillRole.STOP.value,
         ),
     ).fetchall()
@@ -1498,6 +1599,7 @@ def create_trade_outcome_for_closed_plan(
     conn: sqlite3.Connection,
     *,
     plan_row: sqlite3.Row,
+    exit_reason: str,
 ) -> sqlite3.Row:
     existing = get_trade_outcome_by_plan_id(conn, str(plan_row["plan_id"]))
     if existing is not None:
@@ -1577,7 +1679,7 @@ def create_trade_outcome_for_closed_plan(
             "entry_fill_id": entry_fill_id,
             "exit_fill_ids": exit_fill_ids,
             "exit_legs": exit_legs,
-            "exit_reason": "STOP",
+            "exit_reason": exit_reason,
             "total_exit_qty": exit_qty,
             "weighted_exit_avg_px": exit_avg_px,
             "realized_gross_pnl": gross_pnl,
@@ -1648,7 +1750,7 @@ def create_trade_outcome_for_closed_plan(
             latest_exit_fill_ts_utc,
             exit_avg_px,
             exit_qty,
-            "STOP",
+            exit_reason,
             gross_pnl,
             None,
             gross_pnl,
@@ -1678,6 +1780,22 @@ def create_trade_outcome_from_stop_fill(
     return create_trade_outcome_for_closed_plan(
         conn,
         plan_row=plan_row,
+        exit_reason=PaperOrderRole.STOP.value,
+    )
+
+
+def create_trade_outcome_from_tp2_fill(
+    conn: sqlite3.Connection,
+    *,
+    plan_row: sqlite3.Row,
+    tp2_fill_row: sqlite3.Row,
+) -> sqlite3.Row:
+    if tp2_fill_row is None:
+        raise RuntimeError("tp2 fill row is required for tp2-close outcome creation")
+    return create_trade_outcome_for_closed_plan(
+        conn,
+        plan_row=plan_row,
+        exit_reason=PaperOrderRole.TP2.value,
     )
 
 
