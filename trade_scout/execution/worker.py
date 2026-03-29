@@ -305,6 +305,10 @@ class ExecutionWorker:
         order_role = str(paper_order_row["order_role"])
         order_status = str(paper_order_row["order_status"])
         if order_role == PaperOrderRole.ENTRY.value and order_status == PaperOrderStatus.FILLED.value:
+            print(
+                "[execution-worker] post-entry lifecycle dispatch for filled ENTRY "
+                f"{self._post_entry_log_context(entry_order_row=paper_order_row)}"
+            )
             self.ensure_protective_stop_for_entry_fill(conn, paper_order_row)
             self.ensure_tp1_order_for_entry_fill(conn, paper_order_row)
             self.ensure_tp2_order_for_entry_fill(conn, paper_order_row)
@@ -327,6 +331,10 @@ class ExecutionWorker:
     def ensure_protective_stop_for_entry_fill(self, conn, entry_order_row) -> None:
         plan_row = self._get_plan_row_by_id(conn, str(entry_order_row["plan_id"]))
         if plan_row is None:
+            self._log_post_entry_warning(
+                "missing plan row",
+                entry_order_row=entry_order_row,
+            )
             return
 
         # The actual STOP row is stronger local truth than the advisory plan pointer.
@@ -343,11 +351,36 @@ class ExecutionWorker:
                 protective_stop_order_id=str(existing_stop_order["paper_order_id"]),
                 remaining_qty=remaining_qty,
             )
+            self._log_post_entry_warning(
+                "protective stop already exists",
+                entry_order_row=entry_order_row,
+                plan_row=plan_row,
+                related_paper_order_id=str(existing_stop_order["paper_order_id"]),
+            )
             return
 
         stop_price = self._coerce_float(plan_row["stop_px"])
         qty = self._coerce_float(plan_row["entry_filled_qty"])
-        if stop_price is None or qty is None or qty <= 0:
+        if stop_price is None:
+            self._log_post_entry_warning(
+                "missing stop price",
+                entry_order_row=entry_order_row,
+                plan_row=plan_row,
+            )
+            return
+        if qty is None:
+            self._log_post_entry_warning(
+                "missing qty",
+                entry_order_row=entry_order_row,
+                plan_row=plan_row,
+            )
+            return
+        if qty <= 0:
+            self._log_post_entry_warning(
+                "qty <= 0",
+                entry_order_row=entry_order_row,
+                plan_row=plan_row,
+            )
             return
 
         client_order_id = self._protective_stop_client_order_id(str(plan_row["request_id"]))
@@ -433,6 +466,10 @@ class ExecutionWorker:
     def ensure_tp1_order_for_entry_fill(self, conn, entry_order_row) -> None:
         plan_row = self._get_plan_row_by_id(conn, str(entry_order_row["plan_id"]))
         if plan_row is None:
+            self._log_post_entry_warning(
+                "missing plan row",
+                entry_order_row=entry_order_row,
+            )
             return
 
         existing_tp1_order = get_paper_order_by_plan_id_and_role(
@@ -446,12 +483,44 @@ class ExecutionWorker:
                 plan_id=str(plan_row["plan_id"]),
                 tp1_order_id=str(existing_tp1_order["paper_order_id"]),
             )
+            self._log_post_entry_warning(
+                "tp1 order already exists",
+                entry_order_row=entry_order_row,
+                plan_row=plan_row,
+                related_paper_order_id=str(existing_tp1_order["paper_order_id"]),
+            )
             return
 
         t1_px = self._coerce_float(plan_row["t1_px"])
         entry_filled_qty = self._coerce_float(plan_row["entry_filled_qty"])
         tp1_qty = self._compute_tp1_qty(entry_filled_qty)
-        if t1_px is None or tp1_qty is None:
+        if t1_px is None:
+            self._log_post_entry_warning(
+                "missing tp1 price",
+                entry_order_row=entry_order_row,
+                plan_row=plan_row,
+            )
+            return
+        if entry_filled_qty is None:
+            self._log_post_entry_warning(
+                "missing qty",
+                entry_order_row=entry_order_row,
+                plan_row=plan_row,
+            )
+            return
+        if entry_filled_qty <= 0:
+            self._log_post_entry_warning(
+                "qty <= 0",
+                entry_order_row=entry_order_row,
+                plan_row=plan_row,
+            )
+            return
+        if tp1_qty is None:
+            self._log_post_entry_warning(
+                "tp1 qty could not be computed",
+                entry_order_row=entry_order_row,
+                plan_row=plan_row,
+            )
             return
 
         client_order_id = self._tp1_client_order_id(str(plan_row["request_id"]))
@@ -536,6 +605,10 @@ class ExecutionWorker:
     def ensure_tp2_order_for_entry_fill(self, conn, entry_order_row) -> None:
         plan_row = self._get_plan_row_by_id(conn, str(entry_order_row["plan_id"]))
         if plan_row is None:
+            self._log_post_entry_warning(
+                "missing plan row",
+                entry_order_row=entry_order_row,
+            )
             return
 
         existing_tp2_order = get_paper_order_by_plan_id_and_role(
@@ -549,12 +622,44 @@ class ExecutionWorker:
                 plan_id=str(plan_row["plan_id"]),
                 tp2_order_id=str(existing_tp2_order["paper_order_id"]),
             )
+            self._log_post_entry_warning(
+                "tp2 order already exists",
+                entry_order_row=entry_order_row,
+                plan_row=plan_row,
+                related_paper_order_id=str(existing_tp2_order["paper_order_id"]),
+            )
             return
 
         t2_px = self._coerce_float(plan_row["t2_px"])
         entry_filled_qty = self._coerce_float(plan_row["entry_filled_qty"])
         tp2_qty = self._compute_tp2_qty(entry_filled_qty)
-        if t2_px is None or tp2_qty is None:
+        if t2_px is None:
+            self._log_post_entry_warning(
+                "missing tp2 price",
+                entry_order_row=entry_order_row,
+                plan_row=plan_row,
+            )
+            return
+        if entry_filled_qty is None:
+            self._log_post_entry_warning(
+                "missing qty",
+                entry_order_row=entry_order_row,
+                plan_row=plan_row,
+            )
+            return
+        if entry_filled_qty <= 0:
+            self._log_post_entry_warning(
+                "qty <= 0",
+                entry_order_row=entry_order_row,
+                plan_row=plan_row,
+            )
+            return
+        if tp2_qty is None:
+            self._log_post_entry_warning(
+                "tp2 qty could not be computed",
+                entry_order_row=entry_order_row,
+                plan_row=plan_row,
+            )
             return
 
         client_order_id = self._tp2_client_order_id(str(plan_row["request_id"]))
@@ -1349,6 +1454,51 @@ class ExecutionWorker:
             """,
             (plan_id,),
         ).fetchone()
+
+    @staticmethod
+    def _post_entry_log_context(
+        *,
+        entry_order_row,
+        plan_row=None,
+        related_paper_order_id: str | None = None,
+    ) -> str:
+        request_id = None
+        alert_id = None
+        if plan_row is not None:
+            request_id = plan_row["request_id"]
+            alert_id = plan_row["alert_id"]
+        if request_id is None:
+            request_id = entry_order_row["request_id"]
+        if alert_id is None:
+            alert_id = entry_order_row["alert_id"]
+
+        parts = [
+            f"request_id={request_id}",
+            f"alert_id={alert_id}",
+            f"paper_order_id={entry_order_row['paper_order_id']}",
+        ]
+        if related_paper_order_id:
+            parts.append(f"related_paper_order_id={related_paper_order_id}")
+        return " ".join(parts)
+
+    def _log_post_entry_warning(
+        self,
+        reason: str,
+        *,
+        entry_order_row,
+        plan_row=None,
+        related_paper_order_id: str | None = None,
+    ) -> None:
+        context = self._post_entry_log_context(
+            entry_order_row=entry_order_row,
+            plan_row=plan_row,
+            related_paper_order_id=related_paper_order_id,
+        )
+        print(
+            "[execution-worker] warning post-entry lifecycle no-op "
+            f"reason={reason} "
+            f"{context}"
+        )
 
     @staticmethod
     def _protective_stop_client_order_id(request_id: str) -> str:

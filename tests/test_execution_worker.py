@@ -815,6 +815,52 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual(1, len(stop_rows))
         self.assertEqual(stop_rows[0]["paper_order_id"], plan_row["protective_stop_order_id"])
 
+    def test_missing_stop_price_logs_post_entry_warning(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(
+                conn,
+                request_id="req-missing-stop",
+                entry_status="FILLED",
+                entry_filled_qty=1.0,
+                entry_avg_fill_px=100.0,
+                entry_fill_ts_utc="2026-03-26T10:00:00+00:00",
+                position_status="PENDING_ENTRY",
+                stop_px=None,
+            )
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-entry-missing-stop",
+                request_id="req-missing-stop",
+                client_order_id="req-missing-stop",
+                broker_order_id="broker-entry-missing-stop",
+                order_status="FILLED",
+            )
+            entry_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+                ("po-entry-missing-stop",),
+            ).fetchone()
+
+            with patch("builtins.print") as print_mock, patch(
+                "trade_scout.execution.worker.submit_stop_order",
+                side_effect=AssertionError("submit_stop_order should not be called"),
+            ):
+                self.worker.ensure_protective_stop_for_entry_fill(conn, entry_row)
+        finally:
+            conn.close()
+
+        print_calls = [call.args[0] for call in print_mock.call_args_list if call.args]
+        self.assertTrue(
+            any(
+                "warning post-entry lifecycle no-op" in message
+                and "reason=missing stop price" in message
+                and "request_id=req-missing-stop" in message
+                and "alert_id=alert-req-missing-stop" in message
+                and "paper_order_id=po-entry-missing-stop" in message
+                for message in print_calls
+            )
+        )
+
     def test_partially_filled_entry_does_not_create_stop(self) -> None:
         conn = get_connection(self.db_path)
         try:
