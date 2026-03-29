@@ -380,6 +380,66 @@ class JournalRowsTest(unittest.TestCase):
         self.assertEqual(rows[1]["schema_version"], "1")
         self.assertEqual(rows[1]["strategy_id"], "long_breakout_continuation")
 
+    def test_load_alert_intent_by_id_returns_execution_facing_fields(self):
+        journal.log_alert_intent(
+            AlertIntentRow(
+                alert_id="alert-load-1",
+                symbol="BTC/USD",
+                side="LONG",
+                market_type="crypto",
+                strategy_profile="crypto_v1",
+                strategy_version="v3_research_step2",
+                config_hash="cfg-789",
+                tier="A",
+                signal_ts_utc="2026-03-29T12:00:00+00:00",
+                timeframe_min=5,
+                signal_px=101.25,
+                signal_px_type="bar_close",
+                alert_status="ALERT_CREATED",
+                skip_reason=None,
+                error_message=None,
+                entry_low=100.5,
+                entry_high=101.0,
+                stop_px=95.5,
+                t1_px=106.0,
+                t2_px=111.0,
+                timeout_seconds=1800,
+                stop_distance=5.5,
+                t1_R=1.5,
+                t2_R=2.5,
+                risk_model="fixed_usd",
+                risk_usd=25.0,
+                qty_model="units",
+                qty=0.75,
+                reasons="breakout confirmed",
+                strategy_id="long_breakout_continuation",
+                setup_family="breakout_continuation",
+                strategy_params_json="{\"pullback\":false}",
+                strategy_params_hash="params-hash-1",
+            )
+        )
+
+        row = journal.load_alert_intent_by_id("alert-load-1")
+
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual("alert-load-1", row["alert_id"])
+        self.assertEqual("2026-03-29T12:00:00+00:00", row["created_ts_utc"])
+        self.assertEqual("2026-03-29T12:00:00+00:00", row["signal_ts_utc"])
+        self.assertEqual("95.5", row["stop_px"])
+        self.assertEqual("106.0", row["t1_px"])
+        self.assertEqual("111.0", row["t2_px"])
+        self.assertEqual("101.25", row["signal_px"])
+        self.assertEqual("1800", row["timeout_seconds"])
+        self.assertEqual("fixed_usd", row["risk_model"])
+        self.assertEqual("25.0", row["risk_usd"])
+        self.assertEqual("units", row["qty_model"])
+        self.assertEqual("0.75", row["qty"])
+        self.assertEqual("long_breakout_continuation", row["strategy_id"])
+        self.assertEqual("breakout_continuation", row["setup_family"])
+        self.assertEqual("{\"pullback\":false}", row["strategy_params_json"])
+        self.assertEqual("params-hash-1", row["strategy_params_hash"])
+
 
 if __name__ == "__main__":
     unittest.main()

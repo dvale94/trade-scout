@@ -373,6 +373,11 @@ def log_execution(row: Union[ExecutionRow, dict[str, Any]]):
 
 
 def load_alert_intent_by_id(alert_id: str) -> dict[str, Any] | None:
+    """Load the authoritative execution-facing alert row for a created alert.
+
+    This loader must return the execution planning fields required by paper
+    trade plan creation. It is not just a minimal existence or validation lookup.
+    """
     path = alerts_intents_path()
     if not os.path.isfile(path) or os.path.getsize(path) == 0:
         return None
@@ -402,8 +407,29 @@ def load_alert_intent_by_id(alert_id: str) -> dict[str, Any] | None:
                 return {
                     "alert_id": row_alert_id,
                     "created_ts_utc": signal_ts_utc,
+                    "signal_ts_utc": signal_ts_utc,
                     "symbol": symbol,
                     "side": side,
+                    "market_type": row.get("market_type"),
+                    "strategy_profile": row.get("strategy_profile"),
+                    "strategy_version": row.get("strategy_version"),
+                    "config_hash": row.get("config_hash"),
+                    "tier": row.get("tier"),
+                    "signal_px": row.get("signal_px"),
+                    "entry_low": row.get("entry_low"),
+                    "entry_high": row.get("entry_high"),
+                    "stop_px": row.get("stop_px"),
+                    "t1_px": row.get("t1_px"),
+                    "t2_px": row.get("t2_px"),
+                    "timeout_seconds": row.get("timeout_seconds"),
+                    "risk_model": row.get("risk_model"),
+                    "risk_usd": row.get("risk_usd"),
+                    "qty_model": row.get("qty_model"),
+                    "qty": row.get("qty"),
+                    "strategy_id": row.get("strategy_id"),
+                    "setup_family": row.get("setup_family"),
+                    "strategy_params_json": row.get("strategy_params_json"),
+                    "strategy_params_hash": row.get("strategy_params_hash"),
                 }
     except Exception:
         return None
