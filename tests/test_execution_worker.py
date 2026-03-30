@@ -1133,6 +1133,7 @@ class ExecutionWorkerTest(unittest.TestCase):
             self._insert_trade_plan_row(
                 conn,
                 request_id="req-tp1-fill",
+                market_type="stocks",
                 entry_status="FILLED",
                 entry_filled_qty=10.0,
                 entry_avg_fill_px=100.0,
@@ -1237,7 +1238,10 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual(replacement_stop_row["paper_order_id"], old_stop_row["superseded_by_paper_order_id"])
         self.assertEqual("po-stop-tp1-fill", replacement_stop_row["replaced_from_paper_order_id"])
         self.assertEqual(5.0, replacement_stop_row["qty"])
+        self.assertEqual("stop", replacement_stop_row["order_type"])
+        self.assertEqual("gtc", replacement_stop_row["time_in_force"])
         self.assertEqual(100.05, replacement_stop_row["stop_price"])
+        self.assertIsNone(replacement_stop_row["limit_price"])
         self.assertEqual(replacement_stop_row["paper_order_id"], plan_row["protective_stop_order_id"])
         self.assertEqual(0, outcome_count)
 
@@ -2036,6 +2040,78 @@ class ExecutionWorkerTest(unittest.TestCase):
 
         self.assertEqual(5.0, replacement_stop_row["qty"])
         self.assertEqual(99.95, replacement_stop_row["stop_price"])
+        self.assertEqual("stop", replacement_stop_row["order_type"])
+        self.assertEqual("gtc", replacement_stop_row["time_in_force"])
+        self.assertIsNone(replacement_stop_row["limit_price"])
+
+    def test_crypto_replacement_stop_uses_stop_limit_and_persists_limit_price(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(
+                conn,
+                request_id="req-crypto-stop-replace",
+                market_type="crypto",
+                entry_status="FILLED",
+                entry_filled_qty=10.0,
+                entry_avg_fill_px=100.0,
+                entry_fill_ts_utc="2026-03-26T14:00:00+00:00",
+                position_status="OPEN",
+                protective_stop_order_id="po-stop-crypto-stop-replace",
+                tp1_order_id="po-tp1-crypto-stop-replace",
+                tp1_filled_qty=5.0,
+                tp1_avg_fill_px=110.0,
+                tp1_fill_ts_utc="2026-03-26T14:05:00+00:00",
+                remaining_qty=5.0,
+                partial_exit_status="TP1_PARTIAL",
+            )
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-stop-crypto-stop-replace",
+                request_id="req-crypto-stop-replace",
+                client_order_id="req-crypto-stop-replace:STOP",
+                broker_order_id="broker-stop-crypto-stop-replace",
+                order_status="SUBMITTED",
+                order_role="STOP",
+                parent_paper_order_id="po-entry-crypto-stop-replace",
+                side="SHORT",
+                qty=10.0,
+                stop_price=95.0,
+            )
+
+            with patch(
+                "trade_scout.execution.worker.cancel_broker_order",
+                return_value=self._broker_result(
+                    "broker-stop-crypto-stop-replace",
+                    broker_status_raw="canceled",
+                    canceled_ts_utc="2026-03-26T14:10:01+00:00",
+                ),
+            ) as cancel_mock, patch(
+                "trade_scout.execution.worker.submit_stop_order",
+                return_value=self._broker_result(
+                    "broker-stop-crypto-stop-replace-r2",
+                    broker_status_raw="submitted",
+                ),
+            ) as submit_stop_mock:
+                self.worker.maybe_move_stop_to_breakeven(
+                    conn,
+                    "plan-req-crypto-stop-replace",
+                    5.0,
+                )
+
+            replacement_stop_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE client_order_id = ?",
+                ("req-crypto-stop-replace:STOP:R2",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(1, cancel_mock.call_count)
+        self.assertEqual(1, submit_stop_mock.call_count)
+        self.assertEqual("crypto", submit_stop_mock.call_args.kwargs["market_type"])
+        self.assertEqual("stop_limit", replacement_stop_row["order_type"])
+        self.assertEqual("gtc", replacement_stop_row["time_in_force"])
+        self.assertEqual(100.05, replacement_stop_row["stop_price"])
+        self.assertEqual(99.94995, replacement_stop_row["limit_price"])
 
     def test_remote_recovery_still_persists_normalized_order_by_client_order_id(self) -> None:
         self._insert_pending_request(request_id="req-3", alert_id="alert-3")
@@ -2771,6 +2847,7 @@ class ExecutionWorkerTest(unittest.TestCase):
         conn,
         *,
         request_id: str,
+        market_type: str | None = None,
         entry_status: str = "PENDING",
         entry_filled_qty: float | None = None,
         entry_avg_fill_px: float | None = None,
@@ -2801,6 +2878,7 @@ class ExecutionWorkerTest(unittest.TestCase):
                 created_ts_utc,
                 symbol,
                 side,
+                market_type,
                 entry_type,
                 stop_px,
                 t1_px,
@@ -2825,7 +2903,7 @@ class ExecutionWorkerTest(unittest.TestCase):
                 partial_exit_status,
                 closed_ts_utc,
                 schema_version
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 "plan-" + request_id,
@@ -2834,6 +2912,7 @@ class ExecutionWorkerTest(unittest.TestCase):
                 "2026-03-25T14:00:00+00:00",
                 "AAPL",
                 "LONG",
+                market_type,
                 "MARKET",
                 stop_px,
                 t1_px,

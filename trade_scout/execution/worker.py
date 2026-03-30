@@ -8,6 +8,7 @@ from typing import Any, Callable, Mapping, Optional
 
 from trade_scout import config
 from trade_scout.execution.broker import (
+    build_protective_stop_order_spec,
     cancel_broker_order,
     fetch_broker_order_by_id,
     find_broker_order_by_client_order_id,
@@ -384,7 +385,13 @@ class ExecutionWorker:
             return
 
         client_order_id = self._protective_stop_client_order_id(str(plan_row["request_id"]))
+        market_type = self._coerce_optional_str(plan_row["market_type"])
         stop_side = opposite_trade_side(str(plan_row["side"]))
+        stop_spec = build_protective_stop_order_spec(
+            market_type=market_type,
+            side=stop_side,
+            stop_price=stop_price,
+        )
         try:
             recovered = find_broker_order_by_client_order_id(client_order_id)
         except Exception:
@@ -401,10 +408,11 @@ class ExecutionWorker:
                 side=stop_side,
                 qty=qty,
                 notional=None,
-                order_type="stop",
-                time_in_force="gtc",
+                order_type=stop_spec.order_type,
+                time_in_force=stop_spec.time_in_force,
                 order_role=PaperOrderRole.STOP.value,
                 parent_paper_order_id=str(entry_order_row["paper_order_id"]),
+                limit_price=stop_spec.limit_price,
                 stop_price=stop_price,
                 result=recovered,
             )
@@ -420,9 +428,22 @@ class ExecutionWorker:
             )
             return
 
+        self._log_protective_stop_submission(
+            entry_order_row=entry_order_row,
+            plan_row=plan_row,
+            market_type=market_type,
+            symbol=str(plan_row["symbol"]),
+            side=stop_side,
+            qty=qty,
+            order_type=stop_spec.order_type,
+            time_in_force=stop_spec.time_in_force,
+            stop_price=stop_spec.stop_price,
+            limit_price=stop_spec.limit_price,
+        )
         try:
             result = submit_stop_order(
                 client_order_id=client_order_id,
+                market_type=market_type,
                 symbol=str(plan_row["symbol"]),
                 side=stop_side,
                 qty=qty,
@@ -431,7 +452,14 @@ class ExecutionWorker:
         except Exception as exc:
             recovered = find_broker_order_by_client_order_id(client_order_id)
             if recovered is None:
-                raise exc
+                raise RuntimeError(
+                    "protective stop submission failed "
+                    f"{self._post_entry_log_context(entry_order_row=entry_order_row, plan_row=plan_row)} "
+                    f"market_type={market_type} symbol={plan_row['symbol']} side={stop_side} "
+                    f"qty={qty} order_type={stop_spec.order_type} "
+                    f"time_in_force={stop_spec.time_in_force} stop_price={stop_spec.stop_price} "
+                    f"limit_price={stop_spec.limit_price} error={exc}"
+                ) from exc
             result = recovered
 
         stop_order = insert_paper_order(
@@ -445,10 +473,11 @@ class ExecutionWorker:
             side=stop_side,
             qty=qty,
             notional=None,
-            order_type="stop",
-            time_in_force="gtc",
+            order_type=stop_spec.order_type,
+            time_in_force=stop_spec.time_in_force,
             order_role=PaperOrderRole.STOP.value,
             parent_paper_order_id=str(entry_order_row["paper_order_id"]),
+            limit_price=stop_spec.limit_price,
             stop_price=stop_price,
             result=result,
         )
@@ -960,7 +989,13 @@ class ExecutionWorker:
         except Exception:
             recovered_replacement = None
 
+        market_type = self._coerce_optional_str(plan_row["market_type"])
         stop_side = opposite_trade_side(str(plan_row["side"]))
+        stop_spec = build_protective_stop_order_spec(
+            market_type=market_type,
+            side=stop_side,
+            stop_price=desired_stop_price,
+        )
 
         if recovered_replacement is None and current_stop_order is not None:
             broker_order_id = self._coerce_optional_str(current_stop_order["broker_order_id"])
@@ -982,20 +1017,42 @@ class ExecutionWorker:
             cancel_result = None
 
         if recovered_replacement is None:
+            self._log_protective_stop_submission(
+                entry_order_row=latest_stop_order,
+                plan_row=plan_row,
+                market_type=market_type,
+                symbol=str(plan_row["symbol"]),
+                side=stop_side,
+                qty=desired_qty,
+                order_type=stop_spec.order_type,
+                time_in_force=stop_spec.time_in_force,
+                stop_price=stop_spec.stop_price,
+                limit_price=stop_spec.limit_price,
+                action="submitting replacement protective stop",
+            )
             try:
                 replacement_result = submit_stop_order(
                     client_order_id=replacement_client_order_id,
+                    market_type=market_type,
                     symbol=str(plan_row["symbol"]),
                     side=stop_side,
                     qty=desired_qty,
-                    stop_price=desired_stop_price,
+                    stop_price=stop_spec.stop_price,
                 )
             except Exception as exc:
                 recovered_replacement = find_broker_order_by_client_order_id(
                     replacement_client_order_id
                 )
                 if recovered_replacement is None:
-                    raise exc
+                    raise RuntimeError(
+                        "replacement protective stop submission failed "
+                        f"request_id={plan_row['request_id']} alert_id={plan_row['alert_id']} "
+                        f"paper_order_id={latest_stop_order['paper_order_id']} "
+                        f"market_type={market_type} symbol={plan_row['symbol']} side={stop_side} "
+                        f"qty={desired_qty} order_type={stop_spec.order_type} "
+                        f"time_in_force={stop_spec.time_in_force} stop_price={stop_spec.stop_price} "
+                        f"limit_price={stop_spec.limit_price} error={exc}"
+                    ) from exc
                 replacement_result = recovered_replacement
         else:
             replacement_result = recovered_replacement
@@ -1011,14 +1068,15 @@ class ExecutionWorker:
             side=stop_side,
             qty=desired_qty,
             notional=None,
-            order_type="stop",
-            time_in_force="gtc",
+            order_type=stop_spec.order_type,
+            time_in_force=stop_spec.time_in_force,
             order_role=PaperOrderRole.STOP.value,
             parent_paper_order_id=str(latest_stop_order["parent_paper_order_id"])
             if latest_stop_order["parent_paper_order_id"]
             else None,
             replaced_from_paper_order_id=str(latest_stop_order["paper_order_id"]),
-            stop_price=desired_stop_price,
+            limit_price=stop_spec.limit_price,
+            stop_price=stop_spec.stop_price,
             result=replacement_result,
         )
         if current_stop_order is not None:
@@ -1498,6 +1556,29 @@ class ExecutionWorker:
             "[execution-worker] warning post-entry lifecycle no-op "
             f"reason={reason} "
             f"{context}"
+        )
+
+    def _log_protective_stop_submission(
+        self,
+        *,
+        entry_order_row,
+        plan_row,
+        market_type: str | None,
+        symbol: str,
+        side: str,
+        qty: float,
+        order_type: str,
+        time_in_force: str,
+        stop_price: float,
+        limit_price: float | None,
+        action: str = "submitting protective stop",
+    ) -> None:
+        print(
+            f"[execution-worker] {action} "
+            f"{self._post_entry_log_context(entry_order_row=entry_order_row, plan_row=plan_row)} "
+            f"market_type={market_type} symbol={symbol} side={side} qty={qty} "
+            f"order_type={order_type} time_in_force={time_in_force} "
+            f"stop_price={stop_price} limit_price={limit_price}"
         )
 
     @staticmethod

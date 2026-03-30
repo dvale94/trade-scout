@@ -160,6 +160,59 @@ def submit_stop_order(
     return _normalize_order_result(response_json)
 
 
+def submit_stop_limit_order(
+    *,
+    client_order_id: str,
+    symbol: str,
+    side: str,
+    qty: float,
+    stop_price: float,
+    limit_price: float,
+    time_in_force: str = "gtc",
+) -> BrokerOrderResult:
+    _require_alpaca_config()
+
+    normalized_symbol = str(symbol).strip()
+    normalized_side = _map_side(side)
+    normalized_tif = str(time_in_force).strip().lower()
+    if not normalized_symbol:
+        raise RuntimeError("Stop-limit order is missing symbol for Alpaca submission")
+    if qty <= 0:
+        raise RuntimeError("Stop-limit order qty must be greater than 0")
+    if stop_price <= 0:
+        raise RuntimeError("Stop-limit order stop_price must be greater than 0")
+    if limit_price <= 0:
+        raise RuntimeError("Stop-limit order limit_price must be greater than 0")
+    if normalized_tif not in {"gtc", "ioc"}:
+        raise RuntimeError(
+            f"Stop-limit order time_in_force must be 'gtc' or 'ioc', got: {time_in_force}"
+        )
+
+    payload = {
+        "symbol": normalized_symbol,
+        "side": normalized_side,
+        "type": "stop_limit",
+        "time_in_force": normalized_tif,
+        "qty": str(qty),
+        "stop_price": str(stop_price),
+        "limit_price": str(limit_price),
+        "client_order_id": client_order_id,
+    }
+
+    url = f"{config.ALPACA_BASE_URL.rstrip('/')}/v2/orders"
+    response = requests.post(url, json=payload, headers=_auth_headers(), timeout=15)
+    response_json = _parse_response_json(response)
+
+    if response.status_code >= 400:
+        detail = response_json if isinstance(response_json, dict) else {"response": response_json}
+        raise RuntimeError(
+            "Alpaca stop-limit submission failed "
+            f"status={response.status_code} detail={json.dumps(detail, sort_keys=True)}"
+        )
+
+    return _normalize_order_result(response_json)
+
+
 def submit_limit_order(
     *,
     client_order_id: str,
