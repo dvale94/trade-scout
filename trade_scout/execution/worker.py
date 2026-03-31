@@ -41,6 +41,7 @@ from trade_scout.execution.queue import (
     insert_paper_order,
     mark_expired,
     mark_failed,
+    mark_paper_order_canceled,
     mark_paper_order_canceled_for_replace,
     mark_paper_order_replaced,
     mark_rejected,
@@ -1155,10 +1156,20 @@ class ExecutionWorker:
         remaining_qty = self._get_remaining_qty_from_realized_exits(conn, plan_id)
         if remaining_qty > 0:
             return
+        plan_row = self._get_plan_row_by_id(conn, plan_id)
+        if plan_row is None:
+            return
+        if closing_fill_role == PaperOrderRole.STOP.value:
+            self.cancel_live_sibling_exit_orders_for_closed_plan(
+                conn,
+                plan_row=plan_row,
+                closing_order_row=closing_order_row,
+            )
         plan_row = update_trade_plan_position_closed(
             conn,
             plan_id=plan_id,
             closed_ts_utc=closing_fill_ts_utc,
+            remaining_qty=0.0,
         )
         if plan_row is None:
             return
@@ -1214,6 +1225,82 @@ class ExecutionWorker:
             f"[execution-worker] created outcome plan_id={plan_row['plan_id']} "
             f"outcome_id={outcome_row['outcome_id']}"
         )
+
+    def cancel_live_sibling_exit_orders_for_closed_plan(
+        self,
+        conn,
+        *,
+        plan_row,
+        closing_order_row=None,
+    ) -> None:
+        closing_paper_order_id = None
+        if closing_order_row is not None:
+            closing_paper_order_id = str(closing_order_row["paper_order_id"])
+
+        for order_role in (PaperOrderRole.TP1.value, PaperOrderRole.TP2.value):
+            sibling_order_row = get_paper_order_by_plan_id_and_role(
+                conn,
+                str(plan_row["plan_id"]),
+                order_role,
+            )
+            if sibling_order_row is None:
+                continue
+            if closing_paper_order_id and str(sibling_order_row["paper_order_id"]) == closing_paper_order_id:
+                continue
+
+            sibling_status = str(sibling_order_row["order_status"])
+            if sibling_status not in {
+                PaperOrderStatus.SUBMITTED.value,
+                PaperOrderStatus.ACCEPTED.value,
+                PaperOrderStatus.PARTIALLY_FILLED.value,
+            }:
+                continue
+
+            broker_order_id = self._coerce_optional_str(sibling_order_row["broker_order_id"])
+            if not broker_order_id:
+                mark_paper_order_canceled(
+                    conn,
+                    paper_order_id=str(sibling_order_row["paper_order_id"]),
+                )
+                continue
+
+            try:
+                cancel_result = cancel_broker_order(broker_order_id)
+            except Exception as exc:
+                try:
+                    broker_snapshot = fetch_broker_order_by_id(broker_order_id)
+                except Exception:
+                    broker_snapshot = None
+                if broker_snapshot is not None:
+                    normalized_status = normalize_broker_order_status(
+                        broker_snapshot.broker_status_raw
+                    )
+                    if normalized_status in {
+                        PaperOrderStatus.CANCELED.value,
+                        PaperOrderStatus.FILLED.value,
+                        PaperOrderStatus.REJECTED.value,
+                        PaperOrderStatus.EXPIRED.value,
+                    }:
+                        reconcile_paper_order_from_broker(
+                            conn,
+                            paper_order_id=str(sibling_order_row["paper_order_id"]),
+                            broker_snapshot=broker_snapshot,
+                            order_status=normalized_status,
+                        )
+                        continue
+                print(
+                    "[execution-worker] warning sibling tp cancel failed "
+                    f"plan_id={plan_row['plan_id']} paper_order_id={sibling_order_row['paper_order_id']} "
+                    f"order_role={order_role} error={exc}"
+                )
+                continue
+
+            reconcile_paper_order_from_broker(
+                conn,
+                paper_order_id=str(sibling_order_row["paper_order_id"]),
+                broker_snapshot=cancel_result,
+                order_status=PaperOrderStatus.CANCELED.value,
+            )
 
     def _get_remaining_qty_from_realized_exits(self, conn, plan_id: str) -> float:
         plan_row = self._get_plan_row_by_id(conn, plan_id)
