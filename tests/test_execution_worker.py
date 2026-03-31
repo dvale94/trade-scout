@@ -2254,6 +2254,7 @@ class ExecutionWorkerTest(unittest.TestCase):
                 entry_avg_fill_px=100.0,
                 entry_fill_ts_utc="2026-03-26T14:00:00+00:00",
                 position_status="OPEN",
+                remaining_qty=1.0,
             )
             self._insert_paper_order_row(
                 conn,
@@ -2267,22 +2268,58 @@ class ExecutionWorkerTest(unittest.TestCase):
                 side="SHORT",
                 stop_price=95.0,
             )
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-tp1-close",
+                request_id="req-close",
+                client_order_id="req-close:TP1",
+                broker_order_id="broker-tp1-close",
+                order_status="ACCEPTED",
+                order_role="TP1",
+                parent_paper_order_id="po-entry-close",
+                side="SHORT",
+                qty=0.5,
+                limit_price=110.0,
+                reduce_only=1,
+            )
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-tp2-close",
+                request_id="req-close",
+                client_order_id="req-close:TP2",
+                broker_order_id="broker-tp2-close",
+                order_status="ACCEPTED",
+                order_role="TP2",
+                parent_paper_order_id="po-entry-close",
+                side="SHORT",
+                qty=0.5,
+                limit_price=115.0,
+                reduce_only=1,
+            )
             stop_row = conn.execute(
                 "SELECT * FROM paper_orders WHERE paper_order_id = ?",
                 ("po-stop-close",),
             ).fetchone()
 
-            reconciled = self.worker.reconcile_paper_order(
-                conn,
-                stop_row,
-                self._broker_result(
-                    "broker-stop-close",
-                    broker_status_raw="filled",
-                    filled_ts_utc="2026-03-26T14:10:00+00:00",
-                    filled_qty=1.0,
-                    filled_avg_price=95.0,
+            with patch(
+                "trade_scout.execution.worker.cancel_broker_order",
+                side_effect=lambda broker_order_id: self._broker_result(
+                    broker_order_id,
+                    broker_status_raw="canceled",
+                    canceled_ts_utc="2026-03-26T14:10:01+00:00",
                 ),
-            )
+            ) as cancel_mock:
+                reconciled = self.worker.reconcile_paper_order(
+                    conn,
+                    stop_row,
+                    self._broker_result(
+                        "broker-stop-close",
+                        broker_status_raw="filled",
+                        filled_ts_utc="2026-03-26T14:10:00+00:00",
+                        filled_qty=1.0,
+                        filled_avg_price=95.0,
+                    ),
+                )
             stop_fill = get_paper_fill_by_order_id_and_role(conn, "po-stop-close", "STOP")
             outcome_row = conn.execute(
                 "SELECT * FROM paper_trade_outcomes WHERE plan_id = ?",
@@ -2292,12 +2329,21 @@ class ExecutionWorkerTest(unittest.TestCase):
                 "SELECT * FROM paper_trade_plans WHERE request_id = ?",
                 ("req-close",),
             ).fetchone()
+            tp1_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+                ("po-tp1-close",),
+            ).fetchone()
+            tp2_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+                ("po-tp2-close",),
+            ).fetchone()
         finally:
             conn.close()
 
         self.assertEqual("FILLED", reconciled["order_status"])
         self.assertIsNotNone(stop_fill)
         self.assertEqual("STOP", stop_fill["fill_role"])
+        self.assertEqual(2, cancel_mock.call_count)
         self.assertIsNotNone(outcome_row)
         self.assertEqual("STOP", outcome_row["exit_reason"])
         self.assertEqual(1, outcome_row["closed"])
@@ -2305,7 +2351,10 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual(95.0, outcome_row["exit_avg_px"])
         self.assertEqual(-5.0, outcome_row["gross_pnl"])
         self.assertEqual(-1.0, outcome_row["realized_r"])
+        self.assertEqual("CANCELED", tp1_row["order_status"])
+        self.assertEqual("CANCELED", tp2_row["order_status"])
         self.assertEqual("CLOSED", plan_row["position_status"])
+        self.assertEqual(0.0, plan_row["remaining_qty"])
         self.assertEqual("2026-03-26T14:10:00+00:00", plan_row["closed_ts_utc"])
         summary = json.loads(outcome_row["raw_summary_json"])
         self.assertEqual(["po-stop-close:STOP"], summary["exit_fill_ids"])
@@ -2606,6 +2655,7 @@ class ExecutionWorkerTest(unittest.TestCase):
                 entry_avg_fill_px=100.0,
                 entry_fill_ts_utc="2026-03-26T14:00:00+00:00",
                 position_status="OPEN",
+                remaining_qty=1.0,
             )
             self._insert_paper_order_row(
                 conn,
@@ -2619,6 +2669,34 @@ class ExecutionWorkerTest(unittest.TestCase):
                 side="SHORT",
                 stop_price=95.0,
             )
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-tp1-close-idem",
+                request_id="req-close-idem",
+                client_order_id="req-close-idem:TP1",
+                broker_order_id="broker-tp1-close-idem",
+                order_status="ACCEPTED",
+                order_role="TP1",
+                parent_paper_order_id="po-entry-close-idem",
+                side="SHORT",
+                qty=0.5,
+                limit_price=110.0,
+                reduce_only=1,
+            )
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-tp2-close-idem",
+                request_id="req-close-idem",
+                client_order_id="req-close-idem:TP2",
+                broker_order_id="broker-tp2-close-idem",
+                order_status="ACCEPTED",
+                order_role="TP2",
+                parent_paper_order_id="po-entry-close-idem",
+                side="SHORT",
+                qty=0.5,
+                limit_price=115.0,
+                reduce_only=1,
+            )
             stop_row = conn.execute(
                 "SELECT * FROM paper_orders WHERE paper_order_id = ?",
                 ("po-stop-close-idem",),
@@ -2630,20 +2708,44 @@ class ExecutionWorkerTest(unittest.TestCase):
                 filled_qty=1.0,
                 filled_avg_price=95.0,
             )
-            self.worker.reconcile_paper_order(conn, stop_row, snapshot)
-            second_stop_row = conn.execute(
-                "SELECT * FROM paper_orders WHERE paper_order_id = ?",
-                ("po-stop-close-idem",),
-            ).fetchone()
-            self.worker.reconcile_paper_order(conn, second_stop_row, snapshot)
+            with patch(
+                "trade_scout.execution.worker.cancel_broker_order",
+                side_effect=lambda broker_order_id: self._broker_result(
+                    broker_order_id,
+                    broker_status_raw="canceled",
+                    canceled_ts_utc="2026-03-26T14:15:01+00:00",
+                ),
+            ) as cancel_mock:
+                self.worker.reconcile_paper_order(conn, stop_row, snapshot)
+                second_stop_row = conn.execute(
+                    "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+                    ("po-stop-close-idem",),
+                ).fetchone()
+                self.worker.reconcile_paper_order(conn, second_stop_row, snapshot)
             outcome_count = conn.execute(
                 "SELECT COUNT(*) AS n FROM paper_trade_outcomes WHERE plan_id = ?",
                 ("plan-req-close-idem",),
             ).fetchone()["n"]
+            plan_row = conn.execute(
+                "SELECT * FROM paper_trade_plans WHERE request_id = ?",
+                ("req-close-idem",),
+            ).fetchone()
+            tp1_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+                ("po-tp1-close-idem",),
+            ).fetchone()
+            tp2_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+                ("po-tp2-close-idem",),
+            ).fetchone()
         finally:
             conn.close()
 
+        self.assertEqual(2, cancel_mock.call_count)
         self.assertEqual(1, outcome_count)
+        self.assertEqual("CANCELED", tp1_row["order_status"])
+        self.assertEqual("CANCELED", tp2_row["order_status"])
+        self.assertEqual(0.0, plan_row["remaining_qty"])
 
     def test_role_aware_lookup_returns_only_entry_order(self) -> None:
         conn = get_connection(self.db_path)

@@ -1271,17 +1271,20 @@ def update_trade_plan_position_closed(
     *,
     plan_id: str,
     closed_ts_utc: str,
+    remaining_qty: float | None = None,
 ) -> sqlite3.Row | None:
     conn.execute(
         """
         UPDATE paper_trade_plans
         SET position_status = ?,
-            closed_ts_utc = ?
+            closed_ts_utc = ?,
+            remaining_qty = COALESCE(?, remaining_qty)
         WHERE plan_id = ?
         """,
         (
             PaperTradePlanPositionStatus.CLOSED.value,
             closed_ts_utc,
+            remaining_qty,
             plan_id,
         ),
     )
@@ -1547,6 +1550,41 @@ def mark_paper_order_canceled_for_replace(
             PaperOrderStatus.CANCELED.value,
             effective_canceled_ts_utc,
             "canceled_for_replace",
+            effective_canceled_ts_utc,
+            raw_response_json,
+            paper_order_id,
+        ),
+    )
+    conn.commit()
+    return conn.execute(
+        "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+        (paper_order_id,),
+    ).fetchone()
+
+
+def mark_paper_order_canceled(
+    conn: sqlite3.Connection,
+    *,
+    paper_order_id: str,
+    canceled_ts_utc: str | None = None,
+    raw_response_json: str | None = None,
+    status_reason: str = "canceled_after_stop_close",
+) -> sqlite3.Row | None:
+    effective_canceled_ts_utc = canceled_ts_utc or utc_now_iso()
+    conn.execute(
+        """
+        UPDATE paper_orders
+        SET order_status = ?,
+            canceled_ts_utc = COALESCE(?, canceled_ts_utc),
+            status_reason = ?,
+            last_broker_update_ts_utc = ?,
+            raw_response_json = COALESCE(?, raw_response_json)
+        WHERE paper_order_id = ?
+        """,
+        (
+            PaperOrderStatus.CANCELED.value,
+            effective_canceled_ts_utc,
+            status_reason,
             effective_canceled_ts_utc,
             raw_response_json,
             paper_order_id,
