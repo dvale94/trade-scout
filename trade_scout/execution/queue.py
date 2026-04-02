@@ -538,6 +538,22 @@ def get_paper_order_by_request_id_and_role(
     ).fetchone()
 
 
+def get_paper_order_by_plan_id_and_role(
+    conn: sqlite3.Connection, plan_id: str, order_role: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT *
+        FROM paper_orders
+        WHERE plan_id = ?
+          AND order_role = ?
+        ORDER BY submitted_ts_utc ASC
+        LIMIT 1
+        """,
+        (plan_id, order_role),
+    ).fetchone()
+
+
 def get_paper_order_by_client_order_id(
     conn: sqlite3.Connection, client_order_id: str
 ) -> sqlite3.Row | None:
@@ -577,6 +593,19 @@ def get_paper_trade_plan_by_request_id(
         WHERE request_id = ?
         """,
         (request_id,),
+    ).fetchone()
+
+
+def get_paper_trade_plan_by_plan_id(
+    conn: sqlite3.Connection, plan_id: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT *
+        FROM paper_trade_plans
+        WHERE plan_id = ?
+        """,
+        (plan_id,),
     ).fetchone()
 
 
@@ -875,6 +904,10 @@ def insert_paper_order(
     notional: Optional[float],
     order_type: str,
     time_in_force: Optional[str],
+    order_role: str = PaperOrderRole.ENTRY.value,
+    parent_paper_order_id: str | None = None,
+    limit_price: float | None = None,
+    stop_price: float | None = None,
     result: BrokerOrderResult,
 ) -> sqlite3.Row:
     existing = get_paper_order_by_client_order_id(conn, client_order_id)
@@ -900,6 +933,8 @@ def insert_paper_order(
             time_in_force,
             qty,
             notional,
+            limit_price,
+            stop_price,
             submitted_ts_utc,
             accepted_ts_utc,
             broker_status_raw,
@@ -907,7 +942,7 @@ def insert_paper_order(
             last_broker_update_ts_utc,
             raw_response_json,
             schema_version
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             paper_order_id,
@@ -917,14 +952,16 @@ def insert_paper_order(
             broker,
             result.broker_order_id,
             client_order_id,
-            None,
-            PaperOrderRole.ENTRY.value,
+            parent_paper_order_id,
+            order_role,
             symbol,
             side,
             order_type,
             time_in_force,
             qty,
             notional,
+            limit_price,
+            stop_price,
             result.submitted_ts_utc,
             result.accepted_ts_utc,
             result.broker_status_raw,

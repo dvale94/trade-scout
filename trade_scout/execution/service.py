@@ -5,8 +5,17 @@ from datetime import datetime, timedelta
 from typing import Any, Callable, Mapping, Optional
 
 from trade_scout import config
-from trade_scout.execution.broker import find_existing_broker_order, submit_validated_order
-from trade_scout.execution.models import PaperPositionActionStatus, PaperOrderRole
+from trade_scout.execution.broker import (
+    find_existing_broker_order,
+    find_existing_broker_order_by_client_order_id,
+    submit_protective_stop_order,
+    submit_validated_order,
+)
+from trade_scout.execution.models import (
+    PaperPositionActionStatus,
+    PaperPositionStatus,
+    PaperOrderRole,
+)
 from trade_scout.execution.policy import validate_execution_request
 from trade_scout.execution.reconciler import ExecutionReconciler
 from trade_scout.execution.repository import ExecutionRepository
@@ -22,6 +31,8 @@ class ExecutionService:
         max_alert_age_seconds: int,
         broker_order_finder: Callable | None = None,
         broker_order_submitter: Callable | None = None,
+        stop_order_finder: Callable | None = None,
+        stop_order_submitter: Callable | None = None,
     ):
         self.repository = repository
         self.reconciler = reconciler
@@ -29,6 +40,8 @@ class ExecutionService:
         self.max_alert_age_seconds = max_alert_age_seconds
         self.broker_order_finder = broker_order_finder
         self.broker_order_submitter = broker_order_submitter
+        self.stop_order_finder = stop_order_finder
+        self.stop_order_submitter = stop_order_submitter
 
     def process_claimed_request(self, conn, request_row) -> None:
         request_id = self._get_request_id(request_row)
@@ -214,14 +227,25 @@ class ExecutionService:
         actionable_positions = self.repository.get_positions_with_pending_actions(conn, limit=limit)
         processed_count = 0
         for position_row in actionable_positions:
-            self.ensure_post_entry_position_state(conn, position_row)
-            processed_count += 1
+            try:
+                self.ensure_post_entry_position_state(conn, position_row)
+                processed_count += 1
+            except Exception as exc:
+                self.repository.update_paper_position_action_error(
+                    conn,
+                    plan_id=str(position_row["plan_id"]),
+                    last_action_error=str(exc),
+                )
+                print(
+                    f"[execution-worker] position action failed plan_id={position_row['plan_id']} "
+                    f"pending_action_status={position_row['pending_action_status']} error={exc}"
+                )
         return processed_count
 
     def ensure_post_entry_position_state(self, conn, position_row):
         pending_action_status = str(position_row["pending_action_status"])
         if pending_action_status == PaperPositionActionStatus.PLACE_INITIAL_STOP.value:
-            return position_row
+            return self._place_initial_stop_if_needed(conn, position_row)
         return position_row
 
     def _require_alert_row(self, alert_id: str) -> Mapping[str, Any]:
@@ -402,3 +426,159 @@ class ExecutionService:
 
     def _get_broker_order_submitter(self) -> Callable:
         return self.broker_order_submitter or submit_validated_order
+
+    def _get_stop_order_finder(self) -> Callable:
+        return self.stop_order_finder or find_existing_broker_order_by_client_order_id
+
+    def _get_stop_order_submitter(self) -> Callable:
+        return self.stop_order_submitter or submit_protective_stop_order
+
+    def _place_initial_stop_if_needed(self, conn, position_row):
+        plan_id = str(position_row["plan_id"])
+        if str(position_row["position_status"]) not in {
+            PaperPositionStatus.OPEN.value,
+            PaperPositionStatus.PARTIAL.value,
+        }:
+            raise RuntimeError("initial stop action requires OPEN or PARTIAL position")
+
+        remaining_qty = self._coerce_float(position_row["remaining_qty"])
+        if remaining_qty is None or remaining_qty <= 0:
+            raise RuntimeError("initial stop action requires remaining_qty > 0")
+
+        trade_plan = self.repository.get_paper_trade_plan_by_plan_id(conn, plan_id)
+        if trade_plan is None:
+            raise RuntimeError("paper trade plan not found for position action")
+
+        stop_price = self._coerce_float(trade_plan["stop_px"])
+        if stop_price is None or stop_price <= 0:
+            raise RuntimeError("paper trade plan stop_px is missing or invalid")
+        stop_limit_price = stop_price
+        stop_client_order_id = self._build_initial_stop_client_order_id(plan_id)
+
+        local_stop_order = self.repository.get_paper_order_by_client_order_id(conn, stop_client_order_id)
+        if local_stop_order is None:
+            local_stop_order = self.repository.get_paper_order_by_plan_id_and_role(
+                conn,
+                plan_id,
+                PaperOrderRole.STOP.value,
+            )
+
+        if local_stop_order is not None:
+            return self._finalize_initial_stop_state(
+                conn,
+                position_row=position_row,
+                stop_order_row=local_stop_order,
+                stop_qty=remaining_qty,
+                stop_price=stop_price,
+                stop_limit_price=stop_limit_price,
+            )
+
+        remote_stop_order = self._get_stop_order_finder()(stop_client_order_id)
+        if remote_stop_order is not None:
+            local_stop_order = self.repository.insert_paper_order(
+                conn,
+                plan_id=plan_id,
+                request_id=str(position_row["request_id"]),
+                alert_id=str(position_row["alert_id"]),
+                broker=remote_stop_order.broker,
+                client_order_id=stop_client_order_id,
+                symbol=str(position_row["symbol"]),
+                side=str(position_row["side"]),
+                qty=remaining_qty,
+                notional=None,
+                order_type="stop_limit",
+                time_in_force="gtc",
+                order_role=PaperOrderRole.STOP.value,
+                parent_paper_order_id=str(position_row["entry_order_id"] or "") or None,
+                limit_price=stop_limit_price,
+                stop_price=stop_price,
+                result=remote_stop_order,
+            )
+            return self._finalize_initial_stop_state(
+                conn,
+                position_row=position_row,
+                stop_order_row=local_stop_order,
+                stop_qty=remaining_qty,
+                stop_price=stop_price,
+                stop_limit_price=stop_limit_price,
+            )
+
+        stop_result = self._get_stop_order_submitter()(
+            client_order_id=stop_client_order_id,
+            symbol=str(position_row["symbol"]),
+            side=str(position_row["side"]),
+            qty=remaining_qty,
+            stop_price=stop_price,
+            limit_price=stop_limit_price,
+        )
+        local_stop_order = self.repository.insert_paper_order(
+            conn,
+            plan_id=plan_id,
+            request_id=str(position_row["request_id"]),
+            alert_id=str(position_row["alert_id"]),
+            broker=stop_result.broker,
+            client_order_id=stop_client_order_id,
+            symbol=str(position_row["symbol"]),
+            side=str(position_row["side"]),
+            qty=remaining_qty,
+            notional=None,
+            order_type="stop_limit",
+            time_in_force="gtc",
+            order_role=PaperOrderRole.STOP.value,
+            parent_paper_order_id=str(position_row["entry_order_id"] or "") or None,
+            limit_price=stop_limit_price,
+            stop_price=stop_price,
+            result=stop_result,
+        )
+        print(
+            f"[execution-worker] placed initial stop plan_id={plan_id} "
+            f"paper_order_id={local_stop_order['paper_order_id']} broker_order_id={local_stop_order['broker_order_id']}"
+        )
+        return self._finalize_initial_stop_state(
+            conn,
+            position_row=position_row,
+            stop_order_row=local_stop_order,
+            stop_qty=remaining_qty,
+            stop_price=stop_price,
+            stop_limit_price=stop_limit_price,
+        )
+
+    def _finalize_initial_stop_state(
+        self,
+        conn,
+        *,
+        position_row,
+        stop_order_row,
+        stop_qty: float,
+        stop_price: float,
+        stop_limit_price: float | None,
+    ):
+        updated_position = self.repository.update_paper_position_stop_state(
+            conn,
+            plan_id=str(position_row["plan_id"]),
+            active_stop_paper_order_id=str(stop_order_row["paper_order_id"]),
+            stop_qty=stop_qty,
+            stop_price=stop_price,
+            stop_limit_price=stop_limit_price,
+        )
+        if updated_position is None:
+            raise RuntimeError("paper position stop state update did not persist")
+        updated_position = self.repository.update_paper_position_pending_action(
+            conn,
+            plan_id=str(position_row["plan_id"]),
+            pending_action_status=PaperPositionActionStatus.NONE.value,
+        )
+        updated_position = self.repository.update_paper_position_action_error(
+            conn,
+            plan_id=str(position_row["plan_id"]),
+            last_action_error=None,
+        )
+        print(
+            f"[execution-worker] linked initial stop plan_id={position_row['plan_id']} "
+            f"paper_order_id={stop_order_row['paper_order_id']}"
+        )
+        return updated_position
+
+    @staticmethod
+    def _build_initial_stop_client_order_id(plan_id: str) -> str:
+        return f"stop:{plan_id}"

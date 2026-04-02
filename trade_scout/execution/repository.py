@@ -86,6 +86,13 @@ class ExecutionRepository:
     ) -> sqlite3.Row | None:
         return queue.get_paper_trade_plan_by_request_id(conn, request_id)
 
+    def get_paper_trade_plan_by_plan_id(
+        self,
+        conn: sqlite3.Connection,
+        plan_id: str,
+    ) -> sqlite3.Row | None:
+        return queue.get_paper_trade_plan_by_plan_id(conn, plan_id)
+
     def get_paper_position_by_plan_id(
         self,
         conn: sqlite3.Connection,
@@ -121,6 +128,14 @@ class ExecutionRepository:
         order_role: str,
     ) -> sqlite3.Row | None:
         return queue.get_paper_order_by_request_id_and_role(conn, request_id, order_role)
+
+    def get_paper_order_by_plan_id_and_role(
+        self,
+        conn: sqlite3.Connection,
+        plan_id: str,
+        order_role: str,
+    ) -> sqlite3.Row | None:
+        return queue.get_paper_order_by_plan_id_and_role(conn, plan_id, order_role)
 
     def get_paper_order_by_client_order_id(
         self,

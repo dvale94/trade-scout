@@ -851,6 +851,160 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertNotEqual(5.0, position_row["remaining_qty"])
         self.assertEqual("PLACE_INITIAL_STOP", position_row["pending_action_status"])
 
+    def test_process_position_actions_places_initial_stop_and_links_position(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-stop-place", stop_px=94.5)
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET position_status = ?, remaining_qty = ?, entry_filled_qty = ?, entry_avg_fill_px = ?,
+                    opened_ts_utc = ?, pending_action_status = ?, entry_order_id = ?, entry_client_order_id = ?
+                WHERE request_id = ?
+                """,
+                (
+                    "OPEN",
+                    0.6,
+                    0.6,
+                    101.0,
+                    "2026-03-25T16:20:00+00:00",
+                    "PLACE_INITIAL_STOP",
+                    "po-entry-stop-place",
+                    "req-stop-place",
+                    "req-stop-place",
+                ),
+            )
+            conn.commit()
+
+            with patch(
+                "trade_scout.execution.service.find_existing_broker_order_by_client_order_id",
+                return_value=None,
+            ), patch(
+                "trade_scout.execution.service.submit_protective_stop_order",
+                return_value=self._broker_result("broker-stop-place", broker_status_raw="new"),
+            ):
+                processed = self.worker.service.process_position_actions(conn, limit=10)
+
+            stop_order = conn.execute(
+                "SELECT * FROM paper_orders WHERE request_id = ? AND order_role = ?",
+                ("req-stop-place", "STOP"),
+            ).fetchone()
+            position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-stop-place",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(1, processed)
+        self.assertIsNotNone(stop_order)
+        self.assertEqual("STOP", stop_order["order_role"])
+        self.assertEqual("stop:plan-req-stop-place", stop_order["client_order_id"])
+        self.assertEqual(0.6, stop_order["qty"])
+        self.assertEqual(94.5, stop_order["stop_price"])
+        self.assertEqual(94.5, stop_order["limit_price"])
+        self.assertEqual("po-entry-stop-place", stop_order["parent_paper_order_id"])
+        self.assertEqual(stop_order["paper_order_id"], position_row["active_stop_paper_order_id"])
+        self.assertEqual(0.6, position_row["stop_qty"])
+        self.assertEqual(94.5, position_row["stop_price"])
+        self.assertEqual(94.5, position_row["stop_limit_price"])
+        self.assertEqual(PaperPositionActionStatus.NONE.value, position_row["pending_action_status"])
+        self.assertIsNone(position_row["last_action_error"])
+
+    def test_process_position_actions_is_idempotent_for_existing_local_stop(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-stop-local", stop_px=93.0)
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET position_status = ?, remaining_qty = ?, entry_filled_qty = ?, pending_action_status = ?
+                WHERE request_id = ?
+                """,
+                ("OPEN", 0.4, 0.4, "PLACE_INITIAL_STOP", "req-stop-local"),
+            )
+            conn.commit()
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-stop-local",
+                request_id="req-stop-local",
+                client_order_id="stop:plan-req-stop-local",
+                broker_order_id="broker-stop-local",
+                order_status="SUBMITTED",
+                order_role="STOP",
+                parent_paper_order_id="po-entry-local",
+                order_type="stop_limit",
+                qty=0.4,
+                notional=None,
+                limit_price=93.0,
+                stop_price=93.0,
+                broker_status_raw="new",
+            )
+
+            with patch(
+                "trade_scout.execution.service.submit_protective_stop_order",
+                side_effect=AssertionError("submit_protective_stop_order should not be called"),
+            ):
+                processed = self.worker.service.process_position_actions(conn, limit=10)
+
+            stop_rows = conn.execute(
+                "SELECT * FROM paper_orders WHERE request_id = ? AND order_role = ?",
+                ("req-stop-local", "STOP"),
+            ).fetchall()
+            position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-stop-local",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(1, processed)
+        self.assertEqual(1, len(stop_rows))
+        self.assertEqual("po-stop-local", position_row["active_stop_paper_order_id"])
+        self.assertEqual(PaperPositionActionStatus.NONE.value, position_row["pending_action_status"])
+
+    def test_process_position_actions_recovers_remote_stop_by_deterministic_client_order_id(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-stop-remote", stop_px=92.25)
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET position_status = ?, remaining_qty = ?, entry_filled_qty = ?, pending_action_status = ?
+                WHERE request_id = ?
+                """,
+                ("OPEN", 0.55, 0.55, "PLACE_INITIAL_STOP", "req-stop-remote"),
+            )
+            conn.commit()
+
+            with patch(
+                "trade_scout.execution.service.find_existing_broker_order_by_client_order_id",
+                return_value=self._broker_result("broker-stop-remote", broker_status_raw="accepted"),
+            ), patch(
+                "trade_scout.execution.service.submit_protective_stop_order",
+                side_effect=AssertionError("submit_protective_stop_order should not be called"),
+            ):
+                processed = self.worker.service.process_position_actions(conn, limit=10)
+
+            stop_order = conn.execute(
+                "SELECT * FROM paper_orders WHERE request_id = ? AND order_role = ?",
+                ("req-stop-remote", "STOP"),
+            ).fetchone()
+            position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-stop-remote",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(1, processed)
+        self.assertIsNotNone(stop_order)
+        self.assertEqual("stop:plan-req-stop-remote", stop_order["client_order_id"])
+        self.assertEqual("broker-stop-remote", stop_order["broker_order_id"])
+        self.assertEqual("STOP", stop_order["order_role"])
+        self.assertEqual(stop_order["paper_order_id"], position_row["active_stop_paper_order_id"])
+        self.assertEqual(PaperPositionActionStatus.NONE.value, position_row["pending_action_status"])
+
     def test_repeated_reconciliation_does_not_reset_pending_action_scaffolding(self) -> None:
         conn = get_connection(self.db_path)
         try:
@@ -1263,6 +1417,7 @@ class ExecutionWorkerTest(unittest.TestCase):
         *,
         request_id: str,
         entry_status: str = "PENDING",
+        stop_px: float | None = 95.0,
     ) -> None:
         conn.execute(
             """
@@ -1274,6 +1429,7 @@ class ExecutionWorkerTest(unittest.TestCase):
                 symbol,
                 side,
                 entry_type,
+                stop_px,
                 plan_rules_json,
                 plan_status,
                 entry_status,
@@ -1281,7 +1437,7 @@ class ExecutionWorkerTest(unittest.TestCase):
                 entry_avg_fill_px,
                 entry_fill_ts_utc,
                 schema_version
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 "plan-" + request_id,
@@ -1291,6 +1447,7 @@ class ExecutionWorkerTest(unittest.TestCase):
                 "AAPL",
                 "LONG",
                 "MARKET",
+                stop_px,
                 "{}",
                 "CREATED",
                 entry_status,
@@ -1353,6 +1510,13 @@ class ExecutionWorkerTest(unittest.TestCase):
         client_order_id: str,
         broker_order_id: str,
         order_status: str,
+        order_role: str = "ENTRY",
+        parent_paper_order_id: str | None = None,
+        order_type: str = "market",
+        qty: float | None = None,
+        notional: float | None = 25.0,
+        limit_price: float | None = None,
+        stop_price: float | None = None,
         broker_status_raw: str = "submitted",
         accepted_ts_utc: str | None = "2026-03-25T14:00:01+00:00",
         filled_ts_utc: str | None = None,
@@ -1375,6 +1539,8 @@ class ExecutionWorkerTest(unittest.TestCase):
                 time_in_force,
                 qty,
                 notional,
+                limit_price,
+                stop_price,
                 submitted_ts_utc,
                 accepted_ts_utc,
                 filled_ts_utc,
@@ -1383,7 +1549,7 @@ class ExecutionWorkerTest(unittest.TestCase):
                 last_broker_update_ts_utc,
                 raw_response_json,
                 schema_version
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 paper_order_id,
@@ -1393,14 +1559,16 @@ class ExecutionWorkerTest(unittest.TestCase):
                 "alpaca_paper",
                 broker_order_id,
                 client_order_id,
-                None,
-                "ENTRY",
+                parent_paper_order_id,
+                order_role,
                 "AAPL",
                 "LONG",
-                "market",
+                order_type,
                 "gtc",
-                None,
-                25.0,
+                qty,
+                notional,
+                limit_price,
+                stop_price,
                 "2026-03-25T14:00:00+00:00",
                 accepted_ts_utc,
                 filled_ts_utc,

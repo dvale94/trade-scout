@@ -22,6 +22,15 @@ def _map_side(side: str) -> str:
     raise ValueError(f"Unsupported execution side for Alpaca: {side}")
 
 
+def _map_exit_side(side: str) -> str:
+    normalized = str(side).strip().upper()
+    if normalized == "LONG":
+        return "sell"
+    if normalized == "SHORT":
+        return "buy"
+    raise ValueError(f"Unsupported execution side for Alpaca exit: {side}")
+
+
 def _require_alpaca_config() -> None:
     if not config.ALPACA_API_KEY.strip():
         raise RuntimeError("Missing ALPACA_API_KEY for paper execution submission")
@@ -113,6 +122,50 @@ def submit_market_order(
         detail = response_json if isinstance(response_json, dict) else {"response": response_json}
         raise RuntimeError(
             f"Alpaca submission failed status={response.status_code} detail={json.dumps(detail, sort_keys=True)}"
+        )
+
+    return _normalize_order_result(response_json)
+
+
+def submit_stop_order(
+    *,
+    client_order_id: str,
+    symbol: str,
+    side: str,
+    qty: float,
+    stop_price: float,
+    limit_price: float | None = None,
+) -> BrokerOrderResult:
+    _require_alpaca_config()
+
+    normalized_symbol = str(symbol).strip()
+    if not normalized_symbol:
+        raise RuntimeError("STOP submission requires symbol")
+    if qty <= 0:
+        raise RuntimeError("STOP submission requires qty > 0")
+    if stop_price <= 0:
+        raise RuntimeError("STOP submission requires stop_price > 0")
+
+    payload = {
+        "symbol": normalized_symbol,
+        "side": _map_exit_side(side),
+        "type": "stop_limit" if limit_price is not None else "stop",
+        "time_in_force": "gtc",
+        "qty": str(qty),
+        "stop_price": str(stop_price),
+        "client_order_id": client_order_id,
+    }
+    if limit_price is not None:
+        payload["limit_price"] = str(limit_price)
+
+    url = f"{config.ALPACA_BASE_URL.rstrip('/')}/v2/orders"
+    response = requests.post(url, json=payload, headers=_auth_headers(), timeout=15)
+    response_json = _parse_response_json(response)
+
+    if response.status_code >= 400:
+        detail = response_json if isinstance(response_json, dict) else {"response": response_json}
+        raise RuntimeError(
+            f"Alpaca stop submission failed status={response.status_code} detail={json.dumps(detail, sort_keys=True)}"
         )
 
     return _normalize_order_result(response_json)
