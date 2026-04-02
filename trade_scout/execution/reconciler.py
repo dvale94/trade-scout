@@ -114,6 +114,20 @@ class ExecutionReconciler:
         if fill_row is None:
             return
 
+        self.repository.update_paper_position_from_entry_fill(
+            conn,
+            plan_id=str(paper_order_row["plan_id"]),
+            request_id=str(paper_order_row["request_id"]),
+            alert_id=str(paper_order_row["alert_id"]),
+            symbol=str(paper_order_row["symbol"]),
+            side=str(paper_order_row["side"]),
+            entry_order_id=str(paper_order_row["paper_order_id"]),
+            entry_client_order_id=self._coerce_optional_str(paper_order_row["client_order_id"]),
+            entry_filled_qty=float(fill_row["fill_qty"]),
+            entry_avg_fill_px=float(fill_row["fill_px"]),
+            opened_ts_utc=str(fill_row["fill_ts_utc"]),
+        )
+
         print(
             f"[execution-worker] ingested fill paper_order_id={paper_order_row['paper_order_id']} "
             f"paper_fill_id={fill_row['paper_fill_id']} entry_status={entry_status}"

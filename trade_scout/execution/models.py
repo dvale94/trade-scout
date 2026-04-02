@@ -25,6 +25,12 @@ class PaperTradePlanEntryStatus(str, Enum):
     FILLED = "FILLED"
 
 
+class PaperPositionStatus(str, Enum):
+    PENDING_ENTRY = "PENDING_ENTRY"
+    OPEN = "OPEN"
+    CLOSED = "CLOSED"
+
+
 class PaperOrderRole(str, Enum):
     ENTRY = "ENTRY"
 

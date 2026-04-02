@@ -113,6 +113,7 @@ class ExecutionService:
                 alert_id=alert_id,
                 alert_row=alert_row,
             )
+            self._ensure_position_for_plan(conn, trade_plan)
 
             existing_order = self.repository.get_paper_order_by_request_id_and_role(
                 conn,
@@ -120,6 +121,7 @@ class ExecutionService:
                 PaperOrderRole.ENTRY.value,
             )
             if existing_order is not None:
+                self._ensure_position_for_plan(conn, trade_plan, existing_order)
                 self._mark_submitted_from_local_order(conn, request_id, existing_order)
                 print(
                     f"[execution-worker] reused local paper order request_id={request_id} "
@@ -137,6 +139,7 @@ class ExecutionService:
                     alert_row=alert_row,
                     result=recovered_remote_order,
                 )
+                self._ensure_position_for_plan(conn, trade_plan, local_order)
                 self._mark_submitted_from_local_order(conn, request_id, local_order)
                 print(
                     f"[execution-worker] recovered remote broker order request_id={request_id} "
@@ -157,6 +160,7 @@ class ExecutionService:
                 alert_row=alert_row,
                 result=result,
             )
+            self._ensure_position_for_plan(conn, trade_plan, local_order)
             self._mark_submitted_from_local_order(conn, request_id, local_order)
             print(
                 f"[execution-worker] submitted request_id={request_id} "
@@ -188,6 +192,7 @@ class ExecutionService:
                         alert_row=alert_row,
                         result=recovered_remote_order,
                     )
+                    self._ensure_position_for_plan(conn, trade_plan, local_order)
                     self._mark_submitted_from_local_order(conn, request_id, local_order)
                     print(
                         "[execution-worker] recovered broker order after submit exception "
@@ -325,6 +330,23 @@ class ExecutionService:
             broker=str(local_order["broker"]),
             broker_order_id=str(local_order["broker_order_id"]),
             submitted_ts_utc=str(local_order["submitted_ts_utc"]),
+        )
+
+    def _ensure_position_for_plan(self, conn, trade_plan, local_order=None):
+        entry_order_id = None
+        entry_client_order_id = None
+        if local_order is not None:
+            entry_order_id = self._coerce_optional_str(local_order["paper_order_id"])
+            entry_client_order_id = self._coerce_optional_str(local_order["client_order_id"])
+        return self.repository.ensure_paper_position(
+            conn,
+            plan_id=str(trade_plan["plan_id"]),
+            request_id=str(trade_plan["request_id"]),
+            alert_id=str(trade_plan["alert_id"]),
+            symbol=str(trade_plan["symbol"]),
+            side=str(trade_plan["side"]),
+            entry_order_id=entry_order_id,
+            entry_client_order_id=entry_client_order_id,
         )
 
     @staticmethod

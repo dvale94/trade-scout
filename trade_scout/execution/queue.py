@@ -10,6 +10,7 @@ from trade_scout.execution.models import (
     ExecutionRequest,
     ExecutionStatus,
     PaperFillRole,
+    PaperPositionStatus,
     PaperOrderRole,
     PaperOrderStatus,
     PaperTradePlanEntryStatus,
@@ -25,6 +26,7 @@ ACTIVE_REQUEST_STATUSES = (
 PAPER_TRADE_PLAN_SCHEMA_VERSION = "1"
 PAPER_ORDER_SCHEMA_VERSION = "1"
 PAPER_FILL_SCHEMA_VERSION = "1"
+PAPER_POSITION_SCHEMA_VERSION = "1"
 PAPER_TRADE_PLAN_ENTRY_TYPE_MARKET = "MARKET"
 TERMINAL_PAPER_ORDER_STATUSES = (
     PaperOrderStatus.FILLED.value,
@@ -191,6 +193,29 @@ def init_db(db_path: str) -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS paper_positions (
+                position_id TEXT PRIMARY KEY,
+                plan_id TEXT NOT NULL UNIQUE,
+                request_id TEXT NOT NULL,
+                alert_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                position_status TEXT NOT NULL,
+                entry_order_id TEXT,
+                entry_client_order_id TEXT,
+                entry_filled_qty REAL NOT NULL DEFAULT 0,
+                entry_avg_fill_px REAL,
+                opened_ts_utc TEXT,
+                closed_ts_utc TEXT,
+                remaining_qty REAL NOT NULL DEFAULT 0,
+                created_ts_utc TEXT NOT NULL,
+                updated_ts_utc TEXT NOT NULL,
+                schema_version TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_exec_req_status
             ON execution_requests (status)
             """
@@ -241,6 +266,12 @@ def init_db(db_path: str) -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_paper_fills_plan_id
             ON paper_fills (plan_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_paper_positions_request_id
+            ON paper_positions (request_id)
             """
         )
         conn.execute(
@@ -510,6 +541,32 @@ def get_paper_trade_plan_by_request_id(
     ).fetchone()
 
 
+def get_paper_position_by_plan_id(
+    conn: sqlite3.Connection, plan_id: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT *
+        FROM paper_positions
+        WHERE plan_id = ?
+        """,
+        (plan_id,),
+    ).fetchone()
+
+
+def get_paper_position_by_request_id(
+    conn: sqlite3.Connection, request_id: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT *
+        FROM paper_positions
+        WHERE request_id = ?
+        """,
+        (request_id,),
+    ).fetchone()
+
+
 def create_paper_trade_plan(
     conn: sqlite3.Connection,
     *,
@@ -637,6 +694,93 @@ def create_paper_trade_plan(
     if created is None:
         raise RuntimeError("paper trade plan insert did not persist")
     return created
+
+
+def ensure_paper_position(
+    conn: sqlite3.Connection,
+    *,
+    plan_id: str,
+    request_id: str,
+    alert_id: str,
+    symbol: str,
+    side: str,
+    entry_order_id: str | None = None,
+    entry_client_order_id: str | None = None,
+) -> sqlite3.Row:
+    existing = get_paper_position_by_plan_id(conn, plan_id)
+    now = utc_now_iso()
+    if existing is None:
+        position_id = str(uuid4())
+        conn.execute(
+            """
+            INSERT INTO paper_positions (
+                position_id,
+                plan_id,
+                request_id,
+                alert_id,
+                symbol,
+                side,
+                position_status,
+                entry_order_id,
+                entry_client_order_id,
+                entry_filled_qty,
+                entry_avg_fill_px,
+                opened_ts_utc,
+                closed_ts_utc,
+                remaining_qty,
+                created_ts_utc,
+                updated_ts_utc,
+                schema_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                position_id,
+                plan_id,
+                request_id,
+                alert_id,
+                symbol,
+                side,
+                PaperPositionStatus.PENDING_ENTRY.value,
+                entry_order_id,
+                entry_client_order_id,
+                0.0,
+                None,
+                None,
+                None,
+                0.0,
+                now,
+                now,
+                PAPER_POSITION_SCHEMA_VERSION,
+            ),
+        )
+        conn.commit()
+        created = get_paper_position_by_plan_id(conn, plan_id)
+        if created is None:
+            raise RuntimeError("paper position insert did not persist")
+        return created
+
+    if (
+        (entry_order_id and str(existing["entry_order_id"] or "") != entry_order_id)
+        or (
+            entry_client_order_id
+            and str(existing["entry_client_order_id"] or "") != entry_client_order_id
+        )
+    ):
+        conn.execute(
+            """
+            UPDATE paper_positions
+            SET entry_order_id = COALESCE(?, entry_order_id),
+                entry_client_order_id = COALESCE(?, entry_client_order_id),
+                updated_ts_utc = ?
+            WHERE plan_id = ?
+            """,
+            (entry_order_id, entry_client_order_id, now, plan_id),
+        )
+        conn.commit()
+        existing = get_paper_position_by_plan_id(conn, plan_id)
+        if existing is None:
+            raise RuntimeError("paper position update did not persist")
+    return existing
 
 
 def insert_paper_order(
@@ -916,6 +1060,71 @@ def upsert_entry_fill_from_broker_snapshot(
     )
 
     return get_paper_fill_by_order_id_and_role(conn, paper_order_id, fill_role)
+
+
+def update_paper_position_from_entry_fill(
+    conn: sqlite3.Connection,
+    *,
+    plan_id: str,
+    request_id: str,
+    alert_id: str,
+    symbol: str,
+    side: str,
+    entry_order_id: str | None,
+    entry_client_order_id: str | None,
+    entry_filled_qty: float,
+    entry_avg_fill_px: float,
+    opened_ts_utc: str,
+) -> sqlite3.Row | None:
+    position_row = ensure_paper_position(
+        conn,
+        plan_id=plan_id,
+        request_id=request_id,
+        alert_id=alert_id,
+        symbol=symbol,
+        side=side,
+        entry_order_id=entry_order_id,
+        entry_client_order_id=entry_client_order_id,
+    )
+    if position_row is None:
+        return None
+
+    current_opened_ts_utc = str(position_row["opened_ts_utc"]) if position_row["opened_ts_utc"] else None
+    next_status = (
+        PaperPositionStatus.OPEN.value
+        if entry_filled_qty > 0
+        else str(position_row["position_status"])
+    )
+    next_opened_ts_utc = current_opened_ts_utc or (opened_ts_utc if entry_filled_qty > 0 else None)
+    updated_ts_utc = utc_now_iso()
+
+    conn.execute(
+        """
+        UPDATE paper_positions
+        SET position_status = ?,
+            entry_order_id = COALESCE(?, entry_order_id),
+            entry_client_order_id = COALESCE(?, entry_client_order_id),
+            entry_filled_qty = ?,
+            entry_avg_fill_px = ?,
+            opened_ts_utc = ?,
+            remaining_qty = ?,
+            updated_ts_utc = ?
+        WHERE plan_id = ?
+        """,
+        (
+            next_status,
+            entry_order_id,
+            entry_client_order_id,
+            entry_filled_qty,
+            entry_avg_fill_px,
+            next_opened_ts_utc,
+            entry_filled_qty,
+            updated_ts_utc,
+            plan_id,
+        ),
+    )
+    conn.commit()
+    return get_paper_position_by_plan_id(conn, plan_id)
 
 
 def update_trade_plan_entry_summary(

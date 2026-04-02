@@ -70,10 +70,12 @@ class ExecutionWorkerTest(unittest.TestCase):
             self.assertIn("paper_trade_plans", table_names)
             self.assertIn("paper_orders", table_names)
             self.assertIn("paper_fills", table_names)
+            self.assertIn("paper_positions", table_names)
 
             plan_columns = self._table_columns(conn, "paper_trade_plans")
             order_columns = self._table_columns(conn, "paper_orders")
             fill_columns = self._table_columns(conn, "paper_fills")
+            position_columns = self._table_columns(conn, "paper_positions")
         finally:
             conn.close()
 
@@ -99,6 +101,15 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertIn("fill_ts_utc", fill_columns)
         self.assertIn("fill_px", fill_columns)
         self.assertIn("fill_qty", fill_columns)
+
+        self.assertIn("position_id", position_columns)
+        self.assertIn("plan_id", position_columns)
+        self.assertIn("position_status", position_columns)
+        self.assertIn("entry_order_id", position_columns)
+        self.assertIn("entry_client_order_id", position_columns)
+        self.assertIn("entry_filled_qty", position_columns)
+        self.assertIn("remaining_qty", position_columns)
+        self.assertIn("updated_ts_utc", position_columns)
 
     def test_normalize_broker_order_status_maps_expected_values(self) -> None:
         self.assertEqual("SUBMITTED", normalize_broker_order_status("submitted"))
@@ -135,6 +146,7 @@ class ExecutionWorkerTest(unittest.TestCase):
         try:
             plan_rows = conn.execute("SELECT * FROM paper_trade_plans").fetchall()
             order_rows = conn.execute("SELECT * FROM paper_orders").fetchall()
+            position_rows = conn.execute("SELECT * FROM paper_positions").fetchall()
             request_row = conn.execute(
                 "SELECT * FROM execution_requests WHERE request_id = ?",
                 ("req-1",),
@@ -144,9 +156,11 @@ class ExecutionWorkerTest(unittest.TestCase):
 
         self.assertEqual(1, len(plan_rows))
         self.assertEqual(1, len(order_rows))
+        self.assertEqual(1, len(position_rows))
 
         plan_row = plan_rows[0]
         order_row = order_rows[0]
+        position_row = position_rows[0]
 
         self.assertEqual("req-1", plan_row["request_id"])
         self.assertEqual("alert-1", plan_row["alert_id"])
@@ -172,6 +186,11 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual("submitted", order_row["broker_status_raw"])
         self.assertEqual("PENDING", plan_row["entry_status"])
         self.assertIsNone(plan_row["entry_filled_qty"])
+        self.assertEqual(plan_row["plan_id"], position_row["plan_id"])
+        self.assertEqual("PENDING_ENTRY", position_row["position_status"])
+        self.assertEqual(0.0, position_row["entry_filled_qty"])
+        self.assertEqual(0.0, position_row["remaining_qty"])
+        self.assertIsNone(position_row["opened_ts_utc"])
 
         self.assertEqual("SUBMITTED", request_row["status"])
         self.assertEqual("broker-1", request_row["broker_order_id"])
@@ -236,6 +255,10 @@ class ExecutionWorkerTest(unittest.TestCase):
                 "SELECT COUNT(*) AS n FROM paper_trade_plans WHERE request_id = ?",
                 ("req-2",),
             ).fetchone()["n"]
+            position_count = conn.execute(
+                "SELECT COUNT(*) AS n FROM paper_positions WHERE request_id = ?",
+                ("req-2",),
+            ).fetchone()["n"]
             order_count = conn.execute(
                 "SELECT COUNT(*) AS n FROM paper_orders WHERE client_order_id = ?",
                 ("req-2",),
@@ -244,6 +267,7 @@ class ExecutionWorkerTest(unittest.TestCase):
             conn.close()
 
         self.assertEqual(1, plan_count)
+        self.assertEqual(1, position_count)
         self.assertEqual(1, order_count)
 
     def test_get_open_paper_orders_for_sync_excludes_terminal_statuses(self) -> None:
@@ -471,6 +495,10 @@ class ExecutionWorkerTest(unittest.TestCase):
                 "SELECT * FROM paper_trade_plans WHERE request_id = ?",
                 ("req-idem",),
             ).fetchone()
+            position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-idem",),
+            ).fetchone()
         finally:
             conn.close()
 
@@ -480,6 +508,10 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual("FILLED", plan_row["entry_status"])
         self.assertEqual(0.75, plan_row["entry_filled_qty"])
         self.assertEqual(101.25, plan_row["entry_avg_fill_px"])
+        self.assertEqual("OPEN", position_row["position_status"])
+        self.assertEqual(0.75, position_row["entry_filled_qty"])
+        self.assertEqual(0.75, position_row["remaining_qty"])
+        self.assertEqual(101.25, position_row["entry_avg_fill_px"])
 
     def test_filled_order_ingests_one_entry_fill_and_updates_plan_summary(self) -> None:
         conn = get_connection(self.db_path)
@@ -515,6 +547,10 @@ class ExecutionWorkerTest(unittest.TestCase):
                 "SELECT * FROM paper_trade_plans WHERE request_id = ?",
                 ("req-fill-sync",),
             ).fetchone()
+            position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-fill-sync",),
+            ).fetchone()
         finally:
             conn.close()
 
@@ -528,6 +564,13 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual(0.8, plan_row["entry_filled_qty"])
         self.assertEqual(103.5, plan_row["entry_avg_fill_px"])
         self.assertEqual("2026-03-25T14:40:00+00:00", plan_row["entry_fill_ts_utc"])
+        self.assertEqual("OPEN", position_row["position_status"])
+        self.assertEqual("po-fill-sync", position_row["entry_order_id"])
+        self.assertEqual("req-fill-sync", position_row["entry_client_order_id"])
+        self.assertEqual(0.8, position_row["entry_filled_qty"])
+        self.assertEqual(0.8, position_row["remaining_qty"])
+        self.assertEqual(103.5, position_row["entry_avg_fill_px"])
+        self.assertEqual("2026-03-25T14:40:00+00:00", position_row["opened_ts_utc"])
 
     def test_partial_fill_ingests_or_updates_entry_fill_and_plan_summary(self) -> None:
         conn = get_connection(self.db_path)
@@ -562,6 +605,10 @@ class ExecutionWorkerTest(unittest.TestCase):
                 "SELECT * FROM paper_trade_plans WHERE request_id = ?",
                 ("req-partial",),
             ).fetchone()
+            position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-partial",),
+            ).fetchone()
         finally:
             conn.close()
 
@@ -571,6 +618,10 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual("PARTIALLY_FILLED", plan_row["entry_status"])
         self.assertEqual(0.25, plan_row["entry_filled_qty"])
         self.assertEqual(102.0, plan_row["entry_avg_fill_px"])
+        self.assertEqual("OPEN", position_row["position_status"])
+        self.assertEqual(0.25, position_row["entry_filled_qty"])
+        self.assertEqual(0.25, position_row["remaining_qty"])
+        self.assertEqual(102.0, position_row["entry_avg_fill_px"])
 
     def test_partial_fill_timestamp_preserves_first_fallback_timestamp(self) -> None:
         conn = get_connection(self.db_path)
@@ -719,12 +770,67 @@ class ExecutionWorkerTest(unittest.TestCase):
                 "SELECT * FROM paper_trade_plans WHERE request_id = ?",
                 ("req-skip-fill",),
             ).fetchone()
+            position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-skip-fill",),
+            ).fetchone()
         finally:
             conn.close()
 
         self.assertIsNone(fill_row)
         self.assertEqual("PENDING", plan_row["entry_status"])
         self.assertIsNone(plan_row["entry_filled_qty"])
+        self.assertEqual("PENDING_ENTRY", position_row["position_status"])
+        self.assertEqual(0.0, position_row["entry_filled_qty"])
+        self.assertEqual(0.0, position_row["remaining_qty"])
+
+    def test_position_remaining_qty_comes_from_actual_fill_not_intended_qty(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-actual-fill")
+            conn.execute(
+                """
+                UPDATE paper_trade_plans
+                SET intended_qty = ?
+                WHERE request_id = ?
+                """,
+                (5.0, "req-actual-fill"),
+            )
+            conn.commit()
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-actual-fill",
+                request_id="req-actual-fill",
+                client_order_id="req-actual-fill",
+                broker_order_id="broker-actual-fill",
+                order_status="SUBMITTED",
+            )
+            order_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+                ("po-actual-fill",),
+            ).fetchone()
+
+            self.worker.reconcile_paper_order(
+                conn,
+                order_row,
+                self._broker_result(
+                    "broker-actual-fill",
+                    broker_status_raw="filled",
+                    filled_ts_utc="2026-03-25T16:00:00+00:00",
+                    filled_qty=0.33,
+                    filled_avg_price=106.25,
+                ),
+            )
+            position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-actual-fill",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(0.33, position_row["entry_filled_qty"])
+        self.assertEqual(0.33, position_row["remaining_qty"])
+        self.assertNotEqual(5.0, position_row["remaining_qty"])
 
     def test_remote_recovery_still_persists_normalized_order_by_client_order_id(self) -> None:
         self._insert_pending_request(request_id="req-3", alert_id="alert-3")
@@ -1071,6 +1177,48 @@ class ExecutionWorkerTest(unittest.TestCase):
                 None,
                 None,
                 None,
+                "1",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO paper_positions (
+                position_id,
+                plan_id,
+                request_id,
+                alert_id,
+                symbol,
+                side,
+                position_status,
+                entry_order_id,
+                entry_client_order_id,
+                entry_filled_qty,
+                entry_avg_fill_px,
+                opened_ts_utc,
+                closed_ts_utc,
+                remaining_qty,
+                created_ts_utc,
+                updated_ts_utc,
+                schema_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "position-" + request_id,
+                "plan-" + request_id,
+                request_id,
+                "alert-" + request_id,
+                "AAPL",
+                "LONG",
+                "PENDING_ENTRY",
+                None,
+                None,
+                0.0,
+                None,
+                None,
+                None,
+                0.0,
+                "2026-03-25T14:00:00+00:00",
+                "2026-03-25T14:00:00+00:00",
                 "1",
             ),
         )

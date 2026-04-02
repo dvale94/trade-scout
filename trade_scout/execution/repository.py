@@ -86,8 +86,25 @@ class ExecutionRepository:
     ) -> sqlite3.Row | None:
         return queue.get_paper_trade_plan_by_request_id(conn, request_id)
 
+    def get_paper_position_by_plan_id(
+        self,
+        conn: sqlite3.Connection,
+        plan_id: str,
+    ) -> sqlite3.Row | None:
+        return queue.get_paper_position_by_plan_id(conn, plan_id)
+
+    def get_paper_position_by_request_id(
+        self,
+        conn: sqlite3.Connection,
+        request_id: str,
+    ) -> sqlite3.Row | None:
+        return queue.get_paper_position_by_request_id(conn, request_id)
+
     def create_paper_trade_plan(self, conn: sqlite3.Connection, **kwargs) -> sqlite3.Row:
         return queue.create_paper_trade_plan(conn, **kwargs)
+
+    def ensure_paper_position(self, conn: sqlite3.Connection, **kwargs) -> sqlite3.Row:
+        return queue.ensure_paper_position(conn, **kwargs)
 
     def get_paper_order_by_request_id_and_role(
         self,
@@ -163,3 +180,10 @@ class ExecutionRepository:
             entry_avg_fill_px=entry_avg_fill_px,
             entry_fill_ts_utc=entry_fill_ts_utc,
         )
+
+    def update_paper_position_from_entry_fill(
+        self,
+        conn: sqlite3.Connection,
+        **kwargs,
+    ) -> sqlite3.Row | None:
+        return queue.update_paper_position_from_entry_fill(conn, **kwargs)
