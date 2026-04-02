@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Callable, Mapping, Optional
 
 from trade_scout.execution.reconciler import (
@@ -106,6 +107,21 @@ class ExecutionWorker:
 
     def sync_open_paper_orders(self, conn, *, limit: int) -> int:
         return self.reconciler.sync_open_paper_orders(conn, limit=limit)
+
+    def process_position_triggers(
+        self,
+        conn,
+        *,
+        price_by_symbol: Mapping[str, float],
+        limit: int = 100,
+        now_utc: datetime | None = None,
+    ) -> int:
+        return self.service.process_position_triggers(
+            conn,
+            price_by_symbol=price_by_symbol,
+            limit=limit,
+            now_utc=now_utc,
+        )
 
     def reconcile_paper_order(self, conn, paper_order_row, broker_snapshot):
         return self.reconciler.reconcile_paper_order(conn, paper_order_row, broker_snapshot)

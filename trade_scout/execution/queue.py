@@ -658,6 +658,29 @@ def get_positions_with_pending_actions(
     return list(rows)
 
 
+def get_positions_eligible_for_trigger_evaluation(
+    conn: sqlite3.Connection, limit: int = 100
+) -> list[sqlite3.Row]:
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM paper_positions
+        WHERE position_status IN (?, ?)
+          AND remaining_qty > 0
+          AND pending_action_status = ?
+        ORDER BY updated_ts_utc ASC, created_ts_utc ASC
+        LIMIT ?
+        """,
+        (
+            PaperPositionStatus.OPEN.value,
+            PaperPositionStatus.PARTIAL.value,
+            PaperPositionActionStatus.NONE.value,
+            limit,
+        ),
+    ).fetchall()
+    return list(rows)
+
+
 def create_paper_trade_plan(
     conn: sqlite3.Connection,
     *,

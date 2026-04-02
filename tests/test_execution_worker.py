@@ -5,6 +5,7 @@ import sys
 import tempfile
 import types
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -1005,6 +1006,253 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual(stop_order["paper_order_id"], position_row["active_stop_paper_order_id"])
         self.assertEqual(PaperPositionActionStatus.NONE.value, position_row["pending_action_status"])
 
+    def test_tp1_trigger_records_timestamp_and_schedules_cancel_stop_for_tp1(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-tp1", stop_px=92.0)
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET position_status = ?, remaining_qty = ?, entry_filled_qty = ?, pending_action_status = ?
+                WHERE request_id = ?
+                """,
+                ("OPEN", 0.7, 0.7, "NONE", "req-tp1"),
+            )
+            conn.commit()
+
+            processed = self.worker.service.process_position_triggers(
+                conn,
+                price_by_symbol={"AAPL": 110.5},
+                now_utc=datetime(2026, 3, 25, 17, 0, tzinfo=timezone.utc),
+            )
+            position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-tp1",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(1, processed)
+        self.assertEqual("2026-03-25T17:00:00+00:00", position_row["tp1_triggered_ts_utc"])
+        self.assertIsNone(position_row["tp2_triggered_ts_utc"])
+        self.assertEqual(PaperPositionActionStatus.CANCEL_STOP_FOR_TP1.value, position_row["pending_action_status"])
+
+    def test_tp1_trigger_is_recorded_only_once_across_repeated_evaluations(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-tp1-once")
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET position_status = ?, remaining_qty = ?, entry_filled_qty = ?, pending_action_status = ?
+                WHERE request_id = ?
+                """,
+                ("OPEN", 0.7, 0.7, "NONE", "req-tp1-once"),
+            )
+            conn.commit()
+
+            self.worker.service.process_position_triggers(
+                conn,
+                price_by_symbol={"AAPL": 111.0},
+                now_utc=datetime(2026, 3, 25, 17, 1, tzinfo=timezone.utc),
+            )
+            first_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-tp1-once",),
+            ).fetchone()
+            self.worker.service.process_position_triggers(
+                conn,
+                price_by_symbol={"AAPL": 112.0},
+                now_utc=datetime(2026, 3, 25, 17, 2, tzinfo=timezone.utc),
+            )
+            second_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-tp1-once",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(first_row["tp1_triggered_ts_utc"], second_row["tp1_triggered_ts_utc"])
+        self.assertEqual(PaperPositionActionStatus.CANCEL_STOP_FOR_TP1.value, second_row["pending_action_status"])
+
+    def test_tp2_is_not_recorded_before_tp1_in_default_sequencing(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-tp-seq")
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET position_status = ?, remaining_qty = ?, entry_filled_qty = ?, pending_action_status = ?
+                WHERE request_id = ?
+                """,
+                ("OPEN", 0.5, 0.5, "NONE", "req-tp-seq"),
+            )
+            conn.commit()
+
+            self.worker.service.process_position_triggers(
+                conn,
+                price_by_symbol={"AAPL": 116.0},
+                now_utc=datetime(2026, 3, 25, 17, 3, tzinfo=timezone.utc),
+            )
+            position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-tp-seq",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertIsNotNone(position_row["tp1_triggered_ts_utc"])
+        self.assertIsNone(position_row["tp2_triggered_ts_utc"])
+        self.assertEqual(PaperPositionActionStatus.CANCEL_STOP_FOR_TP1.value, position_row["pending_action_status"])
+
+    def test_tp2_records_after_tp1_and_schedules_cancel_stop_for_tp2(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-tp2")
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET position_status = ?, remaining_qty = ?, entry_filled_qty = ?, pending_action_status = ?,
+                    tp1_triggered_ts_utc = ?
+                WHERE request_id = ?
+                """,
+                ("OPEN", 0.45, 0.45, "NONE", "2026-03-25T17:04:00+00:00", "req-tp2"),
+            )
+            conn.commit()
+
+            processed = self.worker.service.process_position_triggers(
+                conn,
+                price_by_symbol={"AAPL": 116.0},
+                now_utc=datetime(2026, 3, 25, 17, 5, tzinfo=timezone.utc),
+            )
+            position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-tp2",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(1, processed)
+        self.assertEqual("2026-03-25T17:04:00+00:00", position_row["tp1_triggered_ts_utc"])
+        self.assertEqual("2026-03-25T17:05:00+00:00", position_row["tp2_triggered_ts_utc"])
+        self.assertEqual(PaperPositionActionStatus.CANCEL_STOP_FOR_TP2.value, position_row["pending_action_status"])
+
+    def test_positions_with_pending_actions_are_not_retriggered(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-trigger-pending")
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET position_status = ?, remaining_qty = ?, entry_filled_qty = ?, pending_action_status = ?
+                WHERE request_id = ?
+                """,
+                ("OPEN", 0.6, 0.6, "PLACE_INITIAL_STOP", "req-trigger-pending"),
+            )
+            conn.commit()
+
+            processed = self.worker.service.process_position_triggers(
+                conn,
+                price_by_symbol={"AAPL": 111.0},
+                now_utc=datetime(2026, 3, 25, 17, 6, tzinfo=timezone.utc),
+            )
+            position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-trigger-pending",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(0, processed)
+        self.assertIsNone(position_row["tp1_triggered_ts_utc"])
+        self.assertEqual("PLACE_INITIAL_STOP", position_row["pending_action_status"])
+
+    def test_closed_error_and_zero_remaining_positions_are_ignored_for_triggers(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            for request_id, status, remaining_qty in (
+                ("req-trigger-closed", "CLOSED", 0.5),
+                ("req-trigger-error", "ERROR", 0.5),
+                ("req-trigger-flat", "OPEN", 0.0),
+            ):
+                self._insert_trade_plan_row(conn, request_id=request_id)
+                conn.execute(
+                    """
+                    UPDATE paper_positions
+                    SET position_status = ?, remaining_qty = ?, entry_filled_qty = ?, pending_action_status = ?
+                    WHERE request_id = ?
+                    """,
+                    (status, remaining_qty, remaining_qty, "NONE", request_id),
+                )
+            conn.commit()
+
+            processed = self.worker.service.process_position_triggers(
+                conn,
+                price_by_symbol={"AAPL": 111.0},
+                now_utc=datetime(2026, 3, 25, 17, 7, tzinfo=timezone.utc),
+            )
+            rows = conn.execute(
+                """
+                SELECT request_id, tp1_triggered_ts_utc, pending_action_status
+                FROM paper_positions
+                WHERE request_id IN (?, ?, ?)
+                ORDER BY request_id
+                """,
+                ("req-trigger-closed", "req-trigger-error", "req-trigger-flat"),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        self.assertEqual(0, processed)
+        for row in rows:
+            self.assertIsNone(row["tp1_triggered_ts_utc"])
+            self.assertEqual("NONE", row["pending_action_status"])
+
+    def test_trigger_evaluation_does_not_submit_tp_orders(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-no-tp-submit")
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET position_status = ?, remaining_qty = ?, entry_filled_qty = ?, pending_action_status = ?
+                WHERE request_id = ?
+                """,
+                ("OPEN", 0.75, 0.75, "NONE", "req-no-tp-submit"),
+            )
+            conn.commit()
+
+            with patch(
+                "trade_scout.execution.service.submit_protective_stop_order",
+                side_effect=AssertionError("submit_protective_stop_order should not be called"),
+            ), patch(
+                "trade_scout.execution.service.submit_validated_order",
+                side_effect=AssertionError("submit_validated_order should not be called"),
+            ):
+                processed = self.worker.service.process_position_triggers(
+                    conn,
+                    price_by_symbol={"AAPL": 111.0},
+                    now_utc=datetime(2026, 3, 25, 17, 8, tzinfo=timezone.utc),
+                )
+
+            order_roles = [
+                row["order_role"]
+                for row in conn.execute(
+                    "SELECT order_role FROM paper_orders WHERE request_id = ? ORDER BY order_role",
+                    ("req-no-tp-submit",),
+                ).fetchall()
+            ]
+            position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-no-tp-submit",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(1, processed)
+        self.assertEqual([], order_roles)
+        self.assertEqual(PaperPositionActionStatus.CANCEL_STOP_FOR_TP1.value, position_row["pending_action_status"])
+
     def test_repeated_reconciliation_does_not_reset_pending_action_scaffolding(self) -> None:
         conn = get_connection(self.db_path)
         try:
@@ -1074,6 +1322,29 @@ class ExecutionWorkerTest(unittest.TestCase):
 
         request_ids = [row["request_id"] for row in rows]
         self.assertIn("req-pending-action", request_ids)
+
+    def test_repository_fetches_positions_eligible_for_trigger_evaluation(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-trigger-eligible")
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET position_status = ?, remaining_qty = ?, entry_filled_qty = ?, pending_action_status = ?
+                WHERE request_id = ?
+                """,
+                ("OPEN", 0.9, 0.9, "NONE", "req-trigger-eligible"),
+            )
+            conn.commit()
+            rows = self.worker.repository.get_positions_eligible_for_trigger_evaluation(
+                conn,
+                limit=10,
+            )
+        finally:
+            conn.close()
+
+        request_ids = [row["request_id"] for row in rows]
+        self.assertIn("req-trigger-eligible", request_ids)
 
     def test_phase_c_still_does_not_create_tp_orders(self) -> None:
         self._insert_pending_request(request_id="req-no-tp", alert_id="alert-no-tp")
@@ -1418,6 +1689,8 @@ class ExecutionWorkerTest(unittest.TestCase):
         request_id: str,
         entry_status: str = "PENDING",
         stop_px: float | None = 95.0,
+        t1_px: float | None = 110.0,
+        t2_px: float | None = 115.0,
     ) -> None:
         conn.execute(
             """
@@ -1430,6 +1703,8 @@ class ExecutionWorkerTest(unittest.TestCase):
                 side,
                 entry_type,
                 stop_px,
+                t1_px,
+                t2_px,
                 plan_rules_json,
                 plan_status,
                 entry_status,
@@ -1437,7 +1712,7 @@ class ExecutionWorkerTest(unittest.TestCase):
                 entry_avg_fill_px,
                 entry_fill_ts_utc,
                 schema_version
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 "plan-" + request_id,
@@ -1448,6 +1723,8 @@ class ExecutionWorkerTest(unittest.TestCase):
                 "LONG",
                 "MARKET",
                 stop_px,
+                t1_px,
+                t2_px,
                 "{}",
                 "CREATED",
                 entry_status,

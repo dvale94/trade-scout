@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Mapping, Optional
 
 from trade_scout import config
@@ -242,11 +242,125 @@ class ExecutionService:
                 )
         return processed_count
 
+    def process_position_triggers(
+        self,
+        conn,
+        *,
+        price_by_symbol: Mapping[str, float],
+        limit: int = 100,
+        now_utc: datetime | None = None,
+    ) -> int:
+        if not price_by_symbol:
+            return 0
+
+        eligible_positions = self.repository.get_positions_eligible_for_trigger_evaluation(
+            conn,
+            limit=limit,
+        )
+        processed_count = 0
+        for position_row in eligible_positions:
+            if self.evaluate_take_profit_triggers(
+                conn,
+                position_row=position_row,
+                price_by_symbol=price_by_symbol,
+                now_utc=now_utc,
+            ):
+                processed_count += 1
+        return processed_count
+
     def ensure_post_entry_position_state(self, conn, position_row):
         pending_action_status = str(position_row["pending_action_status"])
         if pending_action_status == PaperPositionActionStatus.PLACE_INITIAL_STOP.value:
             return self._place_initial_stop_if_needed(conn, position_row)
         return position_row
+
+    def evaluate_take_profit_triggers(
+        self,
+        conn,
+        *,
+        position_row,
+        price_by_symbol: Mapping[str, float],
+        now_utc: datetime | None = None,
+    ) -> bool:
+        symbol = str(position_row["symbol"])
+        current_price = price_by_symbol.get(symbol)
+        if current_price is None:
+            return False
+
+        if str(position_row["pending_action_status"]) != PaperPositionActionStatus.NONE.value:
+            return False
+        if str(position_row["position_status"]) not in {
+            PaperPositionStatus.OPEN.value,
+            PaperPositionStatus.PARTIAL.value,
+        }:
+            return False
+
+        remaining_qty = self._coerce_float(position_row["remaining_qty"])
+        if remaining_qty is None or remaining_qty <= 0:
+            return False
+
+        trade_plan = self.repository.get_paper_trade_plan_by_plan_id(conn, str(position_row["plan_id"]))
+        if trade_plan is None:
+            return False
+
+        side = str(position_row["side"])
+        tp1_px = self._coerce_float(trade_plan["t1_px"])
+        tp2_px = self._coerce_float(trade_plan["t2_px"])
+        trigger_ts_utc = self._now_iso_utc(now_utc)
+
+        tp1_triggered_ts = self._coerce_optional_str(position_row["tp1_triggered_ts_utc"])
+        tp2_triggered_ts = self._coerce_optional_str(position_row["tp2_triggered_ts_utc"])
+
+        if tp1_triggered_ts is None and tp1_px is not None and self._is_tp_crossed(
+            side=side,
+            current_price=float(current_price),
+            target_price=tp1_px,
+        ):
+            self.repository.record_paper_position_trigger(
+                conn,
+                plan_id=str(position_row["plan_id"]),
+                trigger_name="tp1",
+                triggered_ts_utc=trigger_ts_utc,
+            )
+            self.repository.update_paper_position_pending_action(
+                conn,
+                plan_id=str(position_row["plan_id"]),
+                pending_action_status=PaperPositionActionStatus.CANCEL_STOP_FOR_TP1.value,
+            )
+            print(
+                f"[execution-worker] tp1 triggered plan_id={position_row['plan_id']} "
+                f"symbol={symbol} current_price={current_price}"
+            )
+            return True
+
+        if (
+            tp1_triggered_ts is not None
+            and tp2_triggered_ts is None
+            and tp2_px is not None
+            and self._is_tp_crossed(
+                side=side,
+                current_price=float(current_price),
+                target_price=tp2_px,
+            )
+        ):
+            self.repository.record_paper_position_trigger(
+                conn,
+                plan_id=str(position_row["plan_id"]),
+                trigger_name="tp2",
+                triggered_ts_utc=trigger_ts_utc,
+            )
+            self.repository.update_paper_position_pending_action(
+                conn,
+                plan_id=str(position_row["plan_id"]),
+                pending_action_status=PaperPositionActionStatus.CANCEL_STOP_FOR_TP2.value,
+            )
+            print(
+                f"[execution-worker] tp2 triggered plan_id={position_row['plan_id']} "
+                f"symbol={symbol} current_price={current_price}"
+            )
+            return True
+
+        return False
 
     def _require_alert_row(self, alert_id: str) -> Mapping[str, Any]:
         alert_row = self.alert_lookup(alert_id)
@@ -432,6 +546,22 @@ class ExecutionService:
 
     def _get_stop_order_submitter(self) -> Callable:
         return self.stop_order_submitter or submit_protective_stop_order
+
+    @staticmethod
+    def _is_tp_crossed(*, side: str, current_price: float, target_price: float) -> bool:
+        normalized_side = str(side).strip().upper()
+        if normalized_side == "LONG":
+            return current_price >= target_price
+        if normalized_side == "SHORT":
+            return current_price <= target_price
+        raise RuntimeError(f"unsupported side for TP trigger evaluation: {side}")
+
+    @staticmethod
+    def _now_iso_utc(now_utc: datetime | None = None) -> str:
+        if now_utc is None:
+            return datetime.now(timezone.utc).isoformat()
+        normalized = now_utc.astimezone(timezone.utc) if now_utc.tzinfo else now_utc.replace(tzinfo=timezone.utc)
+        return normalized.isoformat()
 
     def _place_initial_stop_if_needed(self, conn, position_row):
         plan_id = str(position_row["plan_id"])

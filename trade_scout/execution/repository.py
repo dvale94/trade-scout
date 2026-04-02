@@ -115,6 +115,14 @@ class ExecutionRepository:
     ) -> list[sqlite3.Row]:
         return queue.get_positions_with_pending_actions(conn, limit=limit)
 
+    def get_positions_eligible_for_trigger_evaluation(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        limit: int = 100,
+    ) -> list[sqlite3.Row]:
+        return queue.get_positions_eligible_for_trigger_evaluation(conn, limit=limit)
+
     def create_paper_trade_plan(self, conn: sqlite3.Connection, **kwargs) -> sqlite3.Row:
         return queue.create_paper_trade_plan(conn, **kwargs)
 
