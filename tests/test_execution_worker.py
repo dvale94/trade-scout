@@ -31,11 +31,13 @@ from trade_scout.execution.queue import (
     reconcile_paper_order_from_broker,
     utc_now_iso,
 )
+from trade_scout.execution.reconciler import (
+    derive_entry_status_from_order_status,
+    normalize_broker_order_status,
+)
 from trade_scout.execution.worker import (
     ExecutionWorker,
     ExecutionWorkerConfig,
-    derive_entry_status_from_order_status,
-    normalize_broker_order_status,
 )
 
 
@@ -119,10 +121,10 @@ class ExecutionWorkerTest(unittest.TestCase):
         self._insert_pending_request(request_id="req-1", alert_id="alert-1")
 
         with patch(
-            "trade_scout.execution.worker.find_existing_broker_order",
+            "trade_scout.execution.service.find_existing_broker_order",
             return_value=None,
         ), patch(
-            "trade_scout.execution.worker.submit_validated_order",
+            "trade_scout.execution.service.submit_validated_order",
             return_value=self._broker_result("broker-1"),
         ):
             attempted = self.worker.run_once()
@@ -201,10 +203,10 @@ class ExecutionWorkerTest(unittest.TestCase):
         self._insert_pending_request(request_id="req-2", alert_id="alert-2")
 
         with patch(
-            "trade_scout.execution.worker.find_existing_broker_order",
+            "trade_scout.execution.service.find_existing_broker_order",
             return_value=None,
         ), patch(
-            "trade_scout.execution.worker.submit_validated_order",
+            "trade_scout.execution.service.submit_validated_order",
             return_value=self._broker_result("broker-2"),
         ):
             self.worker.run_once()
@@ -222,10 +224,10 @@ class ExecutionWorkerTest(unittest.TestCase):
             ).fetchone()
 
             with patch(
-                "trade_scout.execution.worker.find_existing_broker_order",
+                "trade_scout.execution.service.find_existing_broker_order",
                 return_value=None,
             ), patch(
-                "trade_scout.execution.worker.submit_validated_order",
+                "trade_scout.execution.service.submit_validated_order",
                 side_effect=AssertionError("submit_validated_order should not be called"),
             ):
                 self.worker.process_validated_request(conn, request_row)
@@ -728,10 +730,10 @@ class ExecutionWorkerTest(unittest.TestCase):
         self._insert_pending_request(request_id="req-3", alert_id="alert-3")
 
         with patch(
-            "trade_scout.execution.worker.find_existing_broker_order",
+            "trade_scout.execution.service.find_existing_broker_order",
             return_value=self._broker_result("broker-3"),
         ), patch(
-            "trade_scout.execution.worker.submit_validated_order",
+            "trade_scout.execution.service.submit_validated_order",
             side_effect=AssertionError("submit_validated_order should not be called"),
         ):
             attempted = self.worker.run_once()
@@ -780,13 +782,13 @@ class ExecutionWorkerTest(unittest.TestCase):
             conn.close()
 
         with patch(
-            "trade_scout.execution.worker.find_existing_broker_order",
+            "trade_scout.execution.service.find_existing_broker_order",
             return_value=None,
         ), patch(
-            "trade_scout.execution.worker.submit_validated_order",
+            "trade_scout.execution.service.submit_validated_order",
             return_value=self._broker_result("broker-4", broker_status_raw="submitted"),
         ), patch(
-            "trade_scout.execution.worker.fetch_broker_order_by_id",
+            "trade_scout.execution.reconciler.fetch_broker_order_by_id",
             side_effect=lambda broker_order_id: (
                 self._broker_result(
                     broker_order_id,
