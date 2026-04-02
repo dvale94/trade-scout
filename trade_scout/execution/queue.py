@@ -10,6 +10,7 @@ from trade_scout.execution.models import (
     ExecutionRequest,
     ExecutionStatus,
     PaperFillRole,
+    PaperPositionActionStatus,
     PaperPositionStatus,
     PaperOrderRole,
     PaperOrderStatus,
@@ -208,6 +209,14 @@ def init_db(db_path: str) -> None:
                 opened_ts_utc TEXT,
                 closed_ts_utc TEXT,
                 remaining_qty REAL NOT NULL DEFAULT 0,
+                pending_action_status TEXT NOT NULL DEFAULT 'NONE',
+                active_stop_paper_order_id TEXT,
+                stop_qty REAL,
+                stop_price REAL,
+                stop_limit_price REAL,
+                tp1_triggered_ts_utc TEXT,
+                tp2_triggered_ts_utc TEXT,
+                last_action_error TEXT,
                 created_ts_utc TEXT NOT NULL,
                 updated_ts_utc TEXT NOT NULL,
                 schema_version TEXT NOT NULL
@@ -276,6 +285,12 @@ def init_db(db_path: str) -> None:
         )
         conn.execute(
             """
+            CREATE INDEX IF NOT EXISTS idx_paper_positions_action_status
+            ON paper_positions (position_status, pending_action_status)
+            """
+        )
+        conn.execute(
+            """
             CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_fills_order_role
             ON paper_fills (paper_order_id, fill_role)
             """
@@ -287,9 +302,33 @@ def init_db(db_path: str) -> None:
             WHERE status IN ('PENDING', 'CLAIMED', 'VALIDATED')
             """
         )
+        _ensure_paper_positions_columns(conn)
         conn.commit()
     finally:
         conn.close()
+
+
+def _ensure_paper_positions_columns(conn: sqlite3.Connection) -> None:
+    existing_columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(paper_positions)").fetchall()
+    }
+    additive_columns = {
+        "pending_action_status": "TEXT NOT NULL DEFAULT 'NONE'",
+        "active_stop_paper_order_id": "TEXT",
+        "stop_qty": "REAL",
+        "stop_price": "REAL",
+        "stop_limit_price": "REAL",
+        "tp1_triggered_ts_utc": "TEXT",
+        "tp2_triggered_ts_utc": "TEXT",
+        "last_action_error": "TEXT",
+    }
+    for column_name, column_def in additive_columns.items():
+        if column_name in existing_columns:
+            continue
+        conn.execute(
+            f"ALTER TABLE paper_positions ADD COLUMN {column_name} {column_def}"
+        )
 
 
 def insert_request(conn: sqlite3.Connection, request: ExecutionRequest) -> None:
@@ -567,6 +606,29 @@ def get_paper_position_by_request_id(
     ).fetchone()
 
 
+def get_positions_with_pending_actions(
+    conn: sqlite3.Connection, limit: int = 50
+) -> list[sqlite3.Row]:
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM paper_positions
+        WHERE position_status IN (?, ?, ?)
+          AND pending_action_status != ?
+        ORDER BY updated_ts_utc ASC, created_ts_utc ASC
+        LIMIT ?
+        """,
+        (
+            PaperPositionStatus.OPEN.value,
+            PaperPositionStatus.PARTIAL.value,
+            PaperPositionStatus.CLOSING.value,
+            PaperPositionActionStatus.NONE.value,
+            limit,
+        ),
+    ).fetchall()
+    return list(rows)
+
+
 def create_paper_trade_plan(
     conn: sqlite3.Connection,
     *,
@@ -728,10 +790,18 @@ def ensure_paper_position(
                 opened_ts_utc,
                 closed_ts_utc,
                 remaining_qty,
+                pending_action_status,
+                active_stop_paper_order_id,
+                stop_qty,
+                stop_price,
+                stop_limit_price,
+                tp1_triggered_ts_utc,
+                tp2_triggered_ts_utc,
+                last_action_error,
                 created_ts_utc,
                 updated_ts_utc,
                 schema_version
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 position_id,
@@ -748,6 +818,14 @@ def ensure_paper_position(
                 None,
                 None,
                 0.0,
+                PaperPositionActionStatus.NONE.value,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
                 now,
                 now,
                 PAPER_POSITION_SCHEMA_VERSION,
@@ -1122,6 +1200,99 @@ def update_paper_position_from_entry_fill(
             updated_ts_utc,
             plan_id,
         ),
+    )
+    conn.commit()
+    return get_paper_position_by_plan_id(conn, plan_id)
+
+
+def update_paper_position_pending_action(
+    conn: sqlite3.Connection,
+    *,
+    plan_id: str,
+    pending_action_status: str,
+) -> sqlite3.Row | None:
+    conn.execute(
+        """
+        UPDATE paper_positions
+        SET pending_action_status = ?,
+            updated_ts_utc = ?
+        WHERE plan_id = ?
+        """,
+        (pending_action_status, utc_now_iso(), plan_id),
+    )
+    conn.commit()
+    return get_paper_position_by_plan_id(conn, plan_id)
+
+
+def update_paper_position_stop_state(
+    conn: sqlite3.Connection,
+    *,
+    plan_id: str,
+    active_stop_paper_order_id: str | None = None,
+    stop_qty: float | None = None,
+    stop_price: float | None = None,
+    stop_limit_price: float | None = None,
+) -> sqlite3.Row | None:
+    conn.execute(
+        """
+        UPDATE paper_positions
+        SET active_stop_paper_order_id = ?,
+            stop_qty = ?,
+            stop_price = ?,
+            stop_limit_price = ?,
+            updated_ts_utc = ?
+        WHERE plan_id = ?
+        """,
+        (
+            active_stop_paper_order_id,
+            stop_qty,
+            stop_price,
+            stop_limit_price,
+            utc_now_iso(),
+            plan_id,
+        ),
+    )
+    conn.commit()
+    return get_paper_position_by_plan_id(conn, plan_id)
+
+
+def record_paper_position_trigger(
+    conn: sqlite3.Connection,
+    *,
+    plan_id: str,
+    trigger_name: str,
+    triggered_ts_utc: str,
+) -> sqlite3.Row | None:
+    if trigger_name not in {"tp1", "tp2"}:
+        raise ValueError(f"unsupported trigger_name: {trigger_name}")
+    column_name = "tp1_triggered_ts_utc" if trigger_name == "tp1" else "tp2_triggered_ts_utc"
+    conn.execute(
+        f"""
+        UPDATE paper_positions
+        SET {column_name} = COALESCE({column_name}, ?),
+            updated_ts_utc = ?
+        WHERE plan_id = ?
+        """,
+        (triggered_ts_utc, utc_now_iso(), plan_id),
+    )
+    conn.commit()
+    return get_paper_position_by_plan_id(conn, plan_id)
+
+
+def update_paper_position_action_error(
+    conn: sqlite3.Connection,
+    *,
+    plan_id: str,
+    last_action_error: str | None,
+) -> sqlite3.Row | None:
+    conn.execute(
+        """
+        UPDATE paper_positions
+        SET last_action_error = ?,
+            updated_ts_utc = ?
+        WHERE plan_id = ?
+        """,
+        (last_action_error, utc_now_iso(), plan_id),
     )
     conn.commit()
     return get_paper_position_by_plan_id(conn, plan_id)

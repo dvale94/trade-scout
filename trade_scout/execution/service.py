@@ -6,7 +6,7 @@ from typing import Any, Callable, Mapping, Optional
 
 from trade_scout import config
 from trade_scout.execution.broker import find_existing_broker_order, submit_validated_order
-from trade_scout.execution.models import PaperOrderRole
+from trade_scout.execution.models import PaperPositionActionStatus, PaperOrderRole
 from trade_scout.execution.policy import validate_execution_request
 from trade_scout.execution.reconciler import ExecutionReconciler
 from trade_scout.execution.repository import ExecutionRepository
@@ -209,6 +209,20 @@ class ExecutionService:
                 message=str(exc),
             )
             print(f"[execution-worker] failed request_id={request_id} error={exc}")
+
+    def process_position_actions(self, conn, *, limit: int = 25) -> int:
+        actionable_positions = self.repository.get_positions_with_pending_actions(conn, limit=limit)
+        processed_count = 0
+        for position_row in actionable_positions:
+            self.ensure_post_entry_position_state(conn, position_row)
+            processed_count += 1
+        return processed_count
+
+    def ensure_post_entry_position_state(self, conn, position_row):
+        pending_action_status = str(position_row["pending_action_status"])
+        if pending_action_status == PaperPositionActionStatus.PLACE_INITIAL_STOP.value:
+            return position_row
+        return position_row
 
     def _require_alert_row(self, alert_id: str) -> Mapping[str, Any]:
         alert_row = self.alert_lookup(alert_id)

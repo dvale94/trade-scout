@@ -100,6 +100,14 @@ class ExecutionRepository:
     ) -> sqlite3.Row | None:
         return queue.get_paper_position_by_request_id(conn, request_id)
 
+    def get_positions_with_pending_actions(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        limit: int = 50,
+    ) -> list[sqlite3.Row]:
+        return queue.get_positions_with_pending_actions(conn, limit=limit)
+
     def create_paper_trade_plan(self, conn: sqlite3.Connection, **kwargs) -> sqlite3.Row:
         return queue.create_paper_trade_plan(conn, **kwargs)
 
@@ -187,3 +195,51 @@ class ExecutionRepository:
         **kwargs,
     ) -> sqlite3.Row | None:
         return queue.update_paper_position_from_entry_fill(conn, **kwargs)
+
+    def update_paper_position_pending_action(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        plan_id: str,
+        pending_action_status: str,
+    ) -> sqlite3.Row | None:
+        return queue.update_paper_position_pending_action(
+            conn,
+            plan_id=plan_id,
+            pending_action_status=pending_action_status,
+        )
+
+    def update_paper_position_stop_state(
+        self,
+        conn: sqlite3.Connection,
+        **kwargs,
+    ) -> sqlite3.Row | None:
+        return queue.update_paper_position_stop_state(conn, **kwargs)
+
+    def record_paper_position_trigger(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        plan_id: str,
+        trigger_name: str,
+        triggered_ts_utc: str,
+    ) -> sqlite3.Row | None:
+        return queue.record_paper_position_trigger(
+            conn,
+            plan_id=plan_id,
+            trigger_name=trigger_name,
+            triggered_ts_utc=triggered_ts_utc,
+        )
+
+    def update_paper_position_action_error(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        plan_id: str,
+        last_action_error: str | None,
+    ) -> sqlite3.Row | None:
+        return queue.update_paper_position_action_error(
+            conn,
+            plan_id=plan_id,
+            last_action_error=last_action_error,
+        )

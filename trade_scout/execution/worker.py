@@ -93,6 +93,7 @@ class ExecutionWorker:
                     self.service.process_validated_request(conn, validated_row)
 
             self.reconciler.sync_open_paper_orders(conn, limit=self.config.sync_batch_size)
+            self.service.process_position_actions(conn, limit=self.config.sync_batch_size)
         finally:
             conn.close()
         return attempted_count

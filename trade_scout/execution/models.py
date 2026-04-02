@@ -28,11 +28,28 @@ class PaperTradePlanEntryStatus(str, Enum):
 class PaperPositionStatus(str, Enum):
     PENDING_ENTRY = "PENDING_ENTRY"
     OPEN = "OPEN"
+    PARTIAL = "PARTIAL"
+    CLOSING = "CLOSING"
     CLOSED = "CLOSED"
+    ERROR = "ERROR"
+
+
+class PaperPositionActionStatus(str, Enum):
+    NONE = "NONE"
+    PLACE_INITIAL_STOP = "PLACE_INITIAL_STOP"
+    CANCEL_STOP_FOR_TP1 = "CANCEL_STOP_FOR_TP1"
+    SUBMIT_TP1 = "SUBMIT_TP1"
+    REARM_STOP_AFTER_TP1 = "REARM_STOP_AFTER_TP1"
+    CANCEL_STOP_FOR_TP2 = "CANCEL_STOP_FOR_TP2"
+    SUBMIT_TP2 = "SUBMIT_TP2"
+    FINALIZE_CLOSE = "FINALIZE_CLOSE"
 
 
 class PaperOrderRole(str, Enum):
     ENTRY = "ENTRY"
+    STOP = "STOP"
+    TP1 = "TP1"
+    TP2 = "TP2"
 
 
 class PaperFillRole(str, Enum):

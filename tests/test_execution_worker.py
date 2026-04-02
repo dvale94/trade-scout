@@ -20,7 +20,12 @@ if "requests" not in sys.modules:
     requests_stub.post = lambda *args, **kwargs: None
     sys.modules["requests"] = requests_stub
 
-from trade_scout.execution.models import BrokerOrderResult, ExecutionRequest, ExecutionStatus
+from trade_scout.execution.models import (
+    BrokerOrderResult,
+    ExecutionRequest,
+    ExecutionStatus,
+    PaperPositionActionStatus,
+)
 from trade_scout.execution.queue import (
     get_connection,
     get_open_paper_orders_for_sync,
@@ -110,6 +115,14 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertIn("entry_filled_qty", position_columns)
         self.assertIn("remaining_qty", position_columns)
         self.assertIn("updated_ts_utc", position_columns)
+        self.assertIn("pending_action_status", position_columns)
+        self.assertIn("active_stop_paper_order_id", position_columns)
+        self.assertIn("stop_qty", position_columns)
+        self.assertIn("stop_price", position_columns)
+        self.assertIn("stop_limit_price", position_columns)
+        self.assertIn("tp1_triggered_ts_utc", position_columns)
+        self.assertIn("tp2_triggered_ts_utc", position_columns)
+        self.assertIn("last_action_error", position_columns)
 
     def test_normalize_broker_order_status_maps_expected_values(self) -> None:
         self.assertEqual("SUBMITTED", normalize_broker_order_status("submitted"))
@@ -190,6 +203,7 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual("PENDING_ENTRY", position_row["position_status"])
         self.assertEqual(0.0, position_row["entry_filled_qty"])
         self.assertEqual(0.0, position_row["remaining_qty"])
+        self.assertEqual("NONE", position_row["pending_action_status"])
         self.assertIsNone(position_row["opened_ts_utc"])
 
         self.assertEqual("SUBMITTED", request_row["status"])
@@ -512,6 +526,7 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual(0.75, position_row["entry_filled_qty"])
         self.assertEqual(0.75, position_row["remaining_qty"])
         self.assertEqual(101.25, position_row["entry_avg_fill_px"])
+        self.assertEqual("PLACE_INITIAL_STOP", position_row["pending_action_status"])
 
     def test_filled_order_ingests_one_entry_fill_and_updates_plan_summary(self) -> None:
         conn = get_connection(self.db_path)
@@ -571,6 +586,7 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual(0.8, position_row["remaining_qty"])
         self.assertEqual(103.5, position_row["entry_avg_fill_px"])
         self.assertEqual("2026-03-25T14:40:00+00:00", position_row["opened_ts_utc"])
+        self.assertEqual("PLACE_INITIAL_STOP", position_row["pending_action_status"])
 
     def test_partial_fill_ingests_or_updates_entry_fill_and_plan_summary(self) -> None:
         conn = get_connection(self.db_path)
@@ -622,6 +638,7 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual(0.25, position_row["entry_filled_qty"])
         self.assertEqual(0.25, position_row["remaining_qty"])
         self.assertEqual(102.0, position_row["entry_avg_fill_px"])
+        self.assertEqual("PLACE_INITIAL_STOP", position_row["pending_action_status"])
 
     def test_partial_fill_timestamp_preserves_first_fallback_timestamp(self) -> None:
         conn = get_connection(self.db_path)
@@ -783,6 +800,7 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual("PENDING_ENTRY", position_row["position_status"])
         self.assertEqual(0.0, position_row["entry_filled_qty"])
         self.assertEqual(0.0, position_row["remaining_qty"])
+        self.assertEqual("NONE", position_row["pending_action_status"])
 
     def test_position_remaining_qty_comes_from_actual_fill_not_intended_qty(self) -> None:
         conn = get_connection(self.db_path)
@@ -831,6 +849,108 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual(0.33, position_row["entry_filled_qty"])
         self.assertEqual(0.33, position_row["remaining_qty"])
         self.assertNotEqual(5.0, position_row["remaining_qty"])
+        self.assertEqual("PLACE_INITIAL_STOP", position_row["pending_action_status"])
+
+    def test_repeated_reconciliation_does_not_reset_pending_action_scaffolding(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-action-idem")
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-action-idem",
+                request_id="req-action-idem",
+                client_order_id="req-action-idem",
+                broker_order_id="broker-action-idem",
+                order_status="SUBMITTED",
+            )
+            order_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+                ("po-action-idem",),
+            ).fetchone()
+            snapshot = self._broker_result(
+                "broker-action-idem",
+                broker_status_raw="filled",
+                filled_ts_utc="2026-03-25T16:10:00+00:00",
+                filled_qty=0.4,
+                filled_avg_price=107.0,
+            )
+
+            self.worker.reconcile_paper_order(conn, order_row, snapshot)
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET pending_action_status = ?, last_action_error = ?
+                WHERE request_id = ?
+                """,
+                ("PLACE_INITIAL_STOP", "deferred", "req-action-idem"),
+            )
+            conn.commit()
+
+            second_order_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+                ("po-action-idem",),
+            ).fetchone()
+            self.worker.reconcile_paper_order(conn, second_order_row, snapshot)
+            position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-action-idem",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual("PLACE_INITIAL_STOP", position_row["pending_action_status"])
+        self.assertEqual("deferred", position_row["last_action_error"])
+
+    def test_repository_fetches_positions_with_pending_actions(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-pending-action")
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET position_status = ?, pending_action_status = ?
+                WHERE request_id = ?
+                """,
+                ("OPEN", "PLACE_INITIAL_STOP", "req-pending-action"),
+            )
+            conn.commit()
+            rows = self.worker.repository.get_positions_with_pending_actions(conn, limit=10)
+        finally:
+            conn.close()
+
+        request_ids = [row["request_id"] for row in rows]
+        self.assertIn("req-pending-action", request_ids)
+
+    def test_phase_c_still_does_not_create_tp_orders(self) -> None:
+        self._insert_pending_request(request_id="req-no-tp", alert_id="alert-no-tp")
+
+        with patch(
+            "trade_scout.execution.service.find_existing_broker_order",
+            return_value=None,
+        ), patch(
+            "trade_scout.execution.service.submit_validated_order",
+            return_value=self._broker_result("broker-no-tp"),
+        ):
+            self.worker.run_once()
+
+        conn = get_connection(self.db_path)
+        try:
+            roles = [
+                row["order_role"]
+                for row in conn.execute(
+                    "SELECT order_role FROM paper_orders WHERE request_id = ? ORDER BY order_role",
+                    ("req-no-tp",),
+                ).fetchall()
+            ]
+            position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-no-tp",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(["ENTRY"], roles)
+        self.assertEqual(PaperPositionActionStatus.NONE.value, position_row["pending_action_status"])
 
     def test_remote_recovery_still_persists_normalized_order_by_client_order_id(self) -> None:
         self._insert_pending_request(request_id="req-3", alert_id="alert-3")

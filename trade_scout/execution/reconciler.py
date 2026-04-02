@@ -5,6 +5,7 @@ from typing import Any, Callable
 from trade_scout.execution.broker import fetch_broker_order_by_id
 from trade_scout.execution.models import (
     BrokerOrderResult,
+    PaperPositionActionStatus,
     PaperOrderRole,
     PaperOrderStatus,
     PaperTradePlanEntryStatus,
@@ -127,10 +128,28 @@ class ExecutionReconciler:
             entry_avg_fill_px=float(fill_row["fill_px"]),
             opened_ts_utc=str(fill_row["fill_ts_utc"]),
         )
+        self.initialize_post_entry_action_state(
+            conn,
+            plan_id=str(paper_order_row["plan_id"]),
+        )
 
         print(
             f"[execution-worker] ingested fill paper_order_id={paper_order_row['paper_order_id']} "
             f"paper_fill_id={fill_row['paper_fill_id']} entry_status={entry_status}"
+        )
+
+    def initialize_post_entry_action_state(self, conn, *, plan_id: str):
+        position_row = self.repository.get_paper_position_by_plan_id(conn, plan_id)
+        if position_row is None:
+            return None
+        if str(position_row["position_status"]) not in {"OPEN", "PARTIAL"}:
+            return position_row
+        if str(position_row["pending_action_status"]) != PaperPositionActionStatus.NONE.value:
+            return position_row
+        return self.repository.update_paper_position_pending_action(
+            conn,
+            plan_id=plan_id,
+            pending_action_status=PaperPositionActionStatus.PLACE_INITIAL_STOP.value,
         )
 
     @staticmethod
