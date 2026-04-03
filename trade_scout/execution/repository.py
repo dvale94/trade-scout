@@ -226,6 +226,19 @@ class ExecutionRepository:
     ) -> sqlite3.Row | None:
         return queue.update_paper_position_from_entry_fill(conn, **kwargs)
 
+    def initialize_paper_position_exit_allocation(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        plan_id: str,
+        entry_filled_qty: float,
+    ) -> sqlite3.Row | None:
+        return queue.initialize_paper_position_exit_allocation(
+            conn,
+            plan_id=plan_id,
+            entry_filled_qty=entry_filled_qty,
+        )
+
     def update_paper_position_pending_action(
         self,
         conn: sqlite3.Connection,

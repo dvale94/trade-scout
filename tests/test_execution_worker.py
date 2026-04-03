@@ -124,6 +124,10 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertIn("tp1_triggered_ts_utc", position_columns)
         self.assertIn("tp2_triggered_ts_utc", position_columns)
         self.assertIn("active_tp1_paper_order_id", position_columns)
+        self.assertIn("tp1_target_qty", position_columns)
+        self.assertIn("tp2_target_qty", position_columns)
+        self.assertIn("tp1_filled_qty", position_columns)
+        self.assertIn("tp2_filled_qty", position_columns)
         self.assertIn("last_action_error", position_columns)
 
     def test_normalize_broker_order_status_maps_expected_values(self) -> None:
@@ -852,6 +856,113 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual(0.33, position_row["remaining_qty"])
         self.assertNotEqual(5.0, position_row["remaining_qty"])
         self.assertEqual("PLACE_INITIAL_STOP", position_row["pending_action_status"])
+        self.assertAlmostEqual(0.165, position_row["tp1_target_qty"])
+        self.assertAlmostEqual(0.165, position_row["tp2_target_qty"])
+
+    def test_open_position_initializes_exit_allocation_from_actual_fill_truth(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-alloc-open")
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-alloc-open",
+                request_id="req-alloc-open",
+                client_order_id="req-alloc-open",
+                broker_order_id="broker-alloc-open",
+                order_status="SUBMITTED",
+            )
+            order_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+                ("po-alloc-open",),
+            ).fetchone()
+
+            self.worker.reconcile_paper_order(
+                conn,
+                order_row,
+                self._broker_result(
+                    "broker-alloc-open",
+                    broker_status_raw="filled",
+                    filled_ts_utc="2026-03-25T18:00:00+00:00",
+                    filled_qty=0.75,
+                    filled_avg_price=101.25,
+                ),
+            )
+            position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-alloc-open",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertAlmostEqual(0.375, position_row["tp1_target_qty"])
+        self.assertAlmostEqual(0.375, position_row["tp2_target_qty"])
+        self.assertAlmostEqual(
+            position_row["entry_filled_qty"],
+            position_row["tp1_target_qty"] + position_row["tp2_target_qty"],
+        )
+
+    def test_repeated_reconciliation_does_not_reinitialize_exit_allocation(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-alloc-idem")
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-alloc-idem",
+                request_id="req-alloc-idem",
+                client_order_id="req-alloc-idem",
+                broker_order_id="broker-alloc-idem",
+                order_status="SUBMITTED",
+            )
+            order_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+                ("po-alloc-idem",),
+            ).fetchone()
+
+            self.worker.reconcile_paper_order(
+                conn,
+                order_row,
+                self._broker_result(
+                    "broker-alloc-idem",
+                    broker_status_raw="filled",
+                    filled_ts_utc="2026-03-25T18:10:00+00:00",
+                    filled_qty=0.8,
+                    filled_avg_price=100.0,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET tp1_target_qty = ?, tp2_target_qty = ?
+                WHERE request_id = ?
+                """,
+                (0.3, 0.5, "req-alloc-idem"),
+            )
+            conn.commit()
+
+            second_order_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+                ("po-alloc-idem",),
+            ).fetchone()
+            self.worker.reconcile_paper_order(
+                conn,
+                second_order_row,
+                self._broker_result(
+                    "broker-alloc-idem",
+                    broker_status_raw="filled",
+                    filled_ts_utc="2026-03-25T18:10:00+00:00",
+                    filled_qty=0.8,
+                    filled_avg_price=100.0,
+                ),
+            )
+            position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-alloc-idem",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertAlmostEqual(0.3, position_row["tp1_target_qty"])
+        self.assertAlmostEqual(0.5, position_row["tp2_target_qty"])
 
     def test_process_position_actions_places_initial_stop_and_links_position(self) -> None:
         conn = get_connection(self.db_path)
@@ -1277,7 +1388,8 @@ class ExecutionWorkerTest(unittest.TestCase):
                 """
                 UPDATE paper_positions
                 SET position_status = ?, remaining_qty = ?, entry_filled_qty = ?, tp1_triggered_ts_utc = ?,
-                    pending_action_status = ?, active_stop_paper_order_id = ?, stop_qty = ?, stop_price = ?, stop_limit_price = ?
+                    pending_action_status = ?, active_stop_paper_order_id = ?, stop_qty = ?, stop_price = ?, stop_limit_price = ?,
+                    tp1_target_qty = ?, tp2_target_qty = ?
                 WHERE request_id = ?
                 """,
                 (
@@ -1290,6 +1402,8 @@ class ExecutionWorkerTest(unittest.TestCase):
                     0.8,
                     92.0,
                     92.0,
+                    0.4,
+                    0.4,
                     "req-tp1-action",
                 ),
             )
@@ -1332,11 +1446,13 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual("CANCELED", stop_row["order_status"])
         self.assertEqual("TP1", tp1_row["order_role"])
         self.assertEqual("tp1:plan-req-tp1-action", tp1_row["client_order_id"])
-        self.assertEqual(0.8, tp1_row["qty"])
+        self.assertEqual(0.4, tp1_row["qty"])
         self.assertEqual(110.0, tp1_row["limit_price"])
         self.assertEqual(PaperPositionActionStatus.WAIT_TP1_FILL.value, position_row["pending_action_status"])
         self.assertIsNone(position_row["active_stop_paper_order_id"])
         self.assertEqual(tp1_row["paper_order_id"], position_row["active_tp1_paper_order_id"])
+        self.assertEqual(0.4, position_row["tp1_target_qty"])
+        self.assertEqual(0.4, position_row["tp2_target_qty"])
 
     def test_local_stop_already_canceled_still_advances_to_tp1_submission(self) -> None:
         conn = get_connection(self.db_path)
@@ -1361,7 +1477,7 @@ class ExecutionWorkerTest(unittest.TestCase):
                 """
                 UPDATE paper_positions
                 SET position_status = ?, remaining_qty = ?, entry_filled_qty = ?, tp1_triggered_ts_utc = ?,
-                    pending_action_status = ?, active_stop_paper_order_id = ?
+                    pending_action_status = ?, active_stop_paper_order_id = ?, tp1_target_qty = ?, tp2_target_qty = ?
                 WHERE request_id = ?
                 """,
                 (
@@ -1371,6 +1487,8 @@ class ExecutionWorkerTest(unittest.TestCase):
                     "2026-03-25T17:12:00+00:00",
                     "CANCEL_STOP_FOR_TP1",
                     "po-stop-canceled",
+                    0.25,
+                    0.25,
                     "req-tp1-stop-canceled",
                 ),
             )
@@ -1402,6 +1520,7 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual(1, processed)
         self.assertEqual(PaperPositionActionStatus.WAIT_TP1_FILL.value, position_row["pending_action_status"])
         self.assertIsNotNone(tp1_row)
+        self.assertEqual(0.25, tp1_row["qty"])
 
     def test_local_tp1_reuse_is_idempotent(self) -> None:
         conn = get_connection(self.db_path)
@@ -1424,10 +1543,11 @@ class ExecutionWorkerTest(unittest.TestCase):
             conn.execute(
                 """
                 UPDATE paper_positions
-                SET position_status = ?, remaining_qty = ?, entry_filled_qty = ?, pending_action_status = ?
+                SET position_status = ?, remaining_qty = ?, entry_filled_qty = ?, pending_action_status = ?,
+                    tp1_target_qty = ?, tp2_target_qty = ?
                 WHERE request_id = ?
                 """,
-                ("OPEN", 0.6, 0.6, "SUBMIT_TP1", "req-tp1-local-reuse"),
+                ("OPEN", 0.6, 0.6, "SUBMIT_TP1", 0.3, 0.3, "req-tp1-local-reuse"),
             )
             conn.commit()
 
@@ -1460,10 +1580,11 @@ class ExecutionWorkerTest(unittest.TestCase):
             conn.execute(
                 """
                 UPDATE paper_positions
-                SET position_status = ?, remaining_qty = ?, entry_filled_qty = ?, pending_action_status = ?
+                SET position_status = ?, remaining_qty = ?, entry_filled_qty = ?, pending_action_status = ?,
+                    tp1_target_qty = ?, tp2_target_qty = ?
                 WHERE request_id = ?
                 """,
-                ("OPEN", 0.55, 0.55, "SUBMIT_TP1", "req-tp1-remote"),
+                ("OPEN", 0.55, 0.55, "SUBMIT_TP1", 0.275, 0.275, "req-tp1-remote"),
             )
             conn.commit()
 
@@ -1491,6 +1612,41 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual("tp1:plan-req-tp1-remote", tp1_row["client_order_id"])
         self.assertEqual("broker-tp1-remote", tp1_row["broker_order_id"])
         self.assertEqual(PaperPositionActionStatus.WAIT_TP1_FILL.value, position_row["pending_action_status"])
+        self.assertEqual(0.275, tp1_row["qty"])
+
+    def test_tp1_submission_uses_tp1_target_qty_not_full_remaining_qty(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-tp1-target-qty")
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET position_status = ?, remaining_qty = ?, entry_filled_qty = ?, pending_action_status = ?,
+                    tp1_target_qty = ?, tp2_target_qty = ?
+                WHERE request_id = ?
+                """,
+                ("OPEN", 0.8, 0.8, "SUBMIT_TP1", 0.3, 0.5, "req-tp1-target-qty"),
+            )
+            conn.commit()
+
+            with patch(
+                "trade_scout.execution.service.find_existing_broker_order_by_client_order_id",
+                return_value=None,
+            ), patch(
+                "trade_scout.execution.service.submit_take_profit_order",
+                return_value=self._broker_result("broker-tp1-target-qty", broker_status_raw="new"),
+            ):
+                processed = self.worker.service.process_position_actions(conn, limit=10)
+
+            tp1_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE request_id = ? AND order_role = ?",
+                ("req-tp1-target-qty", "TP1"),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(1, processed)
+        self.assertEqual(0.3, tp1_row["qty"])
 
     def test_repeated_tp1_action_processing_does_not_duplicate_tp1_orders(self) -> None:
         conn = get_connection(self.db_path)
@@ -1515,7 +1671,7 @@ class ExecutionWorkerTest(unittest.TestCase):
                 """
                 UPDATE paper_positions
                 SET position_status = ?, remaining_qty = ?, entry_filled_qty = ?, tp1_triggered_ts_utc = ?,
-                    pending_action_status = ?, active_stop_paper_order_id = ?
+                    pending_action_status = ?, active_stop_paper_order_id = ?, tp1_target_qty = ?, tp2_target_qty = ?
                 WHERE request_id = ?
                 """,
                 (
@@ -1525,6 +1681,8 @@ class ExecutionWorkerTest(unittest.TestCase):
                     "2026-03-25T17:13:00+00:00",
                     "CANCEL_STOP_FOR_TP1",
                     "po-stop-repeat",
+                    0.225,
+                    0.225,
                     "req-tp1-repeat",
                 ),
             )
@@ -1577,10 +1735,11 @@ class ExecutionWorkerTest(unittest.TestCase):
             conn.execute(
                 """
                 UPDATE paper_positions
-                SET position_status = ?, remaining_qty = ?, entry_filled_qty = ?, pending_action_status = ?
+                SET position_status = ?, remaining_qty = ?, entry_filled_qty = ?, pending_action_status = ?,
+                    tp1_target_qty = ?, tp2_target_qty = ?
                 WHERE request_id = ?
                 """,
-                ("OPEN", 0.5, 0.5, "SUBMIT_TP1", "req-tp1-no-tp2"),
+                ("OPEN", 0.5, 0.5, "SUBMIT_TP1", 0.25, 0.25, "req-tp1-no-tp2"),
             )
             conn.commit()
 
@@ -2108,10 +2267,23 @@ class ExecutionWorkerTest(unittest.TestCase):
                 opened_ts_utc,
                 closed_ts_utc,
                 remaining_qty,
+                pending_action_status,
+                active_stop_paper_order_id,
+                stop_qty,
+                stop_price,
+                stop_limit_price,
+                tp1_triggered_ts_utc,
+                tp2_triggered_ts_utc,
+                active_tp1_paper_order_id,
+                tp1_target_qty,
+                tp2_target_qty,
+                tp1_filled_qty,
+                tp2_filled_qty,
+                last_action_error,
                 created_ts_utc,
                 updated_ts_utc,
                 schema_version
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 "position-" + request_id,
@@ -2128,6 +2300,19 @@ class ExecutionWorkerTest(unittest.TestCase):
                 None,
                 None,
                 0.0,
+                "NONE",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                0.0,
+                0.0,
+                None,
                 "2026-03-25T14:00:00+00:00",
                 "2026-03-25T14:00:00+00:00",
                 "1",

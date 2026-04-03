@@ -217,6 +217,10 @@ def init_db(db_path: str) -> None:
                 tp1_triggered_ts_utc TEXT,
                 tp2_triggered_ts_utc TEXT,
                 active_tp1_paper_order_id TEXT,
+                tp1_target_qty REAL,
+                tp2_target_qty REAL,
+                tp1_filled_qty REAL NOT NULL DEFAULT 0,
+                tp2_filled_qty REAL NOT NULL DEFAULT 0,
                 last_action_error TEXT,
                 created_ts_utc TEXT NOT NULL,
                 updated_ts_utc TEXT NOT NULL,
@@ -323,6 +327,10 @@ def _ensure_paper_positions_columns(conn: sqlite3.Connection) -> None:
         "tp1_triggered_ts_utc": "TEXT",
         "tp2_triggered_ts_utc": "TEXT",
         "active_tp1_paper_order_id": "TEXT",
+        "tp1_target_qty": "REAL",
+        "tp2_target_qty": "REAL",
+        "tp1_filled_qty": "REAL NOT NULL DEFAULT 0",
+        "tp2_filled_qty": "REAL NOT NULL DEFAULT 0",
         "last_action_error": "TEXT",
     }
     for column_name, column_def in additive_columns.items():
@@ -865,11 +873,15 @@ def ensure_paper_position(
                 tp1_triggered_ts_utc,
                 tp2_triggered_ts_utc,
                 active_tp1_paper_order_id,
+                tp1_target_qty,
+                tp2_target_qty,
+                tp1_filled_qty,
+                tp2_filled_qty,
                 last_action_error,
                 created_ts_utc,
                 updated_ts_utc,
                 schema_version
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 position_id,
@@ -894,6 +906,10 @@ def ensure_paper_position(
                 None,
                 None,
                 None,
+                None,
+                None,
+                0.0,
+                0.0,
                 None,
                 now,
                 now,
@@ -1277,6 +1293,44 @@ def update_paper_position_from_entry_fill(
             updated_ts_utc,
             plan_id,
         ),
+    )
+    conn.commit()
+    return get_paper_position_by_plan_id(conn, plan_id)
+
+
+def initialize_paper_position_exit_allocation(
+    conn: sqlite3.Connection,
+    *,
+    plan_id: str,
+    entry_filled_qty: float,
+) -> sqlite3.Row | None:
+    position_row = get_paper_position_by_plan_id(conn, plan_id)
+    if position_row is None:
+        return None
+
+    existing_tp1_target_qty = position_row["tp1_target_qty"]
+    existing_tp2_target_qty = position_row["tp2_target_qty"]
+    if existing_tp1_target_qty is not None and existing_tp2_target_qty is not None:
+        return position_row
+
+    if entry_filled_qty <= 0:
+        return position_row
+
+    tp1_target_qty = round(entry_filled_qty * 0.5, 8)
+    tp2_target_qty = round(entry_filled_qty - tp1_target_qty, 8)
+    if tp2_target_qty < 0:
+        tp2_target_qty = 0.0
+        tp1_target_qty = round(entry_filled_qty, 8)
+
+    conn.execute(
+        """
+        UPDATE paper_positions
+        SET tp1_target_qty = COALESCE(tp1_target_qty, ?),
+            tp2_target_qty = COALESCE(tp2_target_qty, ?),
+            updated_ts_utc = ?
+        WHERE plan_id = ?
+        """,
+        (tp1_target_qty, tp2_target_qty, utc_now_iso(), plan_id),
     )
     conn.commit()
     return get_paper_position_by_plan_id(conn, plan_id)

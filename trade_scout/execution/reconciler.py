@@ -128,6 +128,11 @@ class ExecutionReconciler:
             entry_avg_fill_px=float(fill_row["fill_px"]),
             opened_ts_utc=str(fill_row["fill_ts_utc"]),
         )
+        self.repository.initialize_paper_position_exit_allocation(
+            conn,
+            plan_id=str(paper_order_row["plan_id"]),
+            entry_filled_qty=float(fill_row["fill_qty"]),
+        )
         self.initialize_post_entry_action_state(
             conn,
             plan_id=str(paper_order_row["plan_id"]),

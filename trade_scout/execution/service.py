@@ -789,15 +789,13 @@ class ExecutionService:
         if trade_plan is None:
             raise RuntimeError("paper trade plan not found for tp1 submission")
 
-        remaining_qty = self._coerce_float(position_row["remaining_qty"])
-        if remaining_qty is None or remaining_qty <= 0:
-            raise RuntimeError("tp1 submission requires remaining_qty > 0")
+        tp1_qty = self._coerce_float(position_row["tp1_target_qty"])
+        if tp1_qty is None or tp1_qty <= 0:
+            raise RuntimeError("tp1 submission requires tp1_target_qty > 0")
 
         tp1_price = self._coerce_float(trade_plan["t1_px"])
         if tp1_price is None or tp1_price <= 0:
             raise RuntimeError("paper trade plan t1_px is missing or invalid")
-
-        tp1_qty = remaining_qty
         tp1_client_order_id = self._build_tp1_client_order_id(plan_id)
 
         local_tp1_order = self.repository.get_paper_order_by_client_order_id(conn, tp1_client_order_id)
