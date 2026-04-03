@@ -300,6 +300,23 @@ class ExecutionRepository:
             tp1_order_terminal=tp1_order_terminal,
         )
 
+    def apply_tp2_fill_to_position(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        plan_id: str,
+        tp2_filled_qty: float,
+        tp2_order_terminal: bool,
+        closed_ts_utc: str | None = None,
+    ) -> sqlite3.Row | None:
+        return queue.apply_tp2_fill_to_position(
+            conn,
+            plan_id=plan_id,
+            tp2_filled_qty=tp2_filled_qty,
+            tp2_order_terminal=tp2_order_terminal,
+            closed_ts_utc=closed_ts_utc,
+        )
+
     def record_paper_position_trigger(
         self,
         conn: sqlite3.Connection,

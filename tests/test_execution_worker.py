@@ -26,6 +26,7 @@ from trade_scout.execution.models import (
     ExecutionRequest,
     ExecutionStatus,
     PaperPositionActionStatus,
+    PaperPositionStatus,
 )
 from trade_scout.execution.queue import (
     get_connection,
@@ -2277,6 +2278,293 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual(1, len(tp2_rows))
         self.assertEqual(PaperPositionActionStatus.WAIT_TP2_FILL.value, position_row["pending_action_status"])
         self.assertIsNone(position_row["active_stop_paper_order_id"])
+
+    def test_tp2_fill_updates_position_truth_and_closes_position(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-tp2-fill")
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-tp2-fill",
+                request_id="req-tp2-fill",
+                client_order_id="tp2:plan-req-tp2-fill",
+                broker_order_id="broker-tp2-fill",
+                order_status="SUBMITTED",
+                order_role="TP2",
+                order_type="limit",
+                qty=0.4,
+                notional=None,
+                limit_price=115.0,
+                broker_status_raw="new",
+            )
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET position_status = ?, entry_filled_qty = ?, remaining_qty = ?, pending_action_status = ?,
+                    active_tp2_paper_order_id = ?, tp1_filled_qty = ?, tp2_filled_qty = ?, active_stop_paper_order_id = ?
+                WHERE request_id = ?
+                """,
+                (
+                    "PARTIAL",
+                    0.8,
+                    0.4,
+                    "WAIT_TP2_FILL",
+                    "po-tp2-fill",
+                    0.4,
+                    0.0,
+                    "po-stop-stale",
+                    "req-tp2-fill",
+                ),
+            )
+            conn.commit()
+            tp2_order_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+                ("po-tp2-fill",),
+            ).fetchone()
+
+            reconciled = self.worker.reconcile_paper_order(
+                conn,
+                tp2_order_row,
+                self._broker_result(
+                    "broker-tp2-fill",
+                    broker_status_raw="filled",
+                    filled_ts_utc="2026-03-25T20:10:00+00:00",
+                    filled_qty=0.4,
+                    filled_avg_price=115.0,
+                ),
+            )
+            position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-tp2-fill",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual("FILLED", reconciled["order_status"])
+        self.assertEqual(0.4, position_row["tp2_filled_qty"])
+        self.assertEqual(0.0, position_row["remaining_qty"])
+        self.assertEqual(PaperPositionStatus.CLOSED.value, position_row["position_status"])
+        self.assertEqual(PaperPositionActionStatus.NONE.value, position_row["pending_action_status"])
+        self.assertIsNone(position_row["active_tp2_paper_order_id"])
+        self.assertIsNone(position_row["active_stop_paper_order_id"])
+        self.assertEqual("2026-03-25T20:10:00+00:00", position_row["closed_ts_utc"])
+
+    def test_tp2_partial_fill_recomputes_remaining_qty_from_total_fill_truth(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-tp2-partial")
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-tp2-partial",
+                request_id="req-tp2-partial",
+                client_order_id="tp2:plan-req-tp2-partial",
+                broker_order_id="broker-tp2-partial",
+                order_status="SUBMITTED",
+                order_role="TP2",
+                order_type="limit",
+                qty=0.4,
+                notional=None,
+                limit_price=115.0,
+                broker_status_raw="new",
+            )
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET position_status = ?, entry_filled_qty = ?, remaining_qty = ?, pending_action_status = ?,
+                    active_tp2_paper_order_id = ?, tp1_filled_qty = ?, tp2_filled_qty = ?
+                WHERE request_id = ?
+                """,
+                (
+                    "PARTIAL",
+                    0.8,
+                    0.4,
+                    "WAIT_TP2_FILL",
+                    "po-tp2-partial",
+                    0.4,
+                    0.0,
+                    "req-tp2-partial",
+                ),
+            )
+            conn.commit()
+            tp2_order_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+                ("po-tp2-partial",),
+            ).fetchone()
+
+            self.worker.reconcile_paper_order(
+                conn,
+                tp2_order_row,
+                self._broker_result(
+                    "broker-tp2-partial",
+                    broker_status_raw="partially_filled",
+                    filled_ts_utc="2026-03-25T20:12:00+00:00",
+                    filled_qty=0.1,
+                    filled_avg_price=115.0,
+                ),
+            )
+            partial_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-tp2-partial",),
+            ).fetchone()
+
+            second_tp2_order_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+                ("po-tp2-partial",),
+            ).fetchone()
+            self.worker.reconcile_paper_order(
+                conn,
+                second_tp2_order_row,
+                self._broker_result(
+                    "broker-tp2-partial",
+                    broker_status_raw="partially_filled",
+                    filled_ts_utc="2026-03-25T20:12:00+00:00",
+                    filled_qty=0.1,
+                    filled_avg_price=115.0,
+                ),
+            )
+            repeated_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-tp2-partial",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(0.1, partial_row["tp2_filled_qty"])
+        self.assertEqual(0.3, partial_row["remaining_qty"])
+        self.assertEqual(PaperPositionActionStatus.WAIT_TP2_FILL.value, partial_row["pending_action_status"])
+        self.assertEqual("po-tp2-partial", partial_row["active_tp2_paper_order_id"])
+        self.assertEqual(PaperPositionStatus.PARTIAL.value, partial_row["position_status"])
+        self.assertEqual(0.1, repeated_row["tp2_filled_qty"])
+        self.assertEqual(0.3, repeated_row["remaining_qty"])
+        self.assertEqual(PaperPositionActionStatus.WAIT_TP2_FILL.value, repeated_row["pending_action_status"])
+
+    def test_wait_tp2_fill_remains_when_tp2_has_no_fill_yet(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-tp2-wait")
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-tp2-wait",
+                request_id="req-tp2-wait",
+                client_order_id="tp2:plan-req-tp2-wait",
+                broker_order_id="broker-tp2-wait",
+                order_status="SUBMITTED",
+                order_role="TP2",
+                order_type="limit",
+                qty=0.2,
+                notional=None,
+                limit_price=115.0,
+                broker_status_raw="new",
+            )
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET position_status = ?, entry_filled_qty = ?, remaining_qty = ?, pending_action_status = ?,
+                    active_tp2_paper_order_id = ?, tp1_filled_qty = ?, tp2_filled_qty = ?
+                WHERE request_id = ?
+                """,
+                (
+                    "PARTIAL",
+                    0.8,
+                    0.2,
+                    "WAIT_TP2_FILL",
+                    "po-tp2-wait",
+                    0.6,
+                    0.0,
+                    "req-tp2-wait",
+                ),
+            )
+            conn.commit()
+            tp2_order_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+                ("po-tp2-wait",),
+            ).fetchone()
+
+            self.worker.reconcile_paper_order(
+                conn,
+                tp2_order_row,
+                self._broker_result(
+                    "broker-tp2-wait",
+                    broker_status_raw="accepted",
+                    filled_qty=None,
+                    filled_avg_price=None,
+                ),
+            )
+            position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-tp2-wait",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(PaperPositionActionStatus.WAIT_TP2_FILL.value, position_row["pending_action_status"])
+        self.assertEqual(PaperPositionStatus.PARTIAL.value, position_row["position_status"])
+        self.assertEqual(0.2, position_row["remaining_qty"])
+        self.assertEqual("po-tp2-wait", position_row["active_tp2_paper_order_id"])
+
+    def test_tp2_terminal_no_fill_clears_active_link_without_closing(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-tp2-no-fill")
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-tp2-no-fill",
+                request_id="req-tp2-no-fill",
+                client_order_id="tp2:plan-req-tp2-no-fill",
+                broker_order_id="broker-tp2-no-fill",
+                order_status="SUBMITTED",
+                order_role="TP2",
+                order_type="limit",
+                qty=0.2,
+                notional=None,
+                limit_price=115.0,
+                broker_status_raw="new",
+            )
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET position_status = ?, entry_filled_qty = ?, remaining_qty = ?, pending_action_status = ?,
+                    active_tp2_paper_order_id = ?, tp1_filled_qty = ?, tp2_filled_qty = ?
+                WHERE request_id = ?
+                """,
+                (
+                    "PARTIAL",
+                    0.8,
+                    0.2,
+                    "WAIT_TP2_FILL",
+                    "po-tp2-no-fill",
+                    0.6,
+                    0.0,
+                    "req-tp2-no-fill",
+                ),
+            )
+            conn.commit()
+            tp2_order_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+                ("po-tp2-no-fill",),
+            ).fetchone()
+
+            self.worker.reconcile_paper_order(
+                conn,
+                tp2_order_row,
+                self._broker_result(
+                    "broker-tp2-no-fill",
+                    broker_status_raw="canceled",
+                    canceled_ts_utc="2026-03-25T20:15:00+00:00",
+                    filled_qty=0.0,
+                    filled_avg_price=None,
+                ),
+            )
+            position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-tp2-no-fill",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertIsNone(position_row["active_tp2_paper_order_id"])
+        self.assertEqual(PaperPositionActionStatus.NONE.value, position_row["pending_action_status"])
+        self.assertEqual(PaperPositionStatus.PARTIAL.value, position_row["position_status"])
 
     def test_tp1_fill_updates_position_truth_and_schedules_rearm(self) -> None:
         conn = get_connection(self.db_path)
