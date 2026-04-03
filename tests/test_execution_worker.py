@@ -123,6 +123,7 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertIn("stop_limit_price", position_columns)
         self.assertIn("tp1_triggered_ts_utc", position_columns)
         self.assertIn("tp2_triggered_ts_utc", position_columns)
+        self.assertIn("active_tp1_paper_order_id", position_columns)
         self.assertIn("last_action_error", position_columns)
 
     def test_normalize_broker_order_status_maps_expected_values(self) -> None:
@@ -1252,6 +1253,362 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual(1, processed)
         self.assertEqual([], order_roles)
         self.assertEqual(PaperPositionActionStatus.CANCEL_STOP_FOR_TP1.value, position_row["pending_action_status"])
+
+    def test_tp1_action_cancels_stop_and_submits_tp1_order(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-tp1-action", stop_px=92.0, t1_px=110.0)
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-stop-tp1-action",
+                request_id="req-tp1-action",
+                client_order_id="stop:plan-req-tp1-action",
+                broker_order_id="broker-stop-tp1-action",
+                order_status="ACCEPTED",
+                order_role="STOP",
+                order_type="stop_limit",
+                qty=0.8,
+                notional=None,
+                limit_price=92.0,
+                stop_price=92.0,
+                broker_status_raw="new",
+            )
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET position_status = ?, remaining_qty = ?, entry_filled_qty = ?, tp1_triggered_ts_utc = ?,
+                    pending_action_status = ?, active_stop_paper_order_id = ?, stop_qty = ?, stop_price = ?, stop_limit_price = ?
+                WHERE request_id = ?
+                """,
+                (
+                    "OPEN",
+                    0.8,
+                    0.8,
+                    "2026-03-25T17:10:00+00:00",
+                    "CANCEL_STOP_FOR_TP1",
+                    "po-stop-tp1-action",
+                    0.8,
+                    92.0,
+                    92.0,
+                    "req-tp1-action",
+                ),
+            )
+            conn.commit()
+
+            with patch(
+                "trade_scout.execution.service.cancel_broker_order",
+                return_value=self._broker_result(
+                    "broker-stop-tp1-action",
+                    broker_status_raw="canceled",
+                    canceled_ts_utc="2026-03-25T17:11:00+00:00",
+                ),
+            ) as cancel_mock, patch(
+                "trade_scout.execution.service.find_existing_broker_order_by_client_order_id",
+                return_value=None,
+            ), patch(
+                "trade_scout.execution.service.submit_take_profit_order",
+                return_value=self._broker_result("broker-tp1-action", broker_status_raw="new"),
+            ) as tp1_submit_mock:
+                processed = self.worker.service.process_position_actions(conn, limit=10)
+
+            stop_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+                ("po-stop-tp1-action",),
+            ).fetchone()
+            tp1_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE request_id = ? AND order_role = ?",
+                ("req-tp1-action", "TP1"),
+            ).fetchone()
+            position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-tp1-action",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(1, processed)
+        self.assertEqual(1, cancel_mock.call_count)
+        self.assertEqual(1, tp1_submit_mock.call_count)
+        self.assertEqual("CANCELED", stop_row["order_status"])
+        self.assertEqual("TP1", tp1_row["order_role"])
+        self.assertEqual("tp1:plan-req-tp1-action", tp1_row["client_order_id"])
+        self.assertEqual(0.8, tp1_row["qty"])
+        self.assertEqual(110.0, tp1_row["limit_price"])
+        self.assertEqual(PaperPositionActionStatus.WAIT_TP1_FILL.value, position_row["pending_action_status"])
+        self.assertIsNone(position_row["active_stop_paper_order_id"])
+        self.assertEqual(tp1_row["paper_order_id"], position_row["active_tp1_paper_order_id"])
+
+    def test_local_stop_already_canceled_still_advances_to_tp1_submission(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-tp1-stop-canceled")
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-stop-canceled",
+                request_id="req-tp1-stop-canceled",
+                client_order_id="stop:plan-req-tp1-stop-canceled",
+                broker_order_id="broker-stop-canceled",
+                order_status="CANCELED",
+                order_role="STOP",
+                order_type="stop_limit",
+                qty=0.5,
+                notional=None,
+                limit_price=95.0,
+                stop_price=95.0,
+                broker_status_raw="canceled",
+            )
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET position_status = ?, remaining_qty = ?, entry_filled_qty = ?, tp1_triggered_ts_utc = ?,
+                    pending_action_status = ?, active_stop_paper_order_id = ?
+                WHERE request_id = ?
+                """,
+                (
+                    "OPEN",
+                    0.5,
+                    0.5,
+                    "2026-03-25T17:12:00+00:00",
+                    "CANCEL_STOP_FOR_TP1",
+                    "po-stop-canceled",
+                    "req-tp1-stop-canceled",
+                ),
+            )
+            conn.commit()
+
+            with patch(
+                "trade_scout.execution.service.cancel_broker_order",
+                side_effect=AssertionError("cancel_broker_order should not be called"),
+            ), patch(
+                "trade_scout.execution.service.find_existing_broker_order_by_client_order_id",
+                return_value=None,
+            ), patch(
+                "trade_scout.execution.service.submit_take_profit_order",
+                return_value=self._broker_result("broker-tp1-stop-canceled", broker_status_raw="new"),
+            ):
+                processed = self.worker.service.process_position_actions(conn, limit=10)
+
+            position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-tp1-stop-canceled",),
+            ).fetchone()
+            tp1_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE request_id = ? AND order_role = ?",
+                ("req-tp1-stop-canceled", "TP1"),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(1, processed)
+        self.assertEqual(PaperPositionActionStatus.WAIT_TP1_FILL.value, position_row["pending_action_status"])
+        self.assertIsNotNone(tp1_row)
+
+    def test_local_tp1_reuse_is_idempotent(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-tp1-local-reuse")
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-tp1-local-reuse",
+                request_id="req-tp1-local-reuse",
+                client_order_id="tp1:plan-req-tp1-local-reuse",
+                broker_order_id="broker-tp1-local-reuse",
+                order_status="SUBMITTED",
+                order_role="TP1",
+                order_type="limit",
+                qty=0.6,
+                notional=None,
+                limit_price=110.0,
+                broker_status_raw="new",
+            )
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET position_status = ?, remaining_qty = ?, entry_filled_qty = ?, pending_action_status = ?
+                WHERE request_id = ?
+                """,
+                ("OPEN", 0.6, 0.6, "SUBMIT_TP1", "req-tp1-local-reuse"),
+            )
+            conn.commit()
+
+            with patch(
+                "trade_scout.execution.service.submit_take_profit_order",
+                side_effect=AssertionError("submit_take_profit_order should not be called"),
+            ):
+                processed = self.worker.service.process_position_actions(conn, limit=10)
+
+            tp1_rows = conn.execute(
+                "SELECT * FROM paper_orders WHERE request_id = ? AND order_role = ?",
+                ("req-tp1-local-reuse", "TP1"),
+            ).fetchall()
+            position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-tp1-local-reuse",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(1, processed)
+        self.assertEqual(1, len(tp1_rows))
+        self.assertEqual(PaperPositionActionStatus.WAIT_TP1_FILL.value, position_row["pending_action_status"])
+        self.assertEqual("po-tp1-local-reuse", position_row["active_tp1_paper_order_id"])
+
+    def test_remote_tp1_recovery_by_deterministic_client_order_id(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-tp1-remote")
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET position_status = ?, remaining_qty = ?, entry_filled_qty = ?, pending_action_status = ?
+                WHERE request_id = ?
+                """,
+                ("OPEN", 0.55, 0.55, "SUBMIT_TP1", "req-tp1-remote"),
+            )
+            conn.commit()
+
+            with patch(
+                "trade_scout.execution.service.find_existing_broker_order_by_client_order_id",
+                return_value=self._broker_result("broker-tp1-remote", broker_status_raw="accepted"),
+            ), patch(
+                "trade_scout.execution.service.submit_take_profit_order",
+                side_effect=AssertionError("submit_take_profit_order should not be called"),
+            ):
+                processed = self.worker.service.process_position_actions(conn, limit=10)
+
+            tp1_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE request_id = ? AND order_role = ?",
+                ("req-tp1-remote", "TP1"),
+            ).fetchone()
+            position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-tp1-remote",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(1, processed)
+        self.assertEqual("tp1:plan-req-tp1-remote", tp1_row["client_order_id"])
+        self.assertEqual("broker-tp1-remote", tp1_row["broker_order_id"])
+        self.assertEqual(PaperPositionActionStatus.WAIT_TP1_FILL.value, position_row["pending_action_status"])
+
+    def test_repeated_tp1_action_processing_does_not_duplicate_tp1_orders(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-tp1-repeat")
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-stop-repeat",
+                request_id="req-tp1-repeat",
+                client_order_id="stop:plan-req-tp1-repeat",
+                broker_order_id="broker-stop-repeat",
+                order_status="CANCELED",
+                order_role="STOP",
+                order_type="stop_limit",
+                qty=0.45,
+                notional=None,
+                limit_price=95.0,
+                stop_price=95.0,
+                broker_status_raw="canceled",
+            )
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET position_status = ?, remaining_qty = ?, entry_filled_qty = ?, tp1_triggered_ts_utc = ?,
+                    pending_action_status = ?, active_stop_paper_order_id = ?
+                WHERE request_id = ?
+                """,
+                (
+                    "OPEN",
+                    0.45,
+                    0.45,
+                    "2026-03-25T17:13:00+00:00",
+                    "CANCEL_STOP_FOR_TP1",
+                    "po-stop-repeat",
+                    "req-tp1-repeat",
+                ),
+            )
+            conn.commit()
+
+            with patch(
+                "trade_scout.execution.service.find_existing_broker_order_by_client_order_id",
+                return_value=None,
+            ), patch(
+                "trade_scout.execution.service.submit_take_profit_order",
+                return_value=self._broker_result("broker-tp1-repeat", broker_status_raw="new"),
+            ):
+                self.worker.service.process_position_actions(conn, limit=10)
+                self.worker.service.process_position_actions(conn, limit=10)
+
+            tp1_rows = conn.execute(
+                "SELECT * FROM paper_orders WHERE request_id = ? AND order_role = ?",
+                ("req-tp1-repeat", "TP1"),
+            ).fetchall()
+            position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-tp1-repeat",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(1, len(tp1_rows))
+        self.assertEqual(PaperPositionActionStatus.WAIT_TP1_FILL.value, position_row["pending_action_status"])
+        self.assertIsNone(position_row["active_stop_paper_order_id"])
+
+    def test_tp1_action_does_not_submit_tp2_or_rearm_stop(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-tp1-no-tp2")
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-stop-no-tp2",
+                request_id="req-tp1-no-tp2",
+                client_order_id="stop:plan-req-tp1-no-tp2",
+                broker_order_id="broker-stop-no-tp2",
+                order_status="CANCELED",
+                order_role="STOP",
+                order_type="stop_limit",
+                qty=0.5,
+                notional=None,
+                limit_price=95.0,
+                stop_price=95.0,
+                broker_status_raw="canceled",
+            )
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET position_status = ?, remaining_qty = ?, entry_filled_qty = ?, pending_action_status = ?
+                WHERE request_id = ?
+                """,
+                ("OPEN", 0.5, 0.5, "SUBMIT_TP1", "req-tp1-no-tp2"),
+            )
+            conn.commit()
+
+            with patch(
+                "trade_scout.execution.service.find_existing_broker_order_by_client_order_id",
+                return_value=None,
+            ), patch(
+                "trade_scout.execution.service.submit_take_profit_order",
+                return_value=self._broker_result("broker-tp1-no-tp2", broker_status_raw="new"),
+            ):
+                self.worker.service.process_position_actions(conn, limit=10)
+
+            roles = [
+                row["order_role"]
+                for row in conn.execute(
+                    "SELECT order_role FROM paper_orders WHERE request_id = ? ORDER BY order_role",
+                    ("req-tp1-no-tp2",),
+                ).fetchall()
+            ]
+            position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-tp1-no-tp2",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(["STOP", "TP1"], roles)
+        self.assertEqual(PaperPositionActionStatus.WAIT_TP1_FILL.value, position_row["pending_action_status"])
 
     def test_repeated_reconciliation_does_not_reset_pending_action_scaffolding(self) -> None:
         conn = get_connection(self.db_path)

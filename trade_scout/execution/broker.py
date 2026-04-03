@@ -3,8 +3,10 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from trade_scout.execution.alpaca_adapter import (
+    cancel_order,
     get_order_by_broker_order_id,
     get_order_by_client_order_id,
+    submit_limit_order,
     submit_market_order,
     submit_stop_order,
 )
@@ -42,6 +44,27 @@ def submit_protective_stop_order(
         side=side,
         qty=qty,
         stop_price=stop_price,
+        limit_price=limit_price,
+    )
+
+
+def cancel_broker_order(broker_order_id: str) -> BrokerOrderResult | None:
+    return cancel_order(broker_order_id)
+
+
+def submit_take_profit_order(
+    *,
+    client_order_id: str,
+    symbol: str,
+    side: str,
+    qty: float,
+    limit_price: float,
+) -> BrokerOrderResult:
+    return submit_limit_order(
+        client_order_id=client_order_id,
+        symbol=symbol,
+        side=side,
+        qty=qty,
         limit_price=limit_price,
     )
 

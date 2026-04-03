@@ -216,6 +216,7 @@ def init_db(db_path: str) -> None:
                 stop_limit_price REAL,
                 tp1_triggered_ts_utc TEXT,
                 tp2_triggered_ts_utc TEXT,
+                active_tp1_paper_order_id TEXT,
                 last_action_error TEXT,
                 created_ts_utc TEXT NOT NULL,
                 updated_ts_utc TEXT NOT NULL,
@@ -321,6 +322,7 @@ def _ensure_paper_positions_columns(conn: sqlite3.Connection) -> None:
         "stop_limit_price": "REAL",
         "tp1_triggered_ts_utc": "TEXT",
         "tp2_triggered_ts_utc": "TEXT",
+        "active_tp1_paper_order_id": "TEXT",
         "last_action_error": "TEXT",
     }
     for column_name, column_def in additive_columns.items():
@@ -564,6 +566,19 @@ def get_paper_order_by_client_order_id(
         WHERE client_order_id = ?
         """,
         (client_order_id,),
+    ).fetchone()
+
+
+def get_paper_order_by_id(
+    conn: sqlite3.Connection, paper_order_id: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT *
+        FROM paper_orders
+        WHERE paper_order_id = ?
+        """,
+        (paper_order_id,),
     ).fetchone()
 
 
@@ -849,11 +864,12 @@ def ensure_paper_position(
                 stop_limit_price,
                 tp1_triggered_ts_utc,
                 tp2_triggered_ts_utc,
+                active_tp1_paper_order_id,
                 last_action_error,
                 created_ts_utc,
                 updated_ts_utc,
                 schema_version
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 position_id,
@@ -871,6 +887,7 @@ def ensure_paper_position(
                 None,
                 0.0,
                 PaperPositionActionStatus.NONE.value,
+                None,
                 None,
                 None,
                 None,
@@ -1311,6 +1328,25 @@ def update_paper_position_stop_state(
             utc_now_iso(),
             plan_id,
         ),
+    )
+    conn.commit()
+    return get_paper_position_by_plan_id(conn, plan_id)
+
+
+def update_paper_position_tp1_state(
+    conn: sqlite3.Connection,
+    *,
+    plan_id: str,
+    active_tp1_paper_order_id: str | None = None,
+) -> sqlite3.Row | None:
+    conn.execute(
+        """
+        UPDATE paper_positions
+        SET active_tp1_paper_order_id = ?,
+            updated_ts_utc = ?
+        WHERE plan_id = ?
+        """,
+        (active_tp1_paper_order_id, utc_now_iso(), plan_id),
     )
     conn.commit()
     return get_paper_position_by_plan_id(conn, plan_id)

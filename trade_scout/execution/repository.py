@@ -152,6 +152,13 @@ class ExecutionRepository:
     ) -> sqlite3.Row | None:
         return queue.get_paper_order_by_client_order_id(conn, client_order_id)
 
+    def get_paper_order_by_id(
+        self,
+        conn: sqlite3.Connection,
+        paper_order_id: str,
+    ) -> sqlite3.Row | None:
+        return queue.get_paper_order_by_id(conn, paper_order_id)
+
     def insert_paper_order(self, conn: sqlite3.Connection, **kwargs) -> sqlite3.Row:
         return queue.insert_paper_order(conn, **kwargs)
 
@@ -238,6 +245,19 @@ class ExecutionRepository:
         **kwargs,
     ) -> sqlite3.Row | None:
         return queue.update_paper_position_stop_state(conn, **kwargs)
+
+    def update_paper_position_tp1_state(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        plan_id: str,
+        active_tp1_paper_order_id: str | None = None,
+    ) -> sqlite3.Row | None:
+        return queue.update_paper_position_tp1_state(
+            conn,
+            plan_id=plan_id,
+            active_tp1_paper_order_id=active_tp1_paper_order_id,
+        )
 
     def record_paper_position_trigger(
         self,

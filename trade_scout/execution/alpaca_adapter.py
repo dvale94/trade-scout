@@ -171,6 +171,78 @@ def submit_stop_order(
     return _normalize_order_result(response_json)
 
 
+def submit_limit_order(
+    *,
+    client_order_id: str,
+    symbol: str,
+    side: str,
+    qty: float,
+    limit_price: float,
+) -> BrokerOrderResult:
+    _require_alpaca_config()
+
+    normalized_symbol = str(symbol).strip()
+    if not normalized_symbol:
+        raise RuntimeError("LIMIT submission requires symbol")
+    if qty <= 0:
+        raise RuntimeError("LIMIT submission requires qty > 0")
+    if limit_price <= 0:
+        raise RuntimeError("LIMIT submission requires limit_price > 0")
+
+    payload = {
+        "symbol": normalized_symbol,
+        "side": _map_exit_side(side),
+        "type": "limit",
+        "time_in_force": "gtc",
+        "qty": str(qty),
+        "limit_price": str(limit_price),
+        "client_order_id": client_order_id,
+    }
+
+    url = f"{config.ALPACA_BASE_URL.rstrip('/')}/v2/orders"
+    response = requests.post(url, json=payload, headers=_auth_headers(), timeout=15)
+    response_json = _parse_response_json(response)
+
+    if response.status_code >= 400:
+        detail = response_json if isinstance(response_json, dict) else {"response": response_json}
+        raise RuntimeError(
+            f"Alpaca limit submission failed status={response.status_code} detail={json.dumps(detail, sort_keys=True)}"
+        )
+
+    return _normalize_order_result(response_json)
+
+
+def cancel_order(broker_order_id: str) -> BrokerOrderResult | None:
+    _require_alpaca_config()
+
+    url = f"{config.ALPACA_BASE_URL.rstrip('/')}/v2/orders/{broker_order_id}"
+    response = requests.delete(url, headers=_auth_headers(), timeout=15)
+
+    if response.status_code == 404:
+        return None
+
+    response_json = _parse_response_json(response)
+    if response.status_code >= 400:
+        detail = response_json if isinstance(response_json, dict) else {"response": response_json}
+        raise RuntimeError(
+            f"Alpaca cancel failed status={response.status_code} detail={json.dumps(detail, sort_keys=True)}"
+        )
+
+    now_utc = utc_now_iso()
+    if isinstance(response_json, dict) and response_json.get("id"):
+        return _normalize_order_result(response_json)
+
+    return BrokerOrderResult(
+        broker=ALPACA_BROKER_NAME,
+        broker_order_id=broker_order_id,
+        submitted_ts_utc=now_utc,
+        raw_response_json=json.dumps(response_json, sort_keys=True),
+        broker_status_raw="canceled",
+        canceled_ts_utc=now_utc,
+        last_broker_update_ts_utc=now_utc,
+    )
+
+
 def get_order_by_client_order_id(request_id: str) -> BrokerOrderResult | None:
     _require_alpaca_config()
 
