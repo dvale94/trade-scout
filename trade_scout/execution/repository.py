@@ -272,6 +272,19 @@ class ExecutionRepository:
             active_tp1_paper_order_id=active_tp1_paper_order_id,
         )
 
+    def update_paper_position_tp2_state(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        plan_id: str,
+        active_tp2_paper_order_id: str | None = None,
+    ) -> sqlite3.Row | None:
+        return queue.update_paper_position_tp2_state(
+            conn,
+            plan_id=plan_id,
+            active_tp2_paper_order_id=active_tp2_paper_order_id,
+        )
+
     def apply_tp1_fill_to_position(
         self,
         conn: sqlite3.Connection,

@@ -217,6 +217,7 @@ def init_db(db_path: str) -> None:
                 tp1_triggered_ts_utc TEXT,
                 tp2_triggered_ts_utc TEXT,
                 active_tp1_paper_order_id TEXT,
+                active_tp2_paper_order_id TEXT,
                 tp1_target_qty REAL,
                 tp2_target_qty REAL,
                 tp1_filled_qty REAL NOT NULL DEFAULT 0,
@@ -327,6 +328,7 @@ def _ensure_paper_positions_columns(conn: sqlite3.Connection) -> None:
         "tp1_triggered_ts_utc": "TEXT",
         "tp2_triggered_ts_utc": "TEXT",
         "active_tp1_paper_order_id": "TEXT",
+        "active_tp2_paper_order_id": "TEXT",
         "tp1_target_qty": "REAL",
         "tp2_target_qty": "REAL",
         "tp1_filled_qty": "REAL NOT NULL DEFAULT 0",
@@ -1401,6 +1403,25 @@ def update_paper_position_tp1_state(
         WHERE plan_id = ?
         """,
         (active_tp1_paper_order_id, utc_now_iso(), plan_id),
+    )
+    conn.commit()
+    return get_paper_position_by_plan_id(conn, plan_id)
+
+
+def update_paper_position_tp2_state(
+    conn: sqlite3.Connection,
+    *,
+    plan_id: str,
+    active_tp2_paper_order_id: str | None = None,
+) -> sqlite3.Row | None:
+    conn.execute(
+        """
+        UPDATE paper_positions
+        SET active_tp2_paper_order_id = ?,
+            updated_ts_utc = ?
+        WHERE plan_id = ?
+        """,
+        (active_tp2_paper_order_id, utc_now_iso(), plan_id),
     )
     conn.commit()
     return get_paper_position_by_plan_id(conn, plan_id)

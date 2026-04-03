@@ -286,6 +286,10 @@ class ExecutionService:
             return self._submit_tp1_if_needed(conn, position_row)
         if pending_action_status == PaperPositionActionStatus.REARM_STOP_AFTER_TP1.value:
             return self._rearm_stop_after_tp1_if_needed(conn, position_row)
+        if pending_action_status == PaperPositionActionStatus.CANCEL_STOP_FOR_TP2.value:
+            return self._cancel_stop_for_tp2_if_needed(conn, position_row)
+        if pending_action_status == PaperPositionActionStatus.SUBMIT_TP2.value:
+            return self._submit_tp2_if_needed(conn, position_row)
         return position_row
 
     def evaluate_take_profit_triggers(
@@ -1003,6 +1007,168 @@ class ExecutionService:
         )
         return updated_position
 
+    def _cancel_stop_for_tp2_if_needed(self, conn, position_row):
+        plan_id = str(position_row["plan_id"])
+        active_stop_paper_order_id = self._coerce_optional_str(position_row["active_stop_paper_order_id"])
+
+        if not active_stop_paper_order_id:
+            return self._advance_to_submit_tp2(conn, position_row)
+
+        stop_order_row = self.repository.get_paper_order_by_id(conn, active_stop_paper_order_id)
+        if stop_order_row is None:
+            return self._advance_to_submit_tp2(conn, position_row)
+
+        stop_status = str(stop_order_row["order_status"])
+        if stop_status in {"CANCELED", "REJECTED", "EXPIRED"}:
+            return self._advance_to_submit_tp2(conn, position_row)
+        if stop_status == "FILLED":
+            raise RuntimeError("cannot advance TP2 submission after stop already filled")
+
+        broker_order_id = self._coerce_optional_str(stop_order_row["broker_order_id"])
+        if not broker_order_id:
+            return self._advance_to_submit_tp2(conn, position_row)
+
+        cancel_result = self._get_broker_order_canceler()(broker_order_id)
+        if cancel_result is not None:
+            self.reconciler.reconcile_paper_order(conn, stop_order_row, cancel_result)
+            stop_order_row = self.repository.get_paper_order_by_id(conn, active_stop_paper_order_id)
+        if stop_order_row is None:
+            return self._advance_to_submit_tp2(conn, position_row)
+
+        if str(stop_order_row["order_status"]) in {"CANCELED", "REJECTED", "EXPIRED"}:
+            return self._advance_to_submit_tp2(conn, position_row)
+
+        raise RuntimeError(
+            f"stop cancel did not reach terminal non-filled state order_status={stop_order_row['order_status']}"
+        )
+
+    def _advance_to_submit_tp2(self, conn, position_row):
+        plan_id = str(position_row["plan_id"])
+        updated_position = self.repository.update_paper_position_stop_state(
+            conn,
+            plan_id=plan_id,
+            active_stop_paper_order_id=None,
+            stop_qty=self._coerce_float(position_row["stop_qty"]),
+            stop_price=self._coerce_float(position_row["stop_price"]),
+            stop_limit_price=self._coerce_float(position_row["stop_limit_price"]),
+        )
+        updated_position = self.repository.update_paper_position_pending_action(
+            conn,
+            plan_id=plan_id,
+            pending_action_status=PaperPositionActionStatus.SUBMIT_TP2.value,
+        )
+        print(f"[execution-worker] advanced tp2 action plan_id={plan_id} next_action=SUBMIT_TP2")
+        return self._submit_tp2_if_needed(conn, updated_position or position_row)
+
+    def _submit_tp2_if_needed(self, conn, position_row):
+        plan_id = str(position_row["plan_id"])
+        trade_plan = self.repository.get_paper_trade_plan_by_plan_id(conn, plan_id)
+        if trade_plan is None:
+            raise RuntimeError("paper trade plan not found for tp2 submission")
+
+        tp2_qty = self._coerce_float(position_row["remaining_qty"])
+        if tp2_qty is None or tp2_qty <= 0:
+            raise RuntimeError("tp2 submission requires remaining_qty > 0")
+
+        tp2_price = self._coerce_float(trade_plan["t2_px"])
+        if tp2_price is None or tp2_price <= 0:
+            raise RuntimeError("paper trade plan t2_px is missing or invalid")
+        tp2_client_order_id = self._build_tp2_client_order_id(plan_id)
+
+        local_tp2_order = self.repository.get_paper_order_by_client_order_id(conn, tp2_client_order_id)
+        if local_tp2_order is not None:
+            return self._finalize_tp2_submission_state(
+                conn,
+                position_row=position_row,
+                tp2_order_row=local_tp2_order,
+            )
+
+        remote_tp2_order = self._get_tp1_order_finder()(tp2_client_order_id)
+        if remote_tp2_order is not None:
+            local_tp2_order = self.repository.insert_paper_order(
+                conn,
+                plan_id=plan_id,
+                request_id=str(position_row["request_id"]),
+                alert_id=str(position_row["alert_id"]),
+                broker=remote_tp2_order.broker,
+                client_order_id=tp2_client_order_id,
+                symbol=str(position_row["symbol"]),
+                side=str(position_row["side"]),
+                qty=tp2_qty,
+                notional=None,
+                order_type="limit",
+                time_in_force="gtc",
+                order_role=PaperOrderRole.TP2.value,
+                parent_paper_order_id=str(position_row["entry_order_id"] or "") or None,
+                limit_price=tp2_price,
+                stop_price=None,
+                result=remote_tp2_order,
+            )
+            return self._finalize_tp2_submission_state(
+                conn,
+                position_row=position_row,
+                tp2_order_row=local_tp2_order,
+            )
+
+        tp2_result = self._get_tp1_order_submitter()(
+            client_order_id=tp2_client_order_id,
+            symbol=str(position_row["symbol"]),
+            side=str(position_row["side"]),
+            qty=tp2_qty,
+            limit_price=tp2_price,
+        )
+        local_tp2_order = self.repository.insert_paper_order(
+            conn,
+            plan_id=plan_id,
+            request_id=str(position_row["request_id"]),
+            alert_id=str(position_row["alert_id"]),
+            broker=tp2_result.broker,
+            client_order_id=tp2_client_order_id,
+            symbol=str(position_row["symbol"]),
+            side=str(position_row["side"]),
+            qty=tp2_qty,
+            notional=None,
+            order_type="limit",
+            time_in_force="gtc",
+            order_role=PaperOrderRole.TP2.value,
+            parent_paper_order_id=str(position_row["entry_order_id"] or "") or None,
+            limit_price=tp2_price,
+            stop_price=None,
+            result=tp2_result,
+        )
+        print(
+            f"[execution-worker] submitted tp2 plan_id={plan_id} "
+            f"paper_order_id={local_tp2_order['paper_order_id']} broker_order_id={local_tp2_order['broker_order_id']}"
+        )
+        return self._finalize_tp2_submission_state(
+            conn,
+            position_row=position_row,
+            tp2_order_row=local_tp2_order,
+        )
+
+    def _finalize_tp2_submission_state(self, conn, *, position_row, tp2_order_row):
+        plan_id = str(position_row["plan_id"])
+        updated_position = self.repository.update_paper_position_tp2_state(
+            conn,
+            plan_id=plan_id,
+            active_tp2_paper_order_id=str(tp2_order_row["paper_order_id"]),
+        )
+        updated_position = self.repository.update_paper_position_pending_action(
+            conn,
+            plan_id=plan_id,
+            pending_action_status=PaperPositionActionStatus.WAIT_TP2_FILL.value,
+        )
+        updated_position = self.repository.update_paper_position_action_error(
+            conn,
+            plan_id=plan_id,
+            last_action_error=None,
+        )
+        print(
+            f"[execution-worker] waiting tp2 fill plan_id={plan_id} "
+            f"paper_order_id={tp2_order_row['paper_order_id']}"
+        )
+        return updated_position
+
     @staticmethod
     def _build_initial_stop_client_order_id(plan_id: str) -> str:
         return f"stop:{plan_id}"
@@ -1014,3 +1180,7 @@ class ExecutionService:
     @staticmethod
     def _build_tp1_client_order_id(plan_id: str) -> str:
         return f"tp1:{plan_id}"
+
+    @staticmethod
+    def _build_tp2_client_order_id(plan_id: str) -> str:
+        return f"tp2:{plan_id}"
