@@ -5,11 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Mapping, Optional
 
-from trade_scout.execution.reconciler import (
-    ExecutionReconciler,
-    derive_entry_status_from_order_status,
-    normalize_broker_order_status,
-)
+from trade_scout.execution.reconciler import ExecutionReconciler
 from trade_scout.execution.repository import ExecutionRepository
 from trade_scout.execution.service import ExecutionService
 
@@ -110,18 +106,25 @@ class ExecutionWorker:
 
     def process_position_triggers(
         self,
-        conn,
+        conn=None,
         *,
         price_by_symbol: Mapping[str, float],
         limit: int = 100,
         now_utc: datetime | None = None,
     ) -> int:
-        return self.service.process_position_triggers(
-            conn,
-            price_by_symbol=price_by_symbol,
-            limit=limit,
-            now_utc=now_utc,
-        )
+        owns_connection = conn is None
+        if owns_connection:
+            conn = self.repository.get_connection()
+        try:
+            return self.service.process_position_triggers(
+                conn,
+                price_by_symbol=price_by_symbol,
+                limit=limit,
+                now_utc=now_utc,
+            )
+        finally:
+            if owns_connection and conn is not None:
+                conn.close()
 
     def reconcile_paper_order(self, conn, paper_order_row, broker_snapshot):
         return self.reconciler.reconcile_paper_order(conn, paper_order_row, broker_snapshot)
