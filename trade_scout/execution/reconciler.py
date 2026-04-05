@@ -6,6 +6,7 @@ from typing import Any, Callable
 from trade_scout.execution.broker import fetch_broker_order_by_id
 from trade_scout.execution.models import (
     BrokerOrderResult,
+    PaperFillRole,
     PaperPositionActionStatus,
     PaperPositionStatus,
     PaperOrderRole,
@@ -166,6 +167,13 @@ class ExecutionReconciler:
         if str(paper_order_row["order_role"]) != PaperOrderRole.TP1.value:
             return
 
+        self.repository.upsert_paper_fill_from_broker_snapshot(
+            conn,
+            paper_order_row=paper_order_row,
+            broker_snapshot=broker_snapshot,
+            fill_role=PaperFillRole.TP1.value,
+        )
+
         tp1_filled_qty = broker_snapshot.filled_qty
         if tp1_filled_qty is None:
             return
@@ -193,6 +201,13 @@ class ExecutionReconciler:
     def apply_tp2_fill_progress_if_present(self, conn, paper_order_row, broker_snapshot) -> None:
         if str(paper_order_row["order_role"]) != PaperOrderRole.TP2.value:
             return
+
+        self.repository.upsert_paper_fill_from_broker_snapshot(
+            conn,
+            paper_order_row=paper_order_row,
+            broker_snapshot=broker_snapshot,
+            fill_role=PaperFillRole.TP2.value,
+        )
 
         tp2_filled_qty = broker_snapshot.filled_qty
         if tp2_filled_qty is None:

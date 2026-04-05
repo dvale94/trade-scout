@@ -1186,7 +1186,7 @@ def get_paper_fill_by_order_id_and_role(
     ).fetchone()
 
 
-def _resolve_entry_fill_ts_utc(
+def _resolve_fill_ts_utc(
     *,
     broker_snapshot: BrokerOrderResult,
     existing_fill_row: sqlite3.Row | None,
@@ -1203,28 +1203,30 @@ def _resolve_entry_fill_ts_utc(
     return None
 
 
-def upsert_entry_fill_from_broker_snapshot(
+def upsert_paper_fill_from_broker_snapshot(
     conn: sqlite3.Connection,
     *,
     paper_order_row: sqlite3.Row,
     broker_snapshot: BrokerOrderResult,
-    entry_status: str,
+    fill_role: str,
 ) -> sqlite3.Row | None:
     if broker_snapshot.filled_qty is None or broker_snapshot.filled_avg_price is None:
         return None
 
     paper_order_id = str(paper_order_row["paper_order_id"])
-    fill_role = PaperFillRole.ENTRY.value
     existing_fill = get_paper_fill_by_order_id_and_role(conn, paper_order_id, fill_role)
-    trade_plan_row = conn.execute(
-        """
-        SELECT *
-        FROM paper_trade_plans
-        WHERE plan_id = ?
-        """,
-        (str(paper_order_row["plan_id"]),),
-    ).fetchone()
-    fill_ts_utc = _resolve_entry_fill_ts_utc(
+    trade_plan_row = None
+    if fill_role == PaperFillRole.ENTRY.value:
+        trade_plan_row = conn.execute(
+            """
+            SELECT *
+            FROM paper_trade_plans
+            WHERE plan_id = ?
+            """,
+            (str(paper_order_row["plan_id"]),),
+        ).fetchone()
+
+    fill_ts_utc = _resolve_fill_ts_utc(
         broker_snapshot=broker_snapshot,
         existing_fill_row=existing_fill,
         trade_plan_row=trade_plan_row,
@@ -1298,6 +1300,24 @@ def upsert_entry_fill_from_broker_snapshot(
         ),
     )
     conn.commit()
+    return get_paper_fill_by_order_id_and_role(conn, paper_order_id, fill_role)
+
+
+def upsert_entry_fill_from_broker_snapshot(
+    conn: sqlite3.Connection,
+    *,
+    paper_order_row: sqlite3.Row,
+    broker_snapshot: BrokerOrderResult,
+    entry_status: str,
+) -> sqlite3.Row | None:
+    fill_row = upsert_paper_fill_from_broker_snapshot(
+        conn,
+        paper_order_row=paper_order_row,
+        broker_snapshot=broker_snapshot,
+        fill_role=PaperFillRole.ENTRY.value,
+    )
+    if fill_row is None:
+        return None
 
     update_trade_plan_entry_summary(
         conn,
@@ -1305,10 +1325,9 @@ def upsert_entry_fill_from_broker_snapshot(
         entry_status=entry_status,
         entry_filled_qty=broker_snapshot.filled_qty,
         entry_avg_fill_px=broker_snapshot.filled_avg_price,
-        entry_fill_ts_utc=fill_ts_utc,
+        entry_fill_ts_utc=str(fill_row["fill_ts_utc"]),
     )
-
-    return get_paper_fill_by_order_id_and_role(conn, paper_order_id, fill_role)
+    return fill_row
 
 
 def update_paper_position_from_entry_fill(

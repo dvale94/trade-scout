@@ -2682,6 +2682,7 @@ class ExecutionWorkerTest(unittest.TestCase):
                     filled_avg_price=115.0,
                 ),
             )
+            fill_row = get_paper_fill_by_order_id_and_role(conn, "po-tp2-fill", "TP2")
             position_row = conn.execute(
                 "SELECT * FROM paper_positions WHERE request_id = ?",
                 ("req-tp2-fill",),
@@ -2690,6 +2691,11 @@ class ExecutionWorkerTest(unittest.TestCase):
             conn.close()
 
         self.assertEqual("FILLED", reconciled["order_status"])
+        self.assertIsNotNone(fill_row)
+        self.assertEqual("po-tp2-fill:TP2", fill_row["paper_fill_id"])
+        self.assertEqual("TP2", fill_row["fill_role"])
+        self.assertEqual(0.4, fill_row["fill_qty"])
+        self.assertEqual(115.0, fill_row["fill_px"])
         self.assertEqual(0.4, position_row["tp2_filled_qty"])
         self.assertEqual(0.0, position_row["remaining_qty"])
         self.assertEqual(PaperPositionStatus.CLOSED.value, position_row["position_status"])
@@ -2771,6 +2777,11 @@ class ExecutionWorkerTest(unittest.TestCase):
                     filled_avg_price=115.0,
                 ),
             )
+            fill_row = get_paper_fill_by_order_id_and_role(conn, "po-tp2-partial", "TP2")
+            fill_count = conn.execute(
+                "SELECT COUNT(*) AS n FROM paper_fills WHERE paper_order_id = ? AND fill_role = ?",
+                ("po-tp2-partial", "TP2"),
+            ).fetchone()["n"]
             repeated_row = conn.execute(
                 "SELECT * FROM paper_positions WHERE request_id = ?",
                 ("req-tp2-partial",),
@@ -2778,6 +2789,10 @@ class ExecutionWorkerTest(unittest.TestCase):
         finally:
             conn.close()
 
+        self.assertIsNotNone(fill_row)
+        self.assertEqual(0.1, fill_row["fill_qty"])
+        self.assertEqual(115.0, fill_row["fill_px"])
+        self.assertEqual(1, fill_count)
         self.assertEqual(0.1, partial_row["tp2_filled_qty"])
         self.assertEqual(0.3, partial_row["remaining_qty"])
         self.assertEqual(PaperPositionActionStatus.WAIT_TP2_FILL.value, partial_row["pending_action_status"])
@@ -2969,6 +2984,7 @@ class ExecutionWorkerTest(unittest.TestCase):
                     filled_avg_price=110.0,
                 ),
             )
+            fill_row = get_paper_fill_by_order_id_and_role(conn, "po-tp1-fill", "TP1")
             position_row = conn.execute(
                 "SELECT * FROM paper_positions WHERE request_id = ?",
                 ("req-tp1-fill",),
@@ -2977,6 +2993,11 @@ class ExecutionWorkerTest(unittest.TestCase):
             conn.close()
 
         self.assertEqual("FILLED", reconciled["order_status"])
+        self.assertIsNotNone(fill_row)
+        self.assertEqual("po-tp1-fill:TP1", fill_row["paper_fill_id"])
+        self.assertEqual("TP1", fill_row["fill_role"])
+        self.assertEqual(0.4, fill_row["fill_qty"])
+        self.assertEqual(110.0, fill_row["fill_px"])
         self.assertEqual(0.4, position_row["tp1_filled_qty"])
         self.assertEqual(0.4, position_row["remaining_qty"])
         self.assertEqual("PARTIAL", position_row["position_status"])
@@ -3057,6 +3078,11 @@ class ExecutionWorkerTest(unittest.TestCase):
                     filled_avg_price=110.0,
                 ),
             )
+            fill_row = get_paper_fill_by_order_id_and_role(conn, "po-tp1-partial", "TP1")
+            fill_count = conn.execute(
+                "SELECT COUNT(*) AS n FROM paper_fills WHERE paper_order_id = ? AND fill_role = ?",
+                ("po-tp1-partial", "TP1"),
+            ).fetchone()["n"]
             repeated_row = conn.execute(
                 "SELECT * FROM paper_positions WHERE request_id = ?",
                 ("req-tp1-partial",),
@@ -3064,6 +3090,10 @@ class ExecutionWorkerTest(unittest.TestCase):
         finally:
             conn.close()
 
+        self.assertIsNotNone(fill_row)
+        self.assertEqual(0.2, fill_row["fill_qty"])
+        self.assertEqual(110.0, fill_row["fill_px"])
+        self.assertEqual(1, fill_count)
         self.assertEqual(0.2, partial_row["tp1_filled_qty"])
         self.assertEqual(0.6, partial_row["remaining_qty"])
         self.assertEqual("PARTIAL", partial_row["position_status"])

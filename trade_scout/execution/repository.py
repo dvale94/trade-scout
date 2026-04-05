@@ -200,6 +200,21 @@ class ExecutionRepository:
             entry_status=entry_status,
         )
 
+    def upsert_paper_fill_from_broker_snapshot(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        paper_order_row: sqlite3.Row,
+        broker_snapshot: BrokerOrderResult,
+        fill_role: str,
+    ) -> sqlite3.Row | None:
+        return queue.upsert_paper_fill_from_broker_snapshot(
+            conn,
+            paper_order_row=paper_order_row,
+            broker_snapshot=broker_snapshot,
+            fill_role=fill_role,
+        )
+
     def update_trade_plan_entry_summary(
         self,
         conn: sqlite3.Connection,
