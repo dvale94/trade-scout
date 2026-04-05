@@ -6,6 +6,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 if "dotenv" not in sys.modules:
     dotenv_stub = types.ModuleType("dotenv")
@@ -221,12 +222,142 @@ class PolicyRepositoryTest(unittest.TestCase):
             row_count = conn.execute(
                 "SELECT COUNT(*) AS n FROM policy_activation_history"
             ).fetchone()["n"]
+            persisted = conn.execute(
+                "SELECT * FROM policy_activation_history WHERE activation_id = ?",
+                ("activation-1",),
+            ).fetchone()
         finally:
             conn.close()
 
         self.assertEqual("activation-1", first.activation_id)
         self.assertEqual("activation-1", second.activation_id)
         self.assertEqual(1, row_count)
+        self.assertIsNone(persisted["effective_to_ts_utc"])
+
+    def test_activate_policy_rolls_back_when_insert_fails_after_closing_previous(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            insert_policy_definition(
+                conn,
+                self._policy_definition_row(policy_id="policy-1", policy_version="1.0.0"),
+            )
+            insert_policy_definition(
+                conn,
+                self._policy_definition_row(policy_id="policy-2", policy_version="1.1.0"),
+            )
+            activate_policy(
+                conn,
+                self._activation_row(
+                    activation_id="activation-1",
+                    policy_id="policy-1",
+                    policy_version="1.0.0",
+                    effective_from_ts_utc="2026-04-05T12:00:00+00:00",
+                ),
+            )
+            with patch(
+                "trade_scout.policy.repository._insert_policy_activation_row",
+                side_effect=RuntimeError("boom"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "boom"):
+                    activate_policy(
+                        conn,
+                        self._activation_row(
+                            activation_id="activation-2",
+                            policy_id="policy-2",
+                            policy_version="1.1.0",
+                            effective_from_ts_utc="2026-04-05T13:00:00+00:00",
+                        ),
+                    )
+            previous = conn.execute(
+                "SELECT * FROM policy_activation_history WHERE activation_id = ?",
+                ("activation-1",),
+            ).fetchone()
+            row_count = conn.execute(
+                "SELECT COUNT(*) AS n FROM policy_activation_history"
+            ).fetchone()["n"]
+        finally:
+            conn.close()
+
+        self.assertIsNone(previous["effective_to_ts_utc"])
+        self.assertEqual(1, row_count)
+
+    def test_activate_policy_failure_leaves_active_policy_query_unchanged(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            insert_policy_definition(
+                conn,
+                self._policy_definition_row(policy_id="policy-1", policy_version="1.0.0"),
+            )
+            insert_policy_definition(
+                conn,
+                self._policy_definition_row(policy_id="policy-2", policy_version="1.1.0"),
+            )
+            activate_policy(
+                conn,
+                self._activation_row(
+                    activation_id="activation-1",
+                    policy_id="policy-1",
+                    policy_version="1.0.0",
+                    effective_from_ts_utc="2026-04-05T12:00:00+00:00",
+                ),
+            )
+            with patch(
+                "trade_scout.policy.repository._insert_policy_activation_row",
+                side_effect=RuntimeError("boom"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "boom"):
+                    activate_policy(
+                        conn,
+                        self._activation_row(
+                            activation_id="activation-2",
+                            policy_id="policy-2",
+                            policy_version="1.1.0",
+                            effective_from_ts_utc="2026-04-05T13:00:00+00:00",
+                        ),
+                    )
+            active = get_active_policy(
+                conn,
+                "execution_policy",
+                "2026-04-05T13:30:00+00:00",
+                mode="SHADOW",
+            )
+        finally:
+            conn.close()
+
+        self.assertIsNotNone(active)
+        self.assertEqual("policy-1", active.policy_id)
+
+    def test_activate_policy_validates_inputs(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            with self.assertRaisesRegex(ValueError, "policy_id is required"):
+                activate_policy(
+                    conn,
+                    PolicyActivationRow(
+                        activation_id="activation-1",
+                        policy_id=" ",
+                        policy_name="execution_policy",
+                        policy_version="1.0.0",
+                        mode="SHADOW",
+                        effective_from_ts_utc="2026-04-05T12:00:00+00:00",
+                        effective_to_ts_utc=None,
+                    ),
+                )
+            with self.assertRaisesRegex(ValueError, "mode must be SHADOW or ENFORCED"):
+                activate_policy(
+                    conn,
+                    PolicyActivationRow(
+                        activation_id="activation-1",
+                        policy_id="policy-1",
+                        policy_name="execution_policy",
+                        policy_version="1.0.0",
+                        mode="INVALID",
+                        effective_from_ts_utc="2026-04-05T12:00:00+00:00",
+                        effective_to_ts_utc=None,
+                    ),
+                )
+        finally:
+            conn.close()
 
     def _policy_definition_row(
         self,
