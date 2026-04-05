@@ -82,7 +82,15 @@ class AlertPipeline:
         self.context = context
         self.policy_repository = policy_repository or PolicyRepository(config.EXECUTION_DB_PATH)
         self.policy_name = policy_name
-        self._policy_db_initialized = False
+        self._policy_runtime_ready = False
+        try:
+            self.policy_repository.init_db()
+            self._policy_runtime_ready = True
+        except Exception as exc:
+            print(
+                f"[policy] error alert_id=UNKNOWN stage=init_db "
+                f"policy_name={self.policy_name} mode=SHADOW error={exc}"
+            )
 
     def _log_intent_and_context(self, symbol: str, core_row, context_row) -> None:
         journal.log_alert_intent(core_row)
@@ -93,12 +101,16 @@ class AlertPipeline:
 
     def _process_policy_shadow(self, intent_row, context_row) -> None:
         alert_id = str(intent_row.alert_id)
-        try:
-            if not self._policy_db_initialized:
-                self.policy_repository.init_db()
-                self._policy_db_initialized = True
+        if not self._policy_runtime_ready:
+            return
 
+        try:
             conn = self.policy_repository.get_connection()
+        except Exception as exc:
+            self._log_policy_error(alert_id=alert_id, stage="get_connection", error=exc)
+            return
+
+        try:
             try:
                 active_policy = self.policy_repository.get_active_policy(
                     conn,
@@ -106,28 +118,54 @@ class AlertPipeline:
                     str(intent_row.signal_ts_utc),
                     mode="SHADOW",
                 )
-                if active_policy is None:
-                    print(f"[policy] no active policy alert_id={alert_id}")
-                    return
+            except Exception as exc:
+                self._log_policy_error(alert_id=alert_id, stage="get_active_policy", error=exc)
+                return
 
+            if active_policy is None:
+                print(
+                    f"[policy] skipped alert_id={alert_id} reason=no_active_policy "
+                    f"policy_name={self.policy_name} mode=SHADOW"
+                )
+                return
+
+            try:
                 policy_config = _policy_config_from_definition_row(active_policy)
+            except Exception as exc:
+                self._log_policy_error(alert_id=alert_id, stage="parse_config", error=exc)
+                return
+
+            try:
                 decision = evaluate_policy(
                     intent_row,
                     context_row,
                     policy_config,
                     mode="SHADOW",
                 )
+            except Exception as exc:
+                self._log_policy_error(alert_id=alert_id, stage="evaluate", error=exc)
+                return
+
+            try:
                 decision_row = decision.to_row(active_policy.policy_id)
                 persisted = self.policy_repository.insert_policy_decision(conn, decision_row)
-            finally:
-                conn.close()
+            except Exception as exc:
+                self._log_policy_error(alert_id=alert_id, stage="persist", error=exc)
+                return
+        finally:
+            conn.close()
 
-            print(
-                f"[policy] evaluated alert_id={alert_id} decision={persisted.decision} "
-                f"policy={persisted.policy_name} version={persisted.policy_version}"
-            )
-        except Exception as exc:
-            print(f"[policy] error alert_id={alert_id} error={exc}")
+        print(
+            f"[policy] evaluated alert_id={alert_id} decision={persisted.decision} "
+            f"policy_name={persisted.policy_name} policy_version={persisted.policy_version} "
+            f"mode=SHADOW"
+        )
+
+    def _log_policy_error(self, *, alert_id: str, stage: str, error: Exception) -> None:
+        print(
+            f"[policy] error alert_id={alert_id} stage={stage} "
+            f"policy_name={self.policy_name} mode=SHADOW error={error}"
+        )
 
     def process(
         self,

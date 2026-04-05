@@ -199,6 +199,108 @@ class AlertPipelinePolicyIntegrationTest(unittest.TestCase):
         self.assertTrue(side_effects["notify"].called)
         self.assertEqual(1, len(context.watch_mgr.added))
 
+    def test_policy_db_init_happens_during_pipeline_setup_not_per_alert(self) -> None:
+        with patch.object(self.policy_repository, "init_db") as init_db_mock:
+            pipeline, _ = self._make_pipeline()
+
+        init_db_mock.assert_called_once_with()
+
+        with self._patch_alert_side_effects(), patch.object(
+            self.policy_repository,
+            "init_db",
+            side_effect=AssertionError("init_db should not be called during per-alert processing"),
+        ), patch(
+            "trade_scout.alert_pipeline.uuid4",
+            side_effect=["provisional-1", "alert-1"],
+        ):
+            pipeline.process(**self._process_kwargs())
+
+    def test_success_log_includes_alert_decision_policy_version_and_mode(self) -> None:
+        self._activate_shadow_policy(filters={"allowed_symbols": ["AAPL"]})
+        pipeline, _ = self._make_pipeline()
+
+        with self._patch_alert_side_effects(), patch(
+            "trade_scout.alert_pipeline.uuid4",
+            side_effect=["provisional-1", "alert-1"],
+        ), patch("builtins.print") as print_mock:
+            pipeline.process(**self._process_kwargs())
+
+        self.assertTrue(
+            any(
+                "[policy] evaluated alert_id=alert-1 decision=ALLOW "
+                "policy_name=execution_policy policy_version=1.0.0 mode=SHADOW"
+                in str(call.args[0])
+                for call in print_mock.call_args_list
+                if call.args
+            )
+        )
+
+    def test_no_active_policy_log_includes_reason_policy_name_and_mode(self) -> None:
+        pipeline, _ = self._make_pipeline()
+
+        with self._patch_alert_side_effects(), patch(
+            "trade_scout.alert_pipeline.uuid4",
+            side_effect=["provisional-1", "alert-1"],
+        ), patch("builtins.print") as print_mock:
+            pipeline.process(**self._process_kwargs())
+
+        self.assertTrue(
+            any(
+                "[policy] skipped alert_id=alert-1 reason=no_active_policy "
+                "policy_name=execution_policy mode=SHADOW"
+                in str(call.args[0])
+                for call in print_mock.call_args_list
+                if call.args
+            )
+        )
+
+    def test_evaluator_failure_log_includes_stage_policy_name_and_mode(self) -> None:
+        self._activate_shadow_policy(filters={"allowed_symbols": ["AAPL"]})
+        pipeline, _ = self._make_pipeline()
+
+        with self._patch_alert_side_effects(), patch(
+            "trade_scout.alert_pipeline.evaluate_policy",
+            side_effect=RuntimeError("policy boom"),
+        ), patch(
+            "trade_scout.alert_pipeline.uuid4",
+            side_effect=["provisional-1", "alert-1"],
+        ), patch("builtins.print") as print_mock:
+            pipeline.process(**self._process_kwargs())
+
+        self.assertTrue(
+            any(
+                "[policy] error alert_id=alert-1 stage=evaluate "
+                "policy_name=execution_policy mode=SHADOW error=policy boom"
+                in str(call.args[0])
+                for call in print_mock.call_args_list
+                if call.args
+            )
+        )
+
+    def test_repository_failure_log_includes_stage_policy_name_and_mode(self) -> None:
+        self._activate_shadow_policy(filters={"allowed_symbols": ["AAPL"]})
+        pipeline, _ = self._make_pipeline()
+
+        with self._patch_alert_side_effects(), patch.object(
+            self.policy_repository,
+            "insert_policy_decision",
+            side_effect=sqlite3.OperationalError("db boom"),
+        ), patch(
+            "trade_scout.alert_pipeline.uuid4",
+            side_effect=["provisional-1", "alert-1"],
+        ), patch("builtins.print") as print_mock:
+            pipeline.process(**self._process_kwargs())
+
+        self.assertTrue(
+            any(
+                "[policy] error alert_id=alert-1 stage=persist "
+                "policy_name=execution_policy mode=SHADOW error=db boom"
+                in str(call.args[0])
+                for call in print_mock.call_args_list
+                if call.args
+            )
+        )
+
     def _activate_shadow_policy(self, *, filters: dict[str, object]) -> None:
         conn = get_connection(self.db_path)
         try:
