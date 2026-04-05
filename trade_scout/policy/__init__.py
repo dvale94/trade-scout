@@ -7,6 +7,15 @@ from trade_scout.policy.models import (
     PolicyDefinitionRow,
     PolicyFeatureSnapshot,
 )
+from trade_scout.policy.repository import (
+    PolicyRepository,
+    activate_policy,
+    get_active_policy,
+    get_policy_decision,
+    get_policy_definition,
+    insert_policy_decision,
+    insert_policy_definition,
+)
 
 __all__ = [
     "PolicyActivationRow",
@@ -16,4 +25,11 @@ __all__ = [
     "PolicyDecisionRow",
     "PolicyDefinitionRow",
     "PolicyFeatureSnapshot",
+    "PolicyRepository",
+    "activate_policy",
+    "get_active_policy",
+    "get_policy_decision",
+    "get_policy_definition",
+    "insert_policy_decision",
+    "insert_policy_definition",
 ]
