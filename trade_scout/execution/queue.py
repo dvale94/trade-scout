@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import sqlite3
 from datetime import datetime, timezone
 from typing import Optional
@@ -11,13 +10,12 @@ from trade_scout.execution.models import (
     ExecutionRequest,
     ExecutionStatus,
     PaperFillRole,
+    PaperPositionActionStatus,
+    PaperPositionStatus,
     PaperOrderRole,
     PaperOrderStatus,
     PaperTradePlanEntryStatus,
-    PaperTradePlanPartialExitStatus,
-    PaperTradePlanPositionStatus,
     PaperTradePlanStatus,
-    PaperTradeOutcomeStatus,
 )
 
 
@@ -29,14 +27,14 @@ ACTIVE_REQUEST_STATUSES = (
 PAPER_TRADE_PLAN_SCHEMA_VERSION = "1"
 PAPER_ORDER_SCHEMA_VERSION = "1"
 PAPER_FILL_SCHEMA_VERSION = "1"
-PAPER_TRADE_OUTCOME_SCHEMA_VERSION = "1"
+PAPER_POSITION_SCHEMA_VERSION = "1"
 PAPER_TRADE_PLAN_ENTRY_TYPE_MARKET = "MARKET"
 TERMINAL_PAPER_ORDER_STATUSES = (
     PaperOrderStatus.FILLED.value,
     PaperOrderStatus.CANCELED.value,
-    PaperOrderStatus.REPLACED.value,
     PaperOrderStatus.REJECTED.value,
     PaperOrderStatus.EXPIRED.value,
+    PaperOrderStatus.REPLACED.value,
 )
 
 
@@ -127,19 +125,6 @@ def init_db(db_path: str) -> None:
                 entry_filled_qty REAL,
                 entry_avg_fill_px REAL,
                 entry_fill_ts_utc TEXT,
-                position_status TEXT,
-                protective_stop_order_id TEXT,
-                tp1_order_id TEXT,
-                tp1_filled_qty REAL,
-                tp1_avg_fill_px REAL,
-                tp1_fill_ts_utc TEXT,
-                tp2_order_id TEXT,
-                tp2_filled_qty REAL,
-                tp2_avg_fill_px REAL,
-                tp2_fill_ts_utc TEXT,
-                remaining_qty REAL,
-                partial_exit_status TEXT,
-                closed_ts_utc TEXT,
                 schema_version TEXT NOT NULL
             )
             """
@@ -155,8 +140,6 @@ def init_db(db_path: str) -> None:
                 broker_order_id TEXT,
                 client_order_id TEXT NOT NULL UNIQUE,
                 parent_paper_order_id TEXT,
-                replaced_from_paper_order_id TEXT,
-                superseded_by_paper_order_id TEXT,
                 order_role TEXT NOT NULL,
                 symbol TEXT NOT NULL,
                 side TEXT NOT NULL,
@@ -212,41 +195,37 @@ def init_db(db_path: str) -> None:
         )
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS paper_trade_outcomes (
-                outcome_id TEXT PRIMARY KEY,
+            CREATE TABLE IF NOT EXISTS paper_positions (
+                position_id TEXT PRIMARY KEY,
                 plan_id TEXT NOT NULL UNIQUE,
                 request_id TEXT NOT NULL,
                 alert_id TEXT NOT NULL,
                 symbol TEXT NOT NULL,
                 side TEXT NOT NULL,
-                market_type TEXT,
-                strategy_profile TEXT,
-                strategy_version TEXT,
-                config_hash TEXT,
-                strategy_id TEXT,
-                setup_family TEXT,
-                strategy_params_json TEXT,
-                strategy_params_hash TEXT,
+                position_status TEXT NOT NULL,
+                entry_order_id TEXT,
+                entry_client_order_id TEXT,
+                entry_filled_qty REAL NOT NULL DEFAULT 0,
+                entry_avg_fill_px REAL,
                 opened_ts_utc TEXT,
                 closed_ts_utc TEXT,
-                entry_fill_ts_utc TEXT,
-                entry_avg_px REAL,
-                entry_qty REAL,
-                exit_fill_ts_utc TEXT,
-                exit_avg_px REAL,
-                exit_qty REAL,
-                exit_reason TEXT NOT NULL,
-                gross_pnl REAL,
-                fees REAL,
-                net_pnl REAL,
-                planned_stop_px REAL,
-                planned_t1_px REAL,
-                planned_t2_px REAL,
-                realized_r REAL,
-                entered INTEGER NOT NULL,
-                closed INTEGER NOT NULL,
-                outcome_status TEXT NOT NULL,
-                raw_summary_json TEXT,
+                remaining_qty REAL NOT NULL DEFAULT 0,
+                pending_action_status TEXT NOT NULL DEFAULT 'NONE',
+                active_stop_paper_order_id TEXT,
+                stop_qty REAL,
+                stop_price REAL,
+                stop_limit_price REAL,
+                tp1_triggered_ts_utc TEXT,
+                tp2_triggered_ts_utc TEXT,
+                active_tp1_paper_order_id TEXT,
+                active_tp2_paper_order_id TEXT,
+                tp1_target_qty REAL,
+                tp2_target_qty REAL,
+                tp1_filled_qty REAL NOT NULL DEFAULT 0,
+                tp2_filled_qty REAL NOT NULL DEFAULT 0,
+                last_action_error TEXT,
+                created_ts_utc TEXT NOT NULL,
+                updated_ts_utc TEXT NOT NULL,
                 schema_version TEXT NOT NULL
             )
             """
@@ -307,14 +286,14 @@ def init_db(db_path: str) -> None:
         )
         conn.execute(
             """
-            CREATE INDEX IF NOT EXISTS idx_paper_trade_outcomes_request_id
-            ON paper_trade_outcomes (request_id)
+            CREATE INDEX IF NOT EXISTS idx_paper_positions_request_id
+            ON paper_positions (request_id)
             """
         )
         conn.execute(
             """
-            CREATE INDEX IF NOT EXISTS idx_paper_trade_outcomes_alert_id
-            ON paper_trade_outcomes (alert_id)
+            CREATE INDEX IF NOT EXISTS idx_paper_positions_action_status
+            ON paper_positions (position_status, pending_action_status)
             """
         )
         conn.execute(
@@ -330,9 +309,39 @@ def init_db(db_path: str) -> None:
             WHERE status IN ('PENDING', 'CLAIMED', 'VALIDATED')
             """
         )
+        _ensure_paper_positions_columns(conn)
         conn.commit()
     finally:
         conn.close()
+
+
+def _ensure_paper_positions_columns(conn: sqlite3.Connection) -> None:
+    existing_columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(paper_positions)").fetchall()
+    }
+    additive_columns = {
+        "pending_action_status": "TEXT NOT NULL DEFAULT 'NONE'",
+        "active_stop_paper_order_id": "TEXT",
+        "stop_qty": "REAL",
+        "stop_price": "REAL",
+        "stop_limit_price": "REAL",
+        "tp1_triggered_ts_utc": "TEXT",
+        "tp2_triggered_ts_utc": "TEXT",
+        "active_tp1_paper_order_id": "TEXT",
+        "active_tp2_paper_order_id": "TEXT",
+        "tp1_target_qty": "REAL",
+        "tp2_target_qty": "REAL",
+        "tp1_filled_qty": "REAL NOT NULL DEFAULT 0",
+        "tp2_filled_qty": "REAL NOT NULL DEFAULT 0",
+        "last_action_error": "TEXT",
+    }
+    for column_name, column_def in additive_columns.items():
+        if column_name in existing_columns:
+            continue
+        conn.execute(
+            f"ALTER TABLE paper_positions ADD COLUMN {column_name} {column_def}"
+        )
 
 
 def insert_request(conn: sqlite3.Connection, request: ExecutionRequest) -> None:
@@ -542,6 +551,22 @@ def get_paper_order_by_request_id_and_role(
     ).fetchone()
 
 
+def get_paper_order_by_plan_id_and_role(
+    conn: sqlite3.Connection, plan_id: str, order_role: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT *
+        FROM paper_orders
+        WHERE plan_id = ?
+          AND order_role = ?
+        ORDER BY submitted_ts_utc ASC
+        LIMIT 1
+        """,
+        (plan_id, order_role),
+    ).fetchone()
+
+
 def get_paper_order_by_client_order_id(
     conn: sqlite3.Connection, client_order_id: str
 ) -> sqlite3.Row | None:
@@ -552,6 +577,19 @@ def get_paper_order_by_client_order_id(
         WHERE client_order_id = ?
         """,
         (client_order_id,),
+    ).fetchone()
+
+
+def get_paper_order_by_id(
+    conn: sqlite3.Connection, paper_order_id: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT *
+        FROM paper_orders
+        WHERE paper_order_id = ?
+        """,
+        (paper_order_id,),
     ).fetchone()
 
 
@@ -582,6 +620,91 @@ def get_paper_trade_plan_by_request_id(
         """,
         (request_id,),
     ).fetchone()
+
+
+def get_paper_trade_plan_by_plan_id(
+    conn: sqlite3.Connection, plan_id: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT *
+        FROM paper_trade_plans
+        WHERE plan_id = ?
+        """,
+        (plan_id,),
+    ).fetchone()
+
+
+def get_paper_position_by_plan_id(
+    conn: sqlite3.Connection, plan_id: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT *
+        FROM paper_positions
+        WHERE plan_id = ?
+        """,
+        (plan_id,),
+    ).fetchone()
+
+
+def get_paper_position_by_request_id(
+    conn: sqlite3.Connection, request_id: str
+) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT *
+        FROM paper_positions
+        WHERE request_id = ?
+        """,
+        (request_id,),
+    ).fetchone()
+
+
+def get_positions_with_pending_actions(
+    conn: sqlite3.Connection, limit: int = 50
+) -> list[sqlite3.Row]:
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM paper_positions
+        WHERE position_status IN (?, ?, ?)
+          AND pending_action_status != ?
+        ORDER BY updated_ts_utc ASC, created_ts_utc ASC
+        LIMIT ?
+        """,
+        (
+            PaperPositionStatus.OPEN.value,
+            PaperPositionStatus.PARTIAL.value,
+            PaperPositionStatus.CLOSING.value,
+            PaperPositionActionStatus.NONE.value,
+            limit,
+        ),
+    ).fetchall()
+    return list(rows)
+
+
+def get_positions_eligible_for_trigger_evaluation(
+    conn: sqlite3.Connection, limit: int = 100
+) -> list[sqlite3.Row]:
+    rows = conn.execute(
+        """
+        SELECT *
+        FROM paper_positions
+        WHERE position_status IN (?, ?)
+          AND remaining_qty > 0
+          AND pending_action_status = ?
+        ORDER BY updated_ts_utc ASC, created_ts_utc ASC
+        LIMIT ?
+        """,
+        (
+            PaperPositionStatus.OPEN.value,
+            PaperPositionStatus.PARTIAL.value,
+            PaperPositionActionStatus.NONE.value,
+            limit,
+        ),
+    ).fetchall()
+    return list(rows)
 
 
 def create_paper_trade_plan(
@@ -663,21 +786,8 @@ def create_paper_trade_plan(
             entry_filled_qty,
             entry_avg_fill_px,
             entry_fill_ts_utc,
-            position_status,
-            protective_stop_order_id,
-            tp1_order_id,
-            tp1_filled_qty,
-            tp1_avg_fill_px,
-            tp1_fill_ts_utc,
-            tp2_order_id,
-            tp2_filled_qty,
-            tp2_avg_fill_px,
-            tp2_fill_ts_utc,
-            remaining_qty,
-            partial_exit_status,
-            closed_ts_utc,
             schema_version
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             plan_id,
@@ -716,19 +826,6 @@ def create_paper_trade_plan(
             None,
             None,
             None,
-            PaperTradePlanPositionStatus.PENDING_ENTRY.value,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            PaperTradePlanPartialExitStatus.NONE.value,
-            None,
             schema_version,
         ),
     )
@@ -737,6 +834,121 @@ def create_paper_trade_plan(
     if created is None:
         raise RuntimeError("paper trade plan insert did not persist")
     return created
+
+
+def ensure_paper_position(
+    conn: sqlite3.Connection,
+    *,
+    plan_id: str,
+    request_id: str,
+    alert_id: str,
+    symbol: str,
+    side: str,
+    entry_order_id: str | None = None,
+    entry_client_order_id: str | None = None,
+) -> sqlite3.Row:
+    existing = get_paper_position_by_plan_id(conn, plan_id)
+    now = utc_now_iso()
+    if existing is None:
+        position_id = str(uuid4())
+        conn.execute(
+            """
+            INSERT INTO paper_positions (
+                position_id,
+                plan_id,
+                request_id,
+                alert_id,
+                symbol,
+                side,
+                position_status,
+                entry_order_id,
+                entry_client_order_id,
+                entry_filled_qty,
+                entry_avg_fill_px,
+                opened_ts_utc,
+                closed_ts_utc,
+                remaining_qty,
+                pending_action_status,
+                active_stop_paper_order_id,
+                stop_qty,
+                stop_price,
+                stop_limit_price,
+                tp1_triggered_ts_utc,
+                tp2_triggered_ts_utc,
+                active_tp1_paper_order_id,
+                active_tp2_paper_order_id,
+                tp1_target_qty,
+                tp2_target_qty,
+                tp1_filled_qty,
+                tp2_filled_qty,
+                last_action_error,
+                created_ts_utc,
+                updated_ts_utc,
+                schema_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                position_id,
+                plan_id,
+                request_id,
+                alert_id,
+                symbol,
+                side,
+                PaperPositionStatus.PENDING_ENTRY.value,
+                entry_order_id,
+                entry_client_order_id,
+                0.0,
+                None,
+                None,
+                None,
+                0.0,
+                PaperPositionActionStatus.NONE.value,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                0.0,
+                0.0,
+                None,
+                now,
+                now,
+                PAPER_POSITION_SCHEMA_VERSION,
+            ),
+        )
+        conn.commit()
+        created = get_paper_position_by_plan_id(conn, plan_id)
+        if created is None:
+            raise RuntimeError("paper position insert did not persist")
+        return created
+
+    if (
+        (entry_order_id and str(existing["entry_order_id"] or "") != entry_order_id)
+        or (
+            entry_client_order_id
+            and str(existing["entry_client_order_id"] or "") != entry_client_order_id
+        )
+    ):
+        conn.execute(
+            """
+            UPDATE paper_positions
+            SET entry_order_id = COALESCE(?, entry_order_id),
+                entry_client_order_id = COALESCE(?, entry_client_order_id),
+                updated_ts_utc = ?
+            WHERE plan_id = ?
+            """,
+            (entry_order_id, entry_client_order_id, now, plan_id),
+        )
+        conn.commit()
+        existing = get_paper_position_by_plan_id(conn, plan_id)
+        if existing is None:
+            raise RuntimeError("paper position update did not persist")
+    return existing
 
 
 def insert_paper_order(
@@ -755,10 +967,8 @@ def insert_paper_order(
     time_in_force: Optional[str],
     order_role: str = PaperOrderRole.ENTRY.value,
     parent_paper_order_id: str | None = None,
-    replaced_from_paper_order_id: str | None = None,
     limit_price: float | None = None,
     stop_price: float | None = None,
-    reduce_only: int = 0,
     result: BrokerOrderResult,
 ) -> sqlite3.Row:
     existing = get_paper_order_by_client_order_id(conn, client_order_id)
@@ -777,8 +987,6 @@ def insert_paper_order(
             broker_order_id,
             client_order_id,
             parent_paper_order_id,
-            replaced_from_paper_order_id,
-            superseded_by_paper_order_id,
             order_role,
             symbol,
             side,
@@ -788,7 +996,6 @@ def insert_paper_order(
             notional,
             limit_price,
             stop_price,
-            reduce_only,
             submitted_ts_utc,
             accepted_ts_utc,
             broker_status_raw,
@@ -796,7 +1003,7 @@ def insert_paper_order(
             last_broker_update_ts_utc,
             raw_response_json,
             schema_version
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             paper_order_id,
@@ -807,8 +1014,6 @@ def insert_paper_order(
             result.broker_order_id,
             client_order_id,
             parent_paper_order_id,
-            replaced_from_paper_order_id,
-            None,
             order_role,
             symbol,
             side,
@@ -818,7 +1023,6 @@ def insert_paper_order(
             notional,
             limit_price,
             stop_price,
-            reduce_only,
             result.submitted_ts_utc,
             result.accepted_ts_utc,
             result.broker_status_raw,
@@ -890,70 +1094,6 @@ def reconcile_paper_order_from_broker(
         WHERE paper_order_id = ?
         """,
         (paper_order_id,),
-    ).fetchone()
-
-
-def get_paper_order_by_plan_id_and_role(
-    conn: sqlite3.Connection,
-    plan_id: str,
-    order_role: str,
-) -> sqlite3.Row | None:
-    return conn.execute(
-        """
-        SELECT *
-        FROM paper_orders
-        WHERE plan_id = ?
-          AND order_role = ?
-        ORDER BY submitted_ts_utc ASC
-        LIMIT 1
-        """,
-        (plan_id, order_role),
-    ).fetchone()
-
-
-def get_latest_paper_order_by_plan_id_and_role(
-    conn: sqlite3.Connection,
-    plan_id: str,
-    order_role: str,
-) -> sqlite3.Row | None:
-    return conn.execute(
-        """
-        SELECT *
-        FROM paper_orders
-        WHERE plan_id = ?
-          AND order_role = ?
-        ORDER BY submitted_ts_utc DESC, paper_order_id DESC
-        LIMIT 1
-        """,
-        (plan_id, order_role),
-    ).fetchone()
-
-
-def get_current_paper_order_by_plan_id_and_role(
-    conn: sqlite3.Connection,
-    plan_id: str,
-    order_role: str,
-) -> sqlite3.Row | None:
-    return conn.execute(
-        """
-        SELECT *
-        FROM paper_orders
-        WHERE plan_id = ?
-          AND order_role = ?
-          AND order_status NOT IN (?, ?, ?, ?, ?)
-          AND superseded_by_paper_order_id IS NULL
-        ORDER BY submitted_ts_utc DESC, paper_order_id DESC
-        LIMIT 1
-        """,
-        (
-            plan_id,
-            order_role,
-            PaperOrderStatus.FILLED.value,
-            PaperOrderStatus.CANCELED.value,
-            PaperOrderStatus.REPLACED.value,
-            PaperOrderStatus.REJECTED.value,
-            PaperOrderStatus.EXPIRED.value,
-        ),
     ).fetchone()
 
 
@@ -1098,103 +1238,365 @@ def upsert_entry_fill_from_broker_snapshot(
     return get_paper_fill_by_order_id_and_role(conn, paper_order_id, fill_role)
 
 
-def upsert_paper_fill_from_broker_snapshot(
+def update_paper_position_from_entry_fill(
     conn: sqlite3.Connection,
     *,
-    paper_order_row: sqlite3.Row,
-    broker_snapshot: BrokerOrderResult,
-    fill_role: str,
-    entry_status: str | None = None,
+    plan_id: str,
+    request_id: str,
+    alert_id: str,
+    symbol: str,
+    side: str,
+    entry_order_id: str | None,
+    entry_client_order_id: str | None,
+    entry_filled_qty: float,
+    entry_avg_fill_px: float,
+    opened_ts_utc: str,
 ) -> sqlite3.Row | None:
-    if fill_role == PaperFillRole.ENTRY.value:
-        return upsert_entry_fill_from_broker_snapshot(
-            conn,
-            paper_order_row=paper_order_row,
-            broker_snapshot=broker_snapshot,
-            entry_status=entry_status or PaperTradePlanEntryStatus.FILLED.value,
-        )
-
-    if broker_snapshot.filled_qty is None or broker_snapshot.filled_avg_price is None:
-        return None
-    fill_ts_utc = broker_snapshot.filled_ts_utc
-    existing_fill = get_paper_fill_by_order_id_and_role(
-        conn, str(paper_order_row["paper_order_id"]), fill_role
+    position_row = ensure_paper_position(
+        conn,
+        plan_id=plan_id,
+        request_id=request_id,
+        alert_id=alert_id,
+        symbol=symbol,
+        side=side,
+        entry_order_id=entry_order_id,
+        entry_client_order_id=entry_client_order_id,
     )
-    if fill_ts_utc is None and existing_fill is not None and existing_fill["fill_ts_utc"]:
-        fill_ts_utc = str(existing_fill["fill_ts_utc"])
-    if fill_ts_utc is None:
-        fill_ts_utc = broker_snapshot.last_broker_update_ts_utc
-    if not fill_ts_utc:
+    if position_row is None:
         return None
 
-    paper_order_id = str(paper_order_row["paper_order_id"])
-    paper_fill_id = (
-        str(existing_fill["paper_fill_id"])
-        if existing_fill is not None
-        else f"{paper_order_id}:{fill_role}"
+    current_opened_ts_utc = str(position_row["opened_ts_utc"]) if position_row["opened_ts_utc"] else None
+    next_status = (
+        PaperPositionStatus.OPEN.value
+        if entry_filled_qty > 0
+        else str(position_row["position_status"])
     )
-    gross_notional = broker_snapshot.filled_qty * broker_snapshot.filled_avg_price
+    next_opened_ts_utc = current_opened_ts_utc or (opened_ts_utc if entry_filled_qty > 0 else None)
+    updated_ts_utc = utc_now_iso()
 
     conn.execute(
         """
-        INSERT INTO paper_fills (
-            paper_fill_id,
-            plan_id,
-            request_id,
-            alert_id,
-            paper_order_id,
-            broker,
-            broker_order_id,
-            broker_fill_id,
-            fill_role,
-            symbol,
-            side,
-            fill_ts_utc,
-            fill_px,
-            fill_qty,
-            gross_notional,
-            fee,
-            liquidity,
-            fill_sequence,
-            raw_fill_json,
-            schema_version
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(paper_fill_id) DO UPDATE SET
-            broker_fill_id = excluded.broker_fill_id,
-            fill_ts_utc = excluded.fill_ts_utc,
-            fill_px = excluded.fill_px,
-            fill_qty = excluded.fill_qty,
-            gross_notional = excluded.gross_notional,
-            fee = excluded.fee,
-            liquidity = excluded.liquidity,
-            fill_sequence = excluded.fill_sequence,
-            raw_fill_json = excluded.raw_fill_json
+        UPDATE paper_positions
+        SET position_status = ?,
+            entry_order_id = COALESCE(?, entry_order_id),
+            entry_client_order_id = COALESCE(?, entry_client_order_id),
+            entry_filled_qty = ?,
+            entry_avg_fill_px = ?,
+            opened_ts_utc = ?,
+            remaining_qty = ?,
+            updated_ts_utc = ?
+        WHERE plan_id = ?
         """,
         (
-            paper_fill_id,
-            str(paper_order_row["plan_id"]),
-            str(paper_order_row["request_id"]),
-            str(paper_order_row["alert_id"]),
-            paper_order_id,
-            str(paper_order_row["broker"]),
-            str(paper_order_row["broker_order_id"]),
-            None,
-            fill_role,
-            str(paper_order_row["symbol"]),
-            str(paper_order_row["side"]),
-            fill_ts_utc,
-            broker_snapshot.filled_avg_price,
-            broker_snapshot.filled_qty,
-            gross_notional,
-            None,
-            None,
-            1,
-            broker_snapshot.raw_response_json,
-            PAPER_FILL_SCHEMA_VERSION,
+            next_status,
+            entry_order_id,
+            entry_client_order_id,
+            entry_filled_qty,
+            entry_avg_fill_px,
+            next_opened_ts_utc,
+            entry_filled_qty,
+            updated_ts_utc,
+            plan_id,
         ),
     )
     conn.commit()
-    return get_paper_fill_by_order_id_and_role(conn, paper_order_id, fill_role)
+    return get_paper_position_by_plan_id(conn, plan_id)
+
+
+def initialize_paper_position_exit_allocation(
+    conn: sqlite3.Connection,
+    *,
+    plan_id: str,
+    entry_filled_qty: float,
+) -> sqlite3.Row | None:
+    position_row = get_paper_position_by_plan_id(conn, plan_id)
+    if position_row is None:
+        return None
+
+    existing_tp1_target_qty = position_row["tp1_target_qty"]
+    existing_tp2_target_qty = position_row["tp2_target_qty"]
+    if existing_tp1_target_qty is not None and existing_tp2_target_qty is not None:
+        return position_row
+
+    if entry_filled_qty <= 0:
+        return position_row
+
+    tp1_target_qty = round(entry_filled_qty * 0.5, 8)
+    tp2_target_qty = round(entry_filled_qty - tp1_target_qty, 8)
+    if tp2_target_qty < 0:
+        tp2_target_qty = 0.0
+        tp1_target_qty = round(entry_filled_qty, 8)
+
+    conn.execute(
+        """
+        UPDATE paper_positions
+        SET tp1_target_qty = COALESCE(tp1_target_qty, ?),
+            tp2_target_qty = COALESCE(tp2_target_qty, ?),
+            updated_ts_utc = ?
+        WHERE plan_id = ?
+        """,
+        (tp1_target_qty, tp2_target_qty, utc_now_iso(), plan_id),
+    )
+    conn.commit()
+    return get_paper_position_by_plan_id(conn, plan_id)
+
+
+def update_paper_position_pending_action(
+    conn: sqlite3.Connection,
+    *,
+    plan_id: str,
+    pending_action_status: str,
+) -> sqlite3.Row | None:
+    conn.execute(
+        """
+        UPDATE paper_positions
+        SET pending_action_status = ?,
+            updated_ts_utc = ?
+        WHERE plan_id = ?
+        """,
+        (pending_action_status, utc_now_iso(), plan_id),
+    )
+    conn.commit()
+    return get_paper_position_by_plan_id(conn, plan_id)
+
+
+def update_paper_position_stop_state(
+    conn: sqlite3.Connection,
+    *,
+    plan_id: str,
+    active_stop_paper_order_id: str | None = None,
+    stop_qty: float | None = None,
+    stop_price: float | None = None,
+    stop_limit_price: float | None = None,
+) -> sqlite3.Row | None:
+    conn.execute(
+        """
+        UPDATE paper_positions
+        SET active_stop_paper_order_id = ?,
+            stop_qty = ?,
+            stop_price = ?,
+            stop_limit_price = ?,
+            updated_ts_utc = ?
+        WHERE plan_id = ?
+        """,
+        (
+            active_stop_paper_order_id,
+            stop_qty,
+            stop_price,
+            stop_limit_price,
+            utc_now_iso(),
+            plan_id,
+        ),
+    )
+    conn.commit()
+    return get_paper_position_by_plan_id(conn, plan_id)
+
+
+def update_paper_position_tp1_state(
+    conn: sqlite3.Connection,
+    *,
+    plan_id: str,
+    active_tp1_paper_order_id: str | None = None,
+) -> sqlite3.Row | None:
+    conn.execute(
+        """
+        UPDATE paper_positions
+        SET active_tp1_paper_order_id = ?,
+            updated_ts_utc = ?
+        WHERE plan_id = ?
+        """,
+        (active_tp1_paper_order_id, utc_now_iso(), plan_id),
+    )
+    conn.commit()
+    return get_paper_position_by_plan_id(conn, plan_id)
+
+
+def update_paper_position_tp2_state(
+    conn: sqlite3.Connection,
+    *,
+    plan_id: str,
+    active_tp2_paper_order_id: str | None = None,
+) -> sqlite3.Row | None:
+    conn.execute(
+        """
+        UPDATE paper_positions
+        SET active_tp2_paper_order_id = ?,
+            updated_ts_utc = ?
+        WHERE plan_id = ?
+        """,
+        (active_tp2_paper_order_id, utc_now_iso(), plan_id),
+    )
+    conn.commit()
+    return get_paper_position_by_plan_id(conn, plan_id)
+
+
+def apply_tp1_fill_to_position(
+    conn: sqlite3.Connection,
+    *,
+    plan_id: str,
+    tp1_filled_qty: float,
+    tp1_order_terminal: bool,
+) -> sqlite3.Row | None:
+    position_row = get_paper_position_by_plan_id(conn, plan_id)
+    if position_row is None:
+        return None
+
+    entry_filled_qty = float(position_row["entry_filled_qty"] or 0.0)
+    tp2_filled_qty = float(position_row["tp2_filled_qty"] or 0.0)
+    bounded_tp1_filled_qty = max(0.0, min(tp1_filled_qty, entry_filled_qty))
+    recomputed_remaining_qty = max(
+        0.0,
+        round(entry_filled_qty - bounded_tp1_filled_qty - tp2_filled_qty, 8),
+    )
+
+    current_status = str(position_row["position_status"])
+    next_status = current_status
+    next_pending_action_status = str(position_row["pending_action_status"])
+    next_active_tp1_paper_order_id = position_row["active_tp1_paper_order_id"]
+
+    if bounded_tp1_filled_qty > 0 and recomputed_remaining_qty > 0:
+        next_status = PaperPositionStatus.PARTIAL.value
+        if tp1_order_terminal:
+            next_pending_action_status = PaperPositionActionStatus.REARM_STOP_AFTER_TP1.value
+
+    if tp1_order_terminal:
+        next_active_tp1_paper_order_id = None
+    if tp1_order_terminal and bounded_tp1_filled_qty <= 0:
+        next_pending_action_status = PaperPositionActionStatus.NONE.value
+
+    conn.execute(
+        """
+        UPDATE paper_positions
+        SET tp1_filled_qty = ?,
+            remaining_qty = ?,
+            position_status = ?,
+            pending_action_status = ?,
+            active_tp1_paper_order_id = ?,
+            updated_ts_utc = ?
+        WHERE plan_id = ?
+        """,
+        (
+            bounded_tp1_filled_qty,
+            recomputed_remaining_qty,
+            next_status,
+            next_pending_action_status,
+            next_active_tp1_paper_order_id,
+            utc_now_iso(),
+            plan_id,
+        ),
+    )
+    conn.commit()
+    return get_paper_position_by_plan_id(conn, plan_id)
+
+
+def apply_tp2_fill_to_position(
+    conn: sqlite3.Connection,
+    *,
+    plan_id: str,
+    tp2_filled_qty: float,
+    tp2_order_terminal: bool,
+    closed_ts_utc: str | None = None,
+) -> sqlite3.Row | None:
+    position_row = get_paper_position_by_plan_id(conn, plan_id)
+    if position_row is None:
+        return None
+
+    entry_filled_qty = float(position_row["entry_filled_qty"] or 0.0)
+    tp1_filled_qty = float(position_row["tp1_filled_qty"] or 0.0)
+    bounded_tp2_filled_qty = max(0.0, min(tp2_filled_qty, entry_filled_qty))
+    recomputed_remaining_qty = max(
+        0.0,
+        round(entry_filled_qty - tp1_filled_qty - bounded_tp2_filled_qty, 8),
+    )
+
+    current_status = str(position_row["position_status"])
+    next_status = current_status
+    next_pending_action_status = str(position_row["pending_action_status"])
+    next_active_stop_paper_order_id = position_row["active_stop_paper_order_id"]
+    next_active_tp2_paper_order_id = position_row["active_tp2_paper_order_id"]
+    next_closed_ts_utc = position_row["closed_ts_utc"]
+
+    if tp2_order_terminal:
+        next_active_tp2_paper_order_id = None
+
+    if tp2_order_terminal and bounded_tp2_filled_qty <= 0:
+        next_pending_action_status = PaperPositionActionStatus.NONE.value
+
+    if tp2_order_terminal and recomputed_remaining_qty <= 0 and bounded_tp2_filled_qty > 0:
+        next_status = PaperPositionStatus.CLOSED.value
+        next_pending_action_status = PaperPositionActionStatus.NONE.value
+        next_active_stop_paper_order_id = None
+        next_closed_ts_utc = next_closed_ts_utc or closed_ts_utc or utc_now_iso()
+
+    conn.execute(
+        """
+        UPDATE paper_positions
+        SET tp2_filled_qty = ?,
+            remaining_qty = ?,
+            position_status = ?,
+            pending_action_status = ?,
+            active_stop_paper_order_id = ?,
+            active_tp2_paper_order_id = ?,
+            closed_ts_utc = ?,
+            updated_ts_utc = ?
+        WHERE plan_id = ?
+        """,
+        (
+            bounded_tp2_filled_qty,
+            recomputed_remaining_qty,
+            next_status,
+            next_pending_action_status,
+            next_active_stop_paper_order_id,
+            next_active_tp2_paper_order_id,
+            next_closed_ts_utc,
+            utc_now_iso(),
+            plan_id,
+        ),
+    )
+    conn.commit()
+    return get_paper_position_by_plan_id(conn, plan_id)
+
+
+def record_paper_position_trigger(
+    conn: sqlite3.Connection,
+    *,
+    plan_id: str,
+    trigger_name: str,
+    triggered_ts_utc: str,
+) -> sqlite3.Row | None:
+    if trigger_name not in {"tp1", "tp2"}:
+        raise ValueError(f"unsupported trigger_name: {trigger_name}")
+    column_name = "tp1_triggered_ts_utc" if trigger_name == "tp1" else "tp2_triggered_ts_utc"
+    conn.execute(
+        f"""
+        UPDATE paper_positions
+        SET {column_name} = COALESCE({column_name}, ?),
+            updated_ts_utc = ?
+        WHERE plan_id = ?
+        """,
+        (triggered_ts_utc, utc_now_iso(), plan_id),
+    )
+    conn.commit()
+    return get_paper_position_by_plan_id(conn, plan_id)
+
+
+def update_paper_position_action_error(
+    conn: sqlite3.Connection,
+    *,
+    plan_id: str,
+    last_action_error: str | None,
+) -> sqlite3.Row | None:
+    conn.execute(
+        """
+        UPDATE paper_positions
+        SET last_action_error = ?,
+            updated_ts_utc = ?
+        WHERE plan_id = ?
+        """,
+        (last_action_error, utc_now_iso(), plan_id),
+    )
+    conn.commit()
+    return get_paper_position_by_plan_id(conn, plan_id)
 
 
 def update_trade_plan_entry_summary(
@@ -1232,666 +1634,3 @@ def update_trade_plan_entry_summary(
         """,
         (plan_id,),
     ).fetchone()
-
-
-def update_trade_plan_position_open(
-    conn: sqlite3.Connection,
-    *,
-    plan_id: str,
-    protective_stop_order_id: str | None = None,
-    tp1_order_id: str | None = None,
-    remaining_qty: float | None = None,
-) -> sqlite3.Row | None:
-    conn.execute(
-        """
-        UPDATE paper_trade_plans
-        SET position_status = ?,
-            protective_stop_order_id = COALESCE(?, protective_stop_order_id),
-            tp1_order_id = COALESCE(?, tp1_order_id),
-            remaining_qty = COALESCE(?, remaining_qty)
-        WHERE plan_id = ?
-        """,
-        (
-            PaperTradePlanPositionStatus.OPEN.value,
-            protective_stop_order_id,
-            tp1_order_id,
-            remaining_qty,
-            plan_id,
-        ),
-    )
-    conn.commit()
-    return conn.execute(
-        "SELECT * FROM paper_trade_plans WHERE plan_id = ?",
-        (plan_id,),
-    ).fetchone()
-
-
-def update_trade_plan_position_closed(
-    conn: sqlite3.Connection,
-    *,
-    plan_id: str,
-    closed_ts_utc: str,
-    remaining_qty: float | None = None,
-) -> sqlite3.Row | None:
-    conn.execute(
-        """
-        UPDATE paper_trade_plans
-        SET position_status = ?,
-            closed_ts_utc = ?,
-            remaining_qty = COALESCE(?, remaining_qty)
-        WHERE plan_id = ?
-        """,
-        (
-            PaperTradePlanPositionStatus.CLOSED.value,
-            closed_ts_utc,
-            remaining_qty,
-            plan_id,
-        ),
-    )
-    conn.commit()
-    return conn.execute(
-        "SELECT * FROM paper_trade_plans WHERE plan_id = ?",
-        (plan_id,),
-    ).fetchone()
-
-
-def update_trade_plan_after_tp1_fill(
-    conn: sqlite3.Connection,
-    *,
-    plan_id: str,
-    tp1_order_id: str,
-    tp1_filled_qty: float,
-    tp1_avg_fill_px: float,
-    tp1_fill_ts_utc: str,
-    remaining_qty: float,
-    partial_exit_status: str,
-) -> sqlite3.Row | None:
-    conn.execute(
-        """
-        UPDATE paper_trade_plans
-        SET tp1_order_id = ?,
-            tp1_filled_qty = ?,
-            tp1_avg_fill_px = ?,
-            tp1_fill_ts_utc = ?,
-            remaining_qty = ?,
-            partial_exit_status = ?,
-            position_status = CASE
-                WHEN position_status = ? THEN position_status
-                ELSE ?
-            END
-        WHERE plan_id = ?
-        """,
-        (
-            tp1_order_id,
-            tp1_filled_qty,
-            tp1_avg_fill_px,
-            tp1_fill_ts_utc,
-            remaining_qty,
-            partial_exit_status,
-            PaperTradePlanPositionStatus.CLOSED.value,
-            PaperTradePlanPositionStatus.OPEN.value,
-            plan_id,
-        ),
-    )
-    conn.commit()
-    return conn.execute(
-        "SELECT * FROM paper_trade_plans WHERE plan_id = ?",
-        (plan_id,),
-    ).fetchone()
-
-
-def update_trade_plan_after_tp2_fill(
-    conn: sqlite3.Connection,
-    *,
-    plan_id: str,
-    tp2_order_id: str,
-    tp2_filled_qty: float,
-    tp2_avg_fill_px: float,
-    tp2_fill_ts_utc: str,
-    remaining_qty: float,
-    partial_exit_status: str,
-) -> sqlite3.Row | None:
-    conn.execute(
-        """
-        UPDATE paper_trade_plans
-        SET tp2_order_id = ?,
-            tp2_filled_qty = ?,
-            tp2_avg_fill_px = ?,
-            tp2_fill_ts_utc = ?,
-            remaining_qty = ?,
-            partial_exit_status = ?,
-            position_status = CASE
-                WHEN position_status = ? THEN position_status
-                ELSE ?
-            END
-        WHERE plan_id = ?
-        """,
-        (
-            tp2_order_id,
-            tp2_filled_qty,
-            tp2_avg_fill_px,
-            tp2_fill_ts_utc,
-            remaining_qty,
-            partial_exit_status,
-            PaperTradePlanPositionStatus.CLOSED.value,
-            PaperTradePlanPositionStatus.OPEN.value,
-            plan_id,
-        ),
-    )
-    conn.commit()
-    return conn.execute(
-        "SELECT * FROM paper_trade_plans WHERE plan_id = ?",
-        (plan_id,),
-    ).fetchone()
-
-
-def update_trade_plan_tp1_pointer(
-    conn: sqlite3.Connection,
-    *,
-    plan_id: str,
-    tp1_order_id: str,
-) -> sqlite3.Row | None:
-    conn.execute(
-        """
-        UPDATE paper_trade_plans
-        SET tp1_order_id = ?
-        WHERE plan_id = ?
-        """,
-        (tp1_order_id, plan_id),
-    )
-    conn.commit()
-    return conn.execute(
-        "SELECT * FROM paper_trade_plans WHERE plan_id = ?",
-        (plan_id,),
-    ).fetchone()
-
-
-def update_trade_plan_tp2_pointer(
-    conn: sqlite3.Connection,
-    *,
-    plan_id: str,
-    tp2_order_id: str,
-) -> sqlite3.Row | None:
-    conn.execute(
-        """
-        UPDATE paper_trade_plans
-        SET tp2_order_id = ?
-        WHERE plan_id = ?
-        """,
-        (tp2_order_id, plan_id),
-    )
-    conn.commit()
-    return conn.execute(
-        "SELECT * FROM paper_trade_plans WHERE plan_id = ?",
-        (plan_id,),
-    ).fetchone()
-
-
-def clear_trade_plan_protective_stop_pointer(
-    conn: sqlite3.Connection,
-    *,
-    plan_id: str,
-) -> sqlite3.Row | None:
-    conn.execute(
-        """
-        UPDATE paper_trade_plans
-        SET protective_stop_order_id = NULL
-        WHERE plan_id = ?
-        """,
-        (plan_id,),
-    )
-    conn.commit()
-    return conn.execute(
-        "SELECT * FROM paper_trade_plans WHERE plan_id = ?",
-        (plan_id,),
-    ).fetchone()
-
-
-def update_open_stop_order_qty(
-    conn: sqlite3.Connection,
-    *,
-    paper_order_id: str,
-    qty: float,
-) -> sqlite3.Row | None:
-    conn.execute(
-        """
-        UPDATE paper_orders
-        SET qty = ?
-        WHERE paper_order_id = ?
-          AND order_status NOT IN (?, ?, ?, ?, ?)
-        """,
-        (qty, paper_order_id, *TERMINAL_PAPER_ORDER_STATUSES),
-    )
-    conn.commit()
-    return conn.execute(
-        "SELECT * FROM paper_orders WHERE paper_order_id = ?",
-        (paper_order_id,),
-    ).fetchone()
-
-
-def update_open_paper_order_qty(
-    conn: sqlite3.Connection,
-    *,
-    paper_order_id: str,
-    qty: float,
-) -> sqlite3.Row | None:
-    conn.execute(
-        """
-        UPDATE paper_orders
-        SET qty = ?
-        WHERE paper_order_id = ?
-          AND order_status NOT IN (?, ?, ?, ?, ?)
-        """,
-        (qty, paper_order_id, *TERMINAL_PAPER_ORDER_STATUSES),
-    )
-    conn.commit()
-    return conn.execute(
-        "SELECT * FROM paper_orders WHERE paper_order_id = ?",
-        (paper_order_id,),
-    ).fetchone()
-
-
-def mark_paper_order_replaced(
-    conn: sqlite3.Connection,
-    *,
-    paper_order_id: str,
-    replacement_paper_order_id: str,
-    canceled_ts_utc: str | None = None,
-    raw_response_json: str | None = None,
-) -> sqlite3.Row | None:
-    effective_canceled_ts_utc = canceled_ts_utc or utc_now_iso()
-    conn.execute(
-        """
-        UPDATE paper_orders
-        SET order_status = ?,
-            canceled_ts_utc = COALESCE(?, canceled_ts_utc),
-            status_reason = ?,
-            superseded_by_paper_order_id = ?,
-            last_broker_update_ts_utc = ?,
-            raw_response_json = COALESCE(?, raw_response_json)
-        WHERE paper_order_id = ?
-        """,
-        (
-            PaperOrderStatus.REPLACED.value,
-            effective_canceled_ts_utc,
-            "REPLACED",
-            replacement_paper_order_id,
-            effective_canceled_ts_utc,
-            raw_response_json,
-            paper_order_id,
-        ),
-    )
-    conn.commit()
-    return conn.execute(
-        "SELECT * FROM paper_orders WHERE paper_order_id = ?",
-        (paper_order_id,),
-    ).fetchone()
-
-
-def mark_paper_order_canceled_for_replace(
-    conn: sqlite3.Connection,
-    *,
-    paper_order_id: str,
-    canceled_ts_utc: str | None = None,
-    raw_response_json: str | None = None,
-) -> sqlite3.Row | None:
-    effective_canceled_ts_utc = canceled_ts_utc or utc_now_iso()
-    conn.execute(
-        """
-        UPDATE paper_orders
-        SET order_status = ?,
-            canceled_ts_utc = COALESCE(?, canceled_ts_utc),
-            status_reason = ?,
-            last_broker_update_ts_utc = ?,
-            raw_response_json = COALESCE(?, raw_response_json)
-        WHERE paper_order_id = ?
-        """,
-        (
-            PaperOrderStatus.CANCELED.value,
-            effective_canceled_ts_utc,
-            "canceled_for_replace",
-            effective_canceled_ts_utc,
-            raw_response_json,
-            paper_order_id,
-        ),
-    )
-    conn.commit()
-    return conn.execute(
-        "SELECT * FROM paper_orders WHERE paper_order_id = ?",
-        (paper_order_id,),
-    ).fetchone()
-
-
-def mark_paper_order_canceled(
-    conn: sqlite3.Connection,
-    *,
-    paper_order_id: str,
-    canceled_ts_utc: str | None = None,
-    raw_response_json: str | None = None,
-    status_reason: str = "canceled_after_stop_close",
-) -> sqlite3.Row | None:
-    effective_canceled_ts_utc = canceled_ts_utc or utc_now_iso()
-    conn.execute(
-        """
-        UPDATE paper_orders
-        SET order_status = ?,
-            canceled_ts_utc = COALESCE(?, canceled_ts_utc),
-            status_reason = ?,
-            last_broker_update_ts_utc = ?,
-            raw_response_json = COALESCE(?, raw_response_json)
-        WHERE paper_order_id = ?
-        """,
-        (
-            PaperOrderStatus.CANCELED.value,
-            effective_canceled_ts_utc,
-            status_reason,
-            effective_canceled_ts_utc,
-            raw_response_json,
-            paper_order_id,
-        ),
-    )
-    conn.commit()
-    return conn.execute(
-        "SELECT * FROM paper_orders WHERE paper_order_id = ?",
-        (paper_order_id,),
-    ).fetchone()
-
-
-def get_trade_outcome_by_plan_id(
-    conn: sqlite3.Connection,
-    plan_id: str,
-) -> sqlite3.Row | None:
-    return conn.execute(
-        """
-        SELECT *
-        FROM paper_trade_outcomes
-        WHERE plan_id = ?
-        """,
-        (plan_id,),
-    ).fetchone()
-
-
-def list_exit_fills_by_plan_id(
-    conn: sqlite3.Connection,
-    plan_id: str,
-) -> list[sqlite3.Row]:
-    rows = conn.execute(
-        """
-        SELECT *
-        FROM paper_fills
-        WHERE plan_id = ?
-          AND fill_role IN (?, ?, ?)
-        ORDER BY fill_ts_utc ASC, fill_sequence ASC, paper_fill_id ASC
-        """,
-        (
-            plan_id,
-            PaperFillRole.TP1.value,
-            PaperFillRole.TP2.value,
-            PaperFillRole.STOP.value,
-        ),
-    ).fetchall()
-    return list(rows)
-
-
-def create_trade_outcome_for_closed_plan(
-    conn: sqlite3.Connection,
-    *,
-    plan_row: sqlite3.Row,
-    exit_reason: str,
-) -> sqlite3.Row:
-    existing = get_trade_outcome_by_plan_id(conn, str(plan_row["plan_id"]))
-    if existing is not None:
-        return existing
-
-    entry_qty = _optional_float(plan_row["entry_filled_qty"])
-    entry_avg_px = _optional_float(plan_row["entry_avg_fill_px"])
-    exit_fill_rows = list_exit_fills_by_plan_id(conn, str(plan_row["plan_id"]))
-    if not exit_fill_rows:
-        raise RuntimeError("closed trade outcome requires at least one exit fill")
-
-    exit_qty = 0.0
-    exit_notional = 0.0
-    gross_pnl = 0.0
-    exit_fill_ids: list[str] = []
-    exit_legs: list[dict[str, object | None]] = []
-    latest_exit_fill_ts_utc = None
-    for exit_fill_row in exit_fill_rows:
-        fill_qty = _optional_float(exit_fill_row["fill_qty"])
-        fill_px = _optional_float(exit_fill_row["fill_px"])
-        fill_ts_utc = _optional_str(exit_fill_row["fill_ts_utc"])
-        if fill_qty is None or fill_px is None or fill_ts_utc is None:
-            continue
-
-        exit_qty += fill_qty
-        exit_notional += fill_px * fill_qty
-        gross_pnl += _compute_gross_pnl(
-            side=str(plan_row["side"]),
-            entry_avg_px=entry_avg_px,
-            exit_avg_px=fill_px,
-            exit_qty=fill_qty,
-        ) or 0.0
-        exit_fill_ids.append(str(exit_fill_row["paper_fill_id"]))
-        exit_legs.append(
-            {
-                "fill_id": str(exit_fill_row["paper_fill_id"]),
-                "role": str(exit_fill_row["fill_role"]),
-                "qty": fill_qty,
-                "px": fill_px,
-                "ts": fill_ts_utc,
-            }
-        )
-        if latest_exit_fill_ts_utc is None or fill_ts_utc > latest_exit_fill_ts_utc:
-            latest_exit_fill_ts_utc = fill_ts_utc
-
-    if exit_qty <= 0 or latest_exit_fill_ts_utc is None:
-        raise RuntimeError("closed trade outcome requires usable exit fill truth")
-
-    exit_avg_px = exit_notional / exit_qty
-    planned_stop_px = _optional_float(plan_row["stop_px"])
-    realized_r = _compute_realized_r(
-        side=str(plan_row["side"]),
-        entry_avg_px=entry_avg_px,
-        entry_qty=entry_qty,
-        exit_avg_px=None,
-        exit_qty=None,
-        planned_stop_px=planned_stop_px,
-        gross_pnl=gross_pnl,
-    )
-    closed_ts_utc = _optional_str(plan_row["closed_ts_utc"]) or latest_exit_fill_ts_utc
-    entry_order_row = get_paper_order_by_plan_id_and_role(
-        conn,
-        str(plan_row["plan_id"]),
-        PaperOrderRole.ENTRY.value,
-    )
-    entry_fill_id = None
-    if entry_order_row is not None:
-        entry_fill_row = get_paper_fill_by_order_id_and_role(
-            conn,
-            str(entry_order_row["paper_order_id"]),
-            PaperFillRole.ENTRY.value,
-        )
-        if entry_fill_row is not None:
-            entry_fill_id = str(entry_fill_row["paper_fill_id"])
-    raw_summary_json = json.dumps(
-        {
-            "entry_fill_id": entry_fill_id,
-            "exit_fill_ids": exit_fill_ids,
-            "exit_legs": exit_legs,
-            "exit_reason": exit_reason,
-            "total_exit_qty": exit_qty,
-            "weighted_exit_avg_px": exit_avg_px,
-            "realized_gross_pnl": gross_pnl,
-        },
-        sort_keys=True,
-    )
-    outcome_id = f"{plan_row['plan_id']}:OUTCOME"
-    conn.execute(
-        """
-        INSERT INTO paper_trade_outcomes (
-            outcome_id,
-            plan_id,
-            request_id,
-            alert_id,
-            symbol,
-            side,
-            market_type,
-            strategy_profile,
-            strategy_version,
-            config_hash,
-            strategy_id,
-            setup_family,
-            strategy_params_json,
-            strategy_params_hash,
-            opened_ts_utc,
-            closed_ts_utc,
-            entry_fill_ts_utc,
-            entry_avg_px,
-            entry_qty,
-            exit_fill_ts_utc,
-            exit_avg_px,
-            exit_qty,
-            exit_reason,
-            gross_pnl,
-            fees,
-            net_pnl,
-            planned_stop_px,
-            planned_t1_px,
-            planned_t2_px,
-            realized_r,
-            entered,
-            closed,
-            outcome_status,
-            raw_summary_json,
-            schema_version
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            outcome_id,
-            str(plan_row["plan_id"]),
-            str(plan_row["request_id"]),
-            str(plan_row["alert_id"]),
-            str(plan_row["symbol"]),
-            str(plan_row["side"]),
-            _optional_str(plan_row["market_type"]),
-            _optional_str(plan_row["strategy_profile"]),
-            _optional_str(plan_row["strategy_version"]),
-            _optional_str(plan_row["config_hash"]),
-            _optional_str(plan_row["strategy_id"]),
-            _optional_str(plan_row["setup_family"]),
-            _optional_str(plan_row["strategy_params_json"]),
-            _optional_str(plan_row["strategy_params_hash"]),
-            _optional_str(plan_row["entry_fill_ts_utc"]),
-            closed_ts_utc,
-            _optional_str(plan_row["entry_fill_ts_utc"]),
-            entry_avg_px,
-            entry_qty,
-            latest_exit_fill_ts_utc,
-            exit_avg_px,
-            exit_qty,
-            exit_reason,
-            gross_pnl,
-            None,
-            gross_pnl,
-            planned_stop_px,
-            _optional_float(plan_row["t1_px"]),
-            _optional_float(plan_row["t2_px"]),
-            realized_r,
-            1 if entry_qty is not None and entry_avg_px is not None else 0,
-            1,
-            PaperTradeOutcomeStatus.CLOSED.value,
-            raw_summary_json,
-            PAPER_TRADE_OUTCOME_SCHEMA_VERSION,
-        ),
-    )
-    conn.commit()
-    return get_trade_outcome_by_plan_id(conn, str(plan_row["plan_id"]))
-
-
-def create_trade_outcome_from_stop_fill(
-    conn: sqlite3.Connection,
-    *,
-    plan_row: sqlite3.Row,
-    stop_fill_row: sqlite3.Row,
-) -> sqlite3.Row:
-    if stop_fill_row is None:
-        raise RuntimeError("stop fill row is required for stop-close outcome creation")
-    return create_trade_outcome_for_closed_plan(
-        conn,
-        plan_row=plan_row,
-        exit_reason=PaperOrderRole.STOP.value,
-    )
-
-
-def create_trade_outcome_from_tp2_fill(
-    conn: sqlite3.Connection,
-    *,
-    plan_row: sqlite3.Row,
-    tp2_fill_row: sqlite3.Row,
-) -> sqlite3.Row:
-    if tp2_fill_row is None:
-        raise RuntimeError("tp2 fill row is required for tp2-close outcome creation")
-    return create_trade_outcome_for_closed_plan(
-        conn,
-        plan_row=plan_row,
-        exit_reason=PaperOrderRole.TP2.value,
-    )
-
-
-def _optional_str(value) -> str | None:
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None
-
-
-def _optional_float(value) -> float | None:
-    if value is None or value == "":
-        return None
-    return float(value)
-
-
-def _compute_gross_pnl(
-    *,
-    side: str,
-    entry_avg_px: float | None,
-    exit_avg_px: float | None,
-    exit_qty: float | None,
-) -> float | None:
-    if entry_avg_px is None or exit_avg_px is None or exit_qty is None:
-        return None
-    if side == "LONG":
-        return (exit_avg_px - entry_avg_px) * exit_qty
-    if side == "SHORT":
-        return (entry_avg_px - exit_avg_px) * exit_qty
-    return None
-
-
-def _compute_realized_r(
-    *,
-    side: str,
-    entry_avg_px: float | None,
-    entry_qty: float | None,
-    exit_avg_px: float | None,
-    exit_qty: float | None,
-    planned_stop_px: float | None,
-    gross_pnl: float | None = None,
-) -> float | None:
-    if gross_pnl is None:
-        gross_pnl = _compute_gross_pnl(
-            side=side,
-            entry_avg_px=entry_avg_px,
-            exit_avg_px=exit_avg_px,
-            exit_qty=exit_qty,
-        )
-    if gross_pnl is None or entry_avg_px is None or entry_qty is None or planned_stop_px is None:
-        return None
-    if side == "LONG":
-        risk_per_unit = entry_avg_px - planned_stop_px
-    elif side == "SHORT":
-        risk_per_unit = planned_stop_px - entry_avg_px
-    else:
-        return None
-    denominator = risk_per_unit * entry_qty
-    if denominator <= 0:
-        return None
-    return gross_pnl / denominator

@@ -98,11 +98,6 @@ def run():
         watch_mgr=watch_mgr,
         telemetry=telemetry,
     )
-    processor = BarProcessor(runtime)
-
-    scheduler_tasks.start_scheduler()
-    print("Maintenance scheduler started (UTC): 6h backups, daily snapshot, nightly DuckDB, monthly archive")
-
     execution_worker = ExecutionWorker(
         ExecutionWorkerConfig(
             db_path=config.EXECUTION_DB_PATH,
@@ -114,6 +109,14 @@ def run():
         ),
         alert_lookup=journal.load_alert_intent_by_id,
     )
+    processor = BarProcessor(
+        runtime,
+        execution_worker=execution_worker if config.EXECUTION_ENABLED else None,
+    )
+
+    scheduler_tasks.start_scheduler()
+    print("Maintenance scheduler started (UTC): 6h backups, daily snapshot, nightly DuckDB, monthly archive")
+
     if config.EXECUTION_ENABLED:
         execution_thread = threading.Thread(
             target=execution_worker.run_forever,

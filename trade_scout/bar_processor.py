@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 import pandas as pd
 
 from . import config
 from .alert_pipeline import AlertPipeline
 from .runtime_context import RuntimeContext
+
+if TYPE_CHECKING:
+    from .execution.worker import ExecutionWorker
 
 
 def append_bar_to_df(df: pd.DataFrame, bar, max_keep: int) -> pd.DataFrame:
@@ -25,12 +29,35 @@ def append_bar_to_df(df: pd.DataFrame, bar, max_keep: int) -> pd.DataFrame:
 
 
 class BarProcessor:
-    def __init__(self, context: RuntimeContext):
+    def __init__(
+        self,
+        context: RuntimeContext,
+        *,
+        execution_worker: ExecutionWorker | None = None,
+    ):
         self.context = context
         self.alerts = AlertPipeline(context)
+        self.execution_worker = execution_worker
+
+    def _process_execution_triggers(self, *, symbol: str, close_price: float) -> None:
+        if self.execution_worker is None:
+            return
+        try:
+            processed = self.execution_worker.process_position_triggers(
+                price_by_symbol={symbol: close_price}
+            )
+            if processed > 0:
+                print(
+                    f"[execution-worker] processed tp triggers symbol={symbol} "
+                    f"count={processed}"
+                )
+        except Exception as exc:
+            print(f"[execution-worker] trigger processing failed symbol={symbol} error={exc}")
 
     async def on_bar(self, bar):
         now = datetime.now(timezone.utc)
+        symbol = bar.symbol
+        close_price = float(bar.close)
 
         try:
             if self.context.reconnect_attempt > 0:
@@ -40,11 +67,10 @@ class BarProcessor:
                 )
                 self.context.reconnect_attempt = 0
 
-            symbol = bar.symbol
             ts = pd.to_datetime(bar.timestamp, utc=True).to_pydatetime()
 
             self.context.telemetry.record_bar(is_anchor=self.context.anchor.is_anchor(symbol))
-            self.context.watch_mgr.update(symbol, float(bar.high), float(bar.low), float(bar.close), ts)
+            self.context.watch_mgr.update(symbol, float(bar.high), float(bar.low), close_price, ts)
 
             df = self.context.data.get(symbol)
             if df is None:
@@ -91,4 +117,5 @@ class BarProcessor:
                 )
 
         finally:
+            self._process_execution_triggers(symbol=symbol, close_price=close_price)
             self.context.telemetry.maybe_flush(datetime.now(timezone.utc))

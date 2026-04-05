@@ -22,6 +22,15 @@ def _map_side(side: str) -> str:
     raise ValueError(f"Unsupported execution side for Alpaca: {side}")
 
 
+def _map_exit_side(side: str) -> str:
+    normalized = str(side).strip().upper()
+    if normalized == "LONG":
+        return "sell"
+    if normalized == "SHORT":
+        return "buy"
+    raise ValueError(f"Unsupported execution side for Alpaca exit: {side}")
+
+
 def _require_alpaca_config() -> None:
     if not config.ALPACA_API_KEY.strip():
         raise RuntimeError("Missing ALPACA_API_KEY for paper execution submission")
@@ -125,27 +134,29 @@ def submit_stop_order(
     side: str,
     qty: float,
     stop_price: float,
+    limit_price: float | None = None,
 ) -> BrokerOrderResult:
     _require_alpaca_config()
 
     normalized_symbol = str(symbol).strip()
-    normalized_side = _map_side(side)
     if not normalized_symbol:
-        raise RuntimeError("Stop order is missing symbol for Alpaca submission")
+        raise RuntimeError("STOP submission requires symbol")
     if qty <= 0:
-        raise RuntimeError("Stop order qty must be greater than 0")
+        raise RuntimeError("STOP submission requires qty > 0")
     if stop_price <= 0:
-        raise RuntimeError("Stop order stop_price must be greater than 0")
+        raise RuntimeError("STOP submission requires stop_price > 0")
 
     payload = {
         "symbol": normalized_symbol,
-        "side": normalized_side,
-        "type": "stop",
+        "side": _map_exit_side(side),
+        "type": "stop_limit" if limit_price is not None else "stop",
         "time_in_force": "gtc",
         "qty": str(qty),
         "stop_price": str(stop_price),
         "client_order_id": client_order_id,
     }
+    if limit_price is not None:
+        payload["limit_price"] = str(limit_price)
 
     url = f"{config.ALPACA_BASE_URL.rstrip('/')}/v2/orders"
     response = requests.post(url, json=payload, headers=_auth_headers(), timeout=15)
@@ -155,59 +166,6 @@ def submit_stop_order(
         detail = response_json if isinstance(response_json, dict) else {"response": response_json}
         raise RuntimeError(
             f"Alpaca stop submission failed status={response.status_code} detail={json.dumps(detail, sort_keys=True)}"
-        )
-
-    return _normalize_order_result(response_json)
-
-
-def submit_stop_limit_order(
-    *,
-    client_order_id: str,
-    symbol: str,
-    side: str,
-    qty: float,
-    stop_price: float,
-    limit_price: float,
-    time_in_force: str = "gtc",
-) -> BrokerOrderResult:
-    _require_alpaca_config()
-
-    normalized_symbol = str(symbol).strip()
-    normalized_side = _map_side(side)
-    normalized_tif = str(time_in_force).strip().lower()
-    if not normalized_symbol:
-        raise RuntimeError("Stop-limit order is missing symbol for Alpaca submission")
-    if qty <= 0:
-        raise RuntimeError("Stop-limit order qty must be greater than 0")
-    if stop_price <= 0:
-        raise RuntimeError("Stop-limit order stop_price must be greater than 0")
-    if limit_price <= 0:
-        raise RuntimeError("Stop-limit order limit_price must be greater than 0")
-    if normalized_tif not in {"gtc", "ioc"}:
-        raise RuntimeError(
-            f"Stop-limit order time_in_force must be 'gtc' or 'ioc', got: {time_in_force}"
-        )
-
-    payload = {
-        "symbol": normalized_symbol,
-        "side": normalized_side,
-        "type": "stop_limit",
-        "time_in_force": normalized_tif,
-        "qty": str(qty),
-        "stop_price": str(stop_price),
-        "limit_price": str(limit_price),
-        "client_order_id": client_order_id,
-    }
-
-    url = f"{config.ALPACA_BASE_URL.rstrip('/')}/v2/orders"
-    response = requests.post(url, json=payload, headers=_auth_headers(), timeout=15)
-    response_json = _parse_response_json(response)
-
-    if response.status_code >= 400:
-        detail = response_json if isinstance(response_json, dict) else {"response": response_json}
-        raise RuntimeError(
-            "Alpaca stop-limit submission failed "
-            f"status={response.status_code} detail={json.dumps(detail, sort_keys=True)}"
         )
 
     return _normalize_order_result(response_json)
@@ -224,17 +182,16 @@ def submit_limit_order(
     _require_alpaca_config()
 
     normalized_symbol = str(symbol).strip()
-    normalized_side = _map_side(side)
     if not normalized_symbol:
-        raise RuntimeError("Limit order is missing symbol for Alpaca submission")
+        raise RuntimeError("LIMIT submission requires symbol")
     if qty <= 0:
-        raise RuntimeError("Limit order qty must be greater than 0")
+        raise RuntimeError("LIMIT submission requires qty > 0")
     if limit_price <= 0:
-        raise RuntimeError("Limit order limit_price must be greater than 0")
+        raise RuntimeError("LIMIT submission requires limit_price > 0")
 
     payload = {
         "symbol": normalized_symbol,
-        "side": normalized_side,
+        "side": _map_exit_side(side),
         "type": "limit",
         "time_in_force": "gtc",
         "qty": str(qty),
@@ -255,50 +212,34 @@ def submit_limit_order(
     return _normalize_order_result(response_json)
 
 
-def cancel_order_by_broker_order_id(broker_order_id: str) -> BrokerOrderResult:
+def cancel_order(broker_order_id: str) -> BrokerOrderResult | None:
     _require_alpaca_config()
 
     url = f"{config.ALPACA_BASE_URL.rstrip('/')}/v2/orders/{broker_order_id}"
-    response = requests.delete(
-        url,
-        headers=_auth_headers(),
-        timeout=15,
-    )
+    response = requests.delete(url, headers=_auth_headers(), timeout=15)
+
+    if response.status_code == 404:
+        return None
+
     response_json = _parse_response_json(response)
-
-    if response.status_code == 204:
-        canceled_ts_utc = utc_now_iso()
-        return BrokerOrderResult(
-            broker=ALPACA_BROKER_NAME,
-            broker_order_id=broker_order_id,
-            submitted_ts_utc=canceled_ts_utc,
-            raw_response_json=json.dumps(
-                {"action": "cancel", "broker_order_id": broker_order_id, "status": "canceled"},
-                sort_keys=True,
-            ),
-            broker_status_raw="canceled",
-            canceled_ts_utc=canceled_ts_utc,
-            last_broker_update_ts_utc=canceled_ts_utc,
-        )
-
     if response.status_code >= 400:
         detail = response_json if isinstance(response_json, dict) else {"response": response_json}
         raise RuntimeError(
             f"Alpaca cancel failed status={response.status_code} detail={json.dumps(detail, sort_keys=True)}"
         )
 
-    if isinstance(response_json, dict):
+    now_utc = utc_now_iso()
+    if isinstance(response_json, dict) and response_json.get("id"):
         return _normalize_order_result(response_json)
 
-    canceled_ts_utc = utc_now_iso()
     return BrokerOrderResult(
         broker=ALPACA_BROKER_NAME,
         broker_order_id=broker_order_id,
-        submitted_ts_utc=canceled_ts_utc,
-        raw_response_json=json.dumps({"response": response_json}, sort_keys=True),
+        submitted_ts_utc=now_utc,
+        raw_response_json=json.dumps(response_json, sort_keys=True),
         broker_status_raw="canceled",
-        canceled_ts_utc=canceled_ts_utc,
-        last_broker_update_ts_utc=canceled_ts_utc,
+        canceled_ts_utc=now_utc,
+        last_broker_update_ts_utc=now_utc,
     )
 
 
