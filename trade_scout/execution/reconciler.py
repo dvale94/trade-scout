@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any, Callable
 
 from trade_scout.execution.broker import fetch_broker_order_by_id
@@ -75,10 +76,11 @@ class ExecutionReconciler:
 
                 reconciled = self.reconcile_paper_order(conn, paper_order_row, broker_snapshot)
                 synced_count += 1
-                print(
-                    f"[execution-worker] synced paper_order_id={paper_order_id} "
-                    f"broker_order_id={broker_order_id} order_status={reconciled['order_status']}"
-                )
+                if self._has_material_order_state_change(paper_order_row, reconciled):
+                    print(
+                        f"[execution-worker] synced paper_order_id={paper_order_id} "
+                        f"broker_order_id={broker_order_id} order_status={reconciled['order_status']}"
+                    )
             except Exception as exc:
                 print(
                     f"[execution-worker] sync failed paper_order_id={paper_order_id} "
@@ -224,6 +226,39 @@ class ExecutionReconciler:
             return None
         text = str(value).strip()
         return text or None
+
+    @classmethod
+    def _has_material_order_state_change(cls, previous_row, current_row) -> bool:
+        return cls._material_order_state_snapshot(previous_row) != cls._material_order_state_snapshot(
+            current_row
+        )
+
+    @staticmethod
+    def _material_order_state_snapshot(row) -> tuple[Any, ...]:
+        raw_payload = ExecutionReconciler._parse_raw_response_json(row["raw_response_json"])
+        return (
+            row["broker_order_id"],
+            row["order_status"],
+            row["broker_status_raw"],
+            row["accepted_ts_utc"],
+            row["canceled_ts_utc"],
+            row["expired_ts_utc"],
+            row["rejected_ts_utc"],
+            row["filled_ts_utc"],
+            row["status_reason"],
+            raw_payload.get("filled_qty"),
+            raw_payload.get("filled_avg_price"),
+        )
+
+    @staticmethod
+    def _parse_raw_response_json(raw_response_json: Any) -> dict[str, Any]:
+        if raw_response_json is None:
+            return {}
+        try:
+            parsed = json.loads(str(raw_response_json))
+        except (TypeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
 
     def _get_broker_order_fetcher(self) -> Callable[[str], BrokerOrderResult | None]:
         return self.broker_order_fetcher or fetch_broker_order_by_id
