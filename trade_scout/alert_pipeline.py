@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from datetime import datetime
 from uuid import uuid4
@@ -13,9 +14,14 @@ from .journal_builders import (
     make_alert_context_row,
     make_intent_core_row,
 )
+from .policy.evaluator import evaluate_policy
+from .policy.models import PolicyConfig
+from .policy.repository import PolicyRepository
 from .runtime_context import EnabledStrategy, RuntimeContext
 from .strategies.types import SetupCandidate
 from .strategy import Candidate
+
+POLICY_NAME = "execution_policy"
 
 
 def format_alert(candidate, tier: str) -> str:
@@ -66,8 +72,17 @@ def _candidate_from_trade_plan(
 
 
 class AlertPipeline:
-    def __init__(self, context: RuntimeContext):
+    def __init__(
+        self,
+        context: RuntimeContext,
+        *,
+        policy_repository: PolicyRepository | None = None,
+        policy_name: str = POLICY_NAME,
+    ):
         self.context = context
+        self.policy_repository = policy_repository or PolicyRepository(config.EXECUTION_DB_PATH)
+        self.policy_name = policy_name
+        self._policy_db_initialized = False
 
     def _log_intent_and_context(self, symbol: str, core_row, context_row) -> None:
         journal.log_alert_intent(core_row)
@@ -75,6 +90,44 @@ class AlertPipeline:
             journal.log_alert_context(context_row)
         except Exception as context_err:
             print(f"ALERT CONTEXT LOG ERROR for {symbol}: {context_err}")
+
+    def _process_policy_shadow(self, intent_row, context_row) -> None:
+        alert_id = str(intent_row.alert_id)
+        try:
+            if not self._policy_db_initialized:
+                self.policy_repository.init_db()
+                self._policy_db_initialized = True
+
+            conn = self.policy_repository.get_connection()
+            try:
+                active_policy = self.policy_repository.get_active_policy(
+                    conn,
+                    self.policy_name,
+                    str(intent_row.signal_ts_utc),
+                    mode="SHADOW",
+                )
+                if active_policy is None:
+                    print(f"[policy] no active policy alert_id={alert_id}")
+                    return
+
+                policy_config = _policy_config_from_definition_row(active_policy)
+                decision = evaluate_policy(
+                    intent_row,
+                    context_row,
+                    policy_config,
+                    mode="SHADOW",
+                )
+                decision_row = decision.to_row(active_policy.policy_id)
+                persisted = self.policy_repository.insert_policy_decision(conn, decision_row)
+            finally:
+                conn.close()
+
+            print(
+                f"[policy] evaluated alert_id={alert_id} decision={persisted.decision} "
+                f"policy={persisted.policy_name} version={persisted.policy_version}"
+            )
+        except Exception as exc:
+            print(f"[policy] error alert_id={alert_id} error={exc}")
 
     def process(
         self,
@@ -181,6 +234,8 @@ class AlertPipeline:
                 self._log_intent_and_context(symbol, intent_row, alert_context_row)
                 return
 
+            self._process_policy_shadow(intent_row, alert_context_row)
+
             journal.log_alert(candidate, computed_for_log, tier, config.STRATEGY_PROFILE)
             notifier.discord_notify(format_alert(candidate, tier))
             self.context.telemetry.record_alert_sent(tier)
@@ -226,3 +281,25 @@ class AlertPipeline:
             print(f"ALERT ERROR for {symbol}: {e}")
             intent_row = replace(intent_row, alert_status="ERROR_ALERT_PIPELINE", error_message=str(e))
             self._log_intent_and_context(symbol, intent_row, alert_context_row)
+
+
+def _policy_config_from_definition_row(policy_definition_row) -> PolicyConfig:
+    raw_config = json.loads(str(policy_definition_row.config_json))
+    if not isinstance(raw_config, dict):
+        raise ValueError("policy config_json must decode to an object")
+
+    raw_filters = raw_config.get("filters", raw_config)
+    if not isinstance(raw_filters, dict):
+        raise ValueError("policy config filters must decode to an object")
+
+    description = raw_config.get("description")
+    if description is None:
+        description = policy_definition_row.description or ""
+
+    return PolicyConfig(
+        policy_name=str(policy_definition_row.policy_name),
+        policy_version=str(policy_definition_row.policy_version),
+        policy_hash=str(policy_definition_row.policy_hash),
+        description=str(description),
+        filters=dict(raw_filters),
+    )
