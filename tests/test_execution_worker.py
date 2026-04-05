@@ -82,11 +82,17 @@ class ExecutionWorkerTest(unittest.TestCase):
             self.assertIn("paper_orders", table_names)
             self.assertIn("paper_fills", table_names)
             self.assertIn("paper_positions", table_names)
+            self.assertIn("policy_definitions", table_names)
+            self.assertIn("policy_decisions", table_names)
+            self.assertIn("policy_activation_history", table_names)
 
             plan_columns = self._table_columns(conn, "paper_trade_plans")
             order_columns = self._table_columns(conn, "paper_orders")
             fill_columns = self._table_columns(conn, "paper_fills")
             position_columns = self._table_columns(conn, "paper_positions")
+            policy_definition_columns = self._table_columns(conn, "policy_definitions")
+            policy_decision_columns = self._table_columns(conn, "policy_decisions")
+            policy_activation_columns = self._table_columns(conn, "policy_activation_history")
         finally:
             conn.close()
 
@@ -136,6 +142,231 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertIn("tp1_filled_qty", position_columns)
         self.assertIn("tp2_filled_qty", position_columns)
         self.assertIn("last_action_error", position_columns)
+
+        self.assertIn("policy_id", policy_definition_columns)
+        self.assertIn("policy_name", policy_definition_columns)
+        self.assertIn("policy_version", policy_definition_columns)
+        self.assertIn("policy_hash", policy_definition_columns)
+        self.assertIn("status", policy_definition_columns)
+        self.assertIn("config_json", policy_definition_columns)
+        self.assertIn("description", policy_definition_columns)
+        self.assertIn("created_ts_utc", policy_definition_columns)
+
+        self.assertIn("policy_decision_id", policy_decision_columns)
+        self.assertIn("alert_id", policy_decision_columns)
+        self.assertIn("policy_id", policy_decision_columns)
+        self.assertIn("mode", policy_decision_columns)
+        self.assertIn("decision", policy_decision_columns)
+        self.assertIn("decision_reasons_json", policy_decision_columns)
+        self.assertIn("criteria_results_json", policy_decision_columns)
+        self.assertIn("feature_snapshot_json", policy_decision_columns)
+        self.assertIn("execution_candidate", policy_decision_columns)
+        self.assertIn("request_id", policy_decision_columns)
+
+        self.assertIn("activation_id", policy_activation_columns)
+        self.assertIn("policy_id", policy_activation_columns)
+        self.assertIn("policy_name", policy_activation_columns)
+        self.assertIn("policy_version", policy_activation_columns)
+        self.assertIn("mode", policy_activation_columns)
+        self.assertIn("effective_from_ts_utc", policy_activation_columns)
+        self.assertIn("effective_to_ts_utc", policy_activation_columns)
+
+    def test_init_db_creates_policy_indexes(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            index_names = {
+                row["name"]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index'"
+                ).fetchall()
+            }
+        finally:
+            conn.close()
+
+        self.assertIn("idx_policy_definitions_name_version", index_names)
+        self.assertIn("idx_policy_decisions_alert_name_version", index_names)
+        self.assertIn("idx_policy_activation_history_active_lookup", index_names)
+
+    def test_init_db_is_idempotent_for_policy_schema(self) -> None:
+        init_db(self.db_path)
+        init_db(self.db_path)
+
+        conn = get_connection(self.db_path)
+        try:
+            table_names = {
+                row["name"]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+        finally:
+            conn.close()
+
+        self.assertIn("policy_definitions", table_names)
+        self.assertIn("policy_decisions", table_names)
+        self.assertIn("policy_activation_history", table_names)
+
+    def test_policy_definitions_name_version_unique_index_enforces_one_version_row(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            conn.execute(
+                """
+                INSERT INTO policy_definitions (
+                    policy_id,
+                    policy_name,
+                    policy_version,
+                    policy_hash,
+                    status,
+                    config_json,
+                    description,
+                    created_ts_utc
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "policy-1",
+                    "execution_policy",
+                    "1.0.0",
+                    "hash-1",
+                    "SHADOW_ONLY",
+                    "{}",
+                    None,
+                    utc_now_iso(),
+                ),
+            )
+            conn.commit()
+
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    """
+                    INSERT INTO policy_definitions (
+                        policy_id,
+                        policy_name,
+                        policy_version,
+                        policy_hash,
+                        status,
+                        config_json,
+                        description,
+                        created_ts_utc
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "policy-2",
+                        "execution_policy",
+                        "1.0.0",
+                        "hash-2",
+                        "ACTIVE",
+                        "{}",
+                        None,
+                        utc_now_iso(),
+                    ),
+                )
+        finally:
+            conn.close()
+
+    def test_policy_decisions_alert_name_version_unique_index_enforces_one_decision(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            conn.execute(
+                """
+                INSERT INTO policy_definitions (
+                    policy_id,
+                    policy_name,
+                    policy_version,
+                    policy_hash,
+                    status,
+                    config_json,
+                    description,
+                    created_ts_utc
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "policy-1",
+                    "execution_policy",
+                    "1.0.0",
+                    "hash-1",
+                    "SHADOW_ONLY",
+                    "{}",
+                    None,
+                    utc_now_iso(),
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO policy_decisions (
+                    policy_decision_id,
+                    alert_id,
+                    policy_id,
+                    policy_name,
+                    policy_version,
+                    policy_hash,
+                    mode,
+                    decision,
+                    decision_ts_utc,
+                    decision_reasons_json,
+                    criteria_results_json,
+                    feature_snapshot_json,
+                    execution_candidate,
+                    request_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "decision-1",
+                    "alert-1",
+                    "policy-1",
+                    "execution_policy",
+                    "1.0.0",
+                    "hash-1",
+                    "SHADOW",
+                    "ALLOW",
+                    utc_now_iso(),
+                    "[]",
+                    "{}",
+                    "{}",
+                    1,
+                    None,
+                ),
+            )
+            conn.commit()
+
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    """
+                    INSERT INTO policy_decisions (
+                        policy_decision_id,
+                        alert_id,
+                        policy_id,
+                        policy_name,
+                        policy_version,
+                        policy_hash,
+                        mode,
+                        decision,
+                        decision_ts_utc,
+                        decision_reasons_json,
+                        criteria_results_json,
+                        feature_snapshot_json,
+                        execution_candidate,
+                        request_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "decision-2",
+                        "alert-1",
+                        "policy-1",
+                        "execution_policy",
+                        "1.0.0",
+                        "hash-1",
+                        "SHADOW",
+                        "BLOCK",
+                        utc_now_iso(),
+                        "[]",
+                        "{}",
+                        "{}",
+                        0,
+                        None,
+                    ),
+                )
+        finally:
+            conn.close()
 
     def test_normalize_broker_order_status_maps_expected_values(self) -> None:
         self.assertEqual("SUBMITTED", normalize_broker_order_status("submitted"))

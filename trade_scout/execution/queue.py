@@ -232,6 +232,57 @@ def init_db(db_path: str) -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS policy_definitions (
+                policy_id TEXT PRIMARY KEY,
+                policy_name TEXT NOT NULL,
+                policy_version TEXT NOT NULL,
+                policy_hash TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (
+                    status IN ('DRAFT', 'ACTIVE', 'SHADOW_ONLY', 'RETIRED')
+                ),
+                config_json TEXT NOT NULL,
+                description TEXT,
+                created_ts_utc TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS policy_decisions (
+                policy_decision_id TEXT PRIMARY KEY,
+                alert_id TEXT NOT NULL,
+                policy_id TEXT NOT NULL,
+                policy_name TEXT NOT NULL,
+                policy_version TEXT NOT NULL,
+                policy_hash TEXT NOT NULL,
+                mode TEXT NOT NULL CHECK (mode IN ('SHADOW', 'ENFORCED')),
+                decision TEXT NOT NULL CHECK (decision IN ('ALLOW', 'BLOCK')),
+                decision_ts_utc TEXT NOT NULL,
+                decision_reasons_json TEXT NOT NULL,
+                criteria_results_json TEXT NOT NULL,
+                feature_snapshot_json TEXT NOT NULL,
+                execution_candidate INTEGER NOT NULL CHECK (execution_candidate IN (0, 1)),
+                request_id TEXT,
+                FOREIGN KEY(policy_id) REFERENCES policy_definitions(policy_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS policy_activation_history (
+                activation_id TEXT PRIMARY KEY,
+                policy_id TEXT NOT NULL,
+                policy_name TEXT NOT NULL,
+                policy_version TEXT NOT NULL,
+                mode TEXT NOT NULL CHECK (mode IN ('SHADOW', 'ENFORCED')),
+                effective_from_ts_utc TEXT NOT NULL,
+                effective_to_ts_utc TEXT,
+                FOREIGN KEY(policy_id) REFERENCES policy_definitions(policy_id)
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_exec_req_status
             ON execution_requests (status)
             """
@@ -294,6 +345,28 @@ def init_db(db_path: str) -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_paper_positions_action_status
             ON paper_positions (position_status, pending_action_status)
+            """
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_policy_definitions_name_version
+            ON policy_definitions (policy_name, policy_version)
+            """
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_policy_decisions_alert_name_version
+            ON policy_decisions (alert_id, policy_name, policy_version)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_policy_activation_history_active_lookup
+            ON policy_activation_history (
+                policy_name,
+                effective_from_ts_utc,
+                effective_to_ts_utc
+            )
             """
         )
         conn.execute(
