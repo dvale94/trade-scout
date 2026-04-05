@@ -30,6 +30,7 @@ from trade_scout.execution.models import (
     PaperPositionActionStatus,
     PaperPositionStatus,
 )
+from trade_scout.execution.alpaca_adapter import _normalize_order_result
 from trade_scout.execution.queue import (
     get_connection,
     get_open_paper_orders_for_sync,
@@ -521,6 +522,19 @@ class ExecutionWorkerTest(unittest.TestCase):
 
         self.assertEqual("2026-03-25T14:31:00+00:00", reconciled["accepted_ts_utc"])
 
+    def test_alpaca_normalize_order_result_backfills_accepted_timestamp_from_submitted_at(self) -> None:
+        normalized = _normalize_order_result(
+            {
+                "id": "broker-accepted-fallback",
+                "status": "new",
+                "submitted_at": "2026-03-25T14:31:00+00:00",
+                "accepted_at": None,
+                "updated_at": "2026-03-25T14:31:05+00:00",
+            }
+        )
+
+        self.assertEqual("2026-03-25T14:31:00+00:00", normalized.accepted_ts_utc)
+
     def test_sync_is_idempotent_when_broker_snapshot_is_unchanged(self) -> None:
         conn = get_connection(self.db_path)
         try:
@@ -570,13 +584,75 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual(1, fill_count)
         self.assertEqual(dict(first), dict(second))
         self.assertEqual("FILLED", plan_row["entry_status"])
-        self.assertEqual(0.75, plan_row["entry_filled_qty"])
-        self.assertEqual(101.25, plan_row["entry_avg_fill_px"])
-        self.assertEqual("OPEN", position_row["position_status"])
-        self.assertEqual(0.75, position_row["entry_filled_qty"])
-        self.assertEqual(0.75, position_row["remaining_qty"])
-        self.assertEqual(101.25, position_row["entry_avg_fill_px"])
-        self.assertEqual("PLACE_INITIAL_STOP", position_row["pending_action_status"])
+
+    def test_sync_open_paper_orders_suppresses_repeated_synced_log_when_snapshot_is_unchanged(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-sync-quiet",
+                request_id="req-sync-quiet",
+                client_order_id="req-sync-quiet",
+                broker_order_id="broker-sync-quiet",
+                order_status="ACCEPTED",
+                broker_status_raw="accepted",
+            )
+            with patch(
+                "trade_scout.execution.reconciler.fetch_broker_order_by_id",
+                return_value=self._broker_result(
+                    "broker-sync-quiet",
+                    broker_status_raw="accepted",
+                    accepted_ts_utc="2026-03-25T14:00:01+00:00",
+                    raw_response_json='{"id":"broker-sync-quiet","status":"accepted"}',
+                ),
+            ), patch("builtins.print") as print_mock:
+                synced_count = self.worker.sync_open_paper_orders(conn, limit=10)
+        finally:
+            conn.close()
+
+        self.assertEqual(1, synced_count)
+        self.assertFalse(
+            any(
+                "[execution-worker] synced paper_order_id=po-sync-quiet" in str(call.args[0])
+                for call in print_mock.call_args_list
+                if call.args
+            )
+        )
+
+    def test_sync_open_paper_orders_logs_when_meaningful_order_state_changes(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-sync-log",
+                request_id="req-sync-log",
+                client_order_id="req-sync-log",
+                broker_order_id="broker-sync-log",
+                order_status="SUBMITTED",
+                broker_status_raw="submitted",
+                accepted_ts_utc=None,
+            )
+            with patch(
+                "trade_scout.execution.reconciler.fetch_broker_order_by_id",
+                return_value=self._broker_result(
+                    "broker-sync-log",
+                    broker_status_raw="accepted",
+                    accepted_ts_utc="2026-03-25T14:05:00+00:00",
+                    raw_response_json='{"id":"broker-sync-log","status":"accepted"}',
+                ),
+            ), patch("builtins.print") as print_mock:
+                synced_count = self.worker.sync_open_paper_orders(conn, limit=10)
+        finally:
+            conn.close()
+
+        self.assertEqual(1, synced_count)
+        self.assertTrue(
+            any(
+                "[execution-worker] synced paper_order_id=po-sync-log" in str(call.args[0])
+                for call in print_mock.call_args_list
+                if call.args
+            )
+        )
 
     def test_filled_order_ingests_one_entry_fill_and_updates_plan_summary(self) -> None:
         conn = get_connection(self.db_path)

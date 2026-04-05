@@ -63,11 +63,36 @@ def _parse_optional_float(value: Any) -> float | None:
     return float(value)
 
 
+def _parse_optional_timestamp(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() == "none":
+        return None
+    return text
+
+
 def _normalize_order_result(response_json: Mapping[str, Any]) -> BrokerOrderResult:
     broker_order_id = str(response_json.get("id", "")).strip()
-    submitted_ts_utc = str(response_json.get("submitted_at", "")).strip() or utc_now_iso()
-    accepted_ts_utc = str(response_json.get("accepted_at", "")).strip() or None
-    broker_status_raw = str(response_json.get("status", "")).strip() or None
+    broker_status_raw = _parse_optional_timestamp(response_json.get("status"))
+    submitted_ts_utc = (
+        _parse_optional_timestamp(response_json.get("submitted_at"))
+        or _parse_optional_timestamp(response_json.get("created_at"))
+        or utc_now_iso()
+    )
+    accepted_ts_utc = _parse_optional_timestamp(response_json.get("accepted_at"))
+    normalized_status = str(broker_status_raw or "").strip().lower()
+    if accepted_ts_utc is None and normalized_status in {
+        "new",
+        "accepted",
+        "pending_replace",
+        "accepted_for_bidding",
+    }:
+        accepted_ts_utc = (
+            _parse_optional_timestamp(response_json.get("submitted_at"))
+            or _parse_optional_timestamp(response_json.get("created_at"))
+            or None
+        )
     if not broker_order_id:
         raise RuntimeError("Alpaca order payload did not include broker order id")
 
@@ -78,15 +103,15 @@ def _normalize_order_result(response_json: Mapping[str, Any]) -> BrokerOrderResu
         raw_response_json=json.dumps(response_json, sort_keys=True),
         broker_status_raw=broker_status_raw,
         accepted_ts_utc=accepted_ts_utc,
-        canceled_ts_utc=str(response_json.get("canceled_at", "")).strip() or None,
-        expired_ts_utc=str(response_json.get("expired_at", "")).strip() or None,
-        rejected_ts_utc=str(response_json.get("failed_at", "")).strip() or None,
-        filled_ts_utc=str(response_json.get("filled_at", "")).strip() or None,
+        canceled_ts_utc=_parse_optional_timestamp(response_json.get("canceled_at")),
+        expired_ts_utc=_parse_optional_timestamp(response_json.get("expired_at")),
+        rejected_ts_utc=_parse_optional_timestamp(response_json.get("failed_at")),
+        filled_ts_utc=_parse_optional_timestamp(response_json.get("filled_at")),
         filled_qty=_parse_optional_float(response_json.get("filled_qty")),
         filled_avg_price=_parse_optional_float(response_json.get("filled_avg_price")),
-        status_reason=str(response_json.get("fail_reason", "")).strip() or None,
+        status_reason=_parse_optional_timestamp(response_json.get("fail_reason")),
         last_broker_update_ts_utc=(
-            str(response_json.get("updated_at", "")).strip()
+            _parse_optional_timestamp(response_json.get("updated_at"))
             or accepted_ts_utc
             or submitted_ts_utc
         ),
