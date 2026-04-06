@@ -11,6 +11,7 @@ load_dotenv()
 
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
 DUCKDB_PATH = Path(os.getenv("DUCKDB_PATH", LOG_DIR / "research.duckdb"))
+EXECUTION_DB_PATH = Path(os.getenv("EXECUTION_DB_PATH", "./execution.db"))
 
 R2_ENDPOINT_URL = os.getenv("R2_ENDPOINT_URL", "").strip()
 R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "").strip()
@@ -57,6 +58,8 @@ def list_latest_objects(client) -> list[dict]:
 def target_path_for_filename(filename: str) -> Path:
     if filename == "research.duckdb":
         return DUCKDB_PATH
+    if filename == "execution.db":
+        return EXECUTION_DB_PATH
     return LOG_DIR / filename
 
 

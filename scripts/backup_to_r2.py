@@ -4,7 +4,10 @@ import argparse
 import hashlib
 import json
 import os
+import sqlite3
+import tempfile
 from datetime import datetime, timezone
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable
 
@@ -15,6 +18,7 @@ load_dotenv()
 
 LOG_DIR = Path(os.getenv("LOG_DIR", "logs"))
 DUCKDB_PATH = Path(os.getenv("DUCKDB_PATH", LOG_DIR / "research.duckdb"))
+EXECUTION_DB_PATH = Path(os.getenv("EXECUTION_DB_PATH", "./execution.db"))
 BACKUP_STATE_DIR = Path(os.getenv("BACKUP_STATE_DIR", LOG_DIR / "backups"))
 
 R2_ENDPOINT_URL = os.getenv("R2_ENDPOINT_URL", "").strip()
@@ -39,7 +43,31 @@ def iter_backup_files() -> list[Path]:
         files.extend(sorted(LOG_DIR.glob("*.json")))
     if DUCKDB_PATH.exists():
         files.append(DUCKDB_PATH)
+    if EXECUTION_DB_PATH.exists():
+        files.append(EXECUTION_DB_PATH)
     return [p for p in files if p.exists() and p.is_file()]
+
+
+@contextmanager
+def backup_file_source(path: Path):
+    if path != EXECUTION_DB_PATH:
+        yield path
+        return
+
+    with tempfile.TemporaryDirectory(prefix="trade-scout-execution-backup-") as temp_dir:
+        snapshot_path = Path(temp_dir) / "execution.db"
+        source_conn = sqlite3.connect(str(EXECUTION_DB_PATH))
+        try:
+            dest_conn = sqlite3.connect(str(snapshot_path))
+            try:
+                source_conn.backup(dest_conn)
+            finally:
+                dest_conn.close()
+        finally:
+            source_conn.close()
+
+        print(f"created execution db snapshot {snapshot_path}")
+        yield snapshot_path
 
 
 def require_r2_env() -> None:
@@ -81,17 +109,18 @@ def upload_snapshot(client, prefix: str, files: Iterable[Path]) -> list[dict]:
     uploaded: list[dict] = []
 
     for path in files:
-        key = f"{prefix}/{path.name}"
-        client.upload_file(str(path), R2_BUCKET, key)
+        with backup_file_source(path) as source_path:
+            key = f"{prefix}/{source_path.name}"
+            client.upload_file(str(source_path), R2_BUCKET, key)
 
-        meta = {
-            "name": path.name,
-            "size": path.stat().st_size,
-            "sha256": sha256_of_file(path),
-            "r2_key": key,
-        }
-        uploaded.append(meta)
-        print(f"uploaded {path} -> s3://{R2_BUCKET}/{key}")
+            meta = {
+                "name": source_path.name,
+                "size": source_path.stat().st_size,
+                "sha256": sha256_of_file(source_path),
+                "r2_key": key,
+            }
+            uploaded.append(meta)
+            print(f"uploaded {source_path} -> s3://{R2_BUCKET}/{key}")
 
     return uploaded
 
