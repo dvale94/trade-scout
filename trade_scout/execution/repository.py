@@ -332,6 +332,23 @@ class ExecutionRepository:
             closed_ts_utc=closed_ts_utc,
         )
 
+    def apply_stop_fill_to_position(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        plan_id: str,
+        stop_filled_qty: float,
+        stop_order_terminal: bool,
+        closed_ts_utc: str | None = None,
+    ) -> sqlite3.Row | None:
+        return queue.apply_stop_fill_to_position(
+            conn,
+            plan_id=plan_id,
+            stop_filled_qty=stop_filled_qty,
+            stop_order_terminal=stop_order_terminal,
+            closed_ts_utc=closed_ts_utc,
+        )
+
     def record_paper_position_trigger(
         self,
         conn: sqlite3.Connection,

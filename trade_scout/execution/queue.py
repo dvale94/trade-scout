@@ -1649,6 +1649,71 @@ def apply_tp2_fill_to_position(
     return get_paper_position_by_plan_id(conn, plan_id)
 
 
+def apply_stop_fill_to_position(
+    conn: sqlite3.Connection,
+    *,
+    plan_id: str,
+    stop_filled_qty: float,
+    stop_order_terminal: bool,
+    closed_ts_utc: str | None = None,
+) -> sqlite3.Row | None:
+    position_row = get_paper_position_by_plan_id(conn, plan_id)
+    if position_row is None:
+        return None
+
+    entry_filled_qty = float(position_row["entry_filled_qty"] or 0.0)
+    tp1_filled_qty = float(position_row["tp1_filled_qty"] or 0.0)
+    tp2_filled_qty = float(position_row["tp2_filled_qty"] or 0.0)
+    current_remaining_qty = max(
+        0.0,
+        round(entry_filled_qty - tp1_filled_qty - tp2_filled_qty, 8),
+    )
+    bounded_stop_filled_qty = max(0.0, min(stop_filled_qty, current_remaining_qty))
+    recomputed_remaining_qty = current_remaining_qty
+
+    current_status = str(position_row["position_status"])
+    next_status = current_status
+    next_pending_action_status = str(position_row["pending_action_status"])
+    next_active_stop_paper_order_id = position_row["active_stop_paper_order_id"]
+    next_closed_ts_utc = position_row["closed_ts_utc"]
+
+    if stop_order_terminal:
+        next_active_stop_paper_order_id = None
+
+    if stop_order_terminal and bounded_stop_filled_qty <= 0:
+        next_pending_action_status = PaperPositionActionStatus.NONE.value
+
+    if stop_order_terminal and bounded_stop_filled_qty > 0:
+        recomputed_remaining_qty = 0.0
+        next_status = PaperPositionStatus.CLOSED.value
+        next_pending_action_status = PaperPositionActionStatus.NONE.value
+        next_closed_ts_utc = next_closed_ts_utc or closed_ts_utc or utc_now_iso()
+
+    conn.execute(
+        """
+        UPDATE paper_positions
+        SET remaining_qty = ?,
+            position_status = ?,
+            pending_action_status = ?,
+            active_stop_paper_order_id = ?,
+            closed_ts_utc = ?,
+            updated_ts_utc = ?
+        WHERE plan_id = ?
+        """,
+        (
+            recomputed_remaining_qty,
+            next_status,
+            next_pending_action_status,
+            next_active_stop_paper_order_id,
+            next_closed_ts_utc,
+            utc_now_iso(),
+            plan_id,
+        ),
+    )
+    conn.commit()
+    return get_paper_position_by_plan_id(conn, plan_id)
+
+
 def record_paper_position_trigger(
     conn: sqlite3.Connection,
     *,

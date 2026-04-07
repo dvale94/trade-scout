@@ -100,6 +100,7 @@ class ExecutionReconciler:
         if reconciled is None:
             raise RuntimeError("paper order reconcile did not persist")
         self.ingest_entry_fill_if_present(conn, reconciled, broker_snapshot)
+        self.apply_stop_fill_progress_if_present(conn, reconciled, broker_snapshot)
         self.apply_tp1_fill_progress_if_present(conn, reconciled, broker_snapshot)
         self.apply_tp2_fill_progress_if_present(conn, reconciled, broker_snapshot)
         return reconciled
@@ -161,6 +162,42 @@ class ExecutionReconciler:
             conn,
             plan_id=plan_id,
             pending_action_status=PaperPositionActionStatus.PLACE_INITIAL_STOP.value,
+        )
+
+    def apply_stop_fill_progress_if_present(self, conn, paper_order_row, broker_snapshot) -> None:
+        if str(paper_order_row["order_role"]) != PaperOrderRole.STOP.value:
+            return
+
+        self.repository.upsert_paper_fill_from_broker_snapshot(
+            conn,
+            paper_order_row=paper_order_row,
+            broker_snapshot=broker_snapshot,
+            fill_role=PaperFillRole.STOP.value,
+        )
+
+        stop_filled_qty = broker_snapshot.filled_qty
+        if stop_filled_qty is None:
+            return
+
+        stop_order_terminal = str(paper_order_row["order_status"]) in {
+            PaperOrderStatus.FILLED.value,
+            PaperOrderStatus.CANCELED.value,
+            PaperOrderStatus.REJECTED.value,
+            PaperOrderStatus.EXPIRED.value,
+        }
+        position_row = self.repository.apply_stop_fill_to_position(
+            conn,
+            plan_id=str(paper_order_row["plan_id"]),
+            stop_filled_qty=float(stop_filled_qty),
+            stop_order_terminal=stop_order_terminal,
+            closed_ts_utc=self._coerce_optional_str(broker_snapshot.filled_ts_utc),
+        )
+        if position_row is None:
+            return
+
+        print(
+            f"[execution-worker] reconciled stop fill plan_id={paper_order_row['plan_id']} "
+            f"remaining_qty={position_row['remaining_qty']} position_status={position_row['position_status']}"
         )
 
     def apply_tp1_fill_progress_if_present(self, conn, paper_order_row, broker_snapshot) -> None:
