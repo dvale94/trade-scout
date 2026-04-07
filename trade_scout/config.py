@@ -30,6 +30,13 @@ def _float_env(name: str, default: str) -> float:
     except ValueError as exc:
         raise ValueError(f"{name} must be a valid float") from exc
 
+
+def _auto_execution_mode_env(name: str, default: str = "OFF") -> str:
+    raw = os.getenv(name, default).strip().upper()
+    if raw not in {"OFF", "FILTERED", "ALL"}:
+        return "OFF"
+    return raw
+
 # Which market are we running?
 MARKET_TYPE = os.getenv("MARKET_TYPE", "crypto").strip().lower()  # crypto | stocks
 
@@ -61,6 +68,8 @@ EXECUTION_MAX_ALERT_AGE_SECONDS = int(os.getenv("EXECUTION_MAX_ALERT_AGE_SECONDS
 EXECUTION_BATCH_SIZE = int(os.getenv("EXECUTION_BATCH_SIZE", "10").strip())
 EXECUTION_WORKER_ID = os.getenv("EXECUTION_WORKER_ID", "execution-worker-1").strip()
 EXECUTION_ORDER_NOTIONAL = _float_env("EXECUTION_ORDER_NOTIONAL", "25")
+AUTO_EXECUTION_MODE = _auto_execution_mode_env("AUTO_EXECUTION_MODE")
+AUTO_EXECUTION_SYMBOLS = {symbol.upper() for symbol in _csv_env("AUTO_EXECUTION_SYMBOLS")}
 
 # Strategy loading
 ENABLED_STRATEGY_IDS = _csv_env("ENABLED_STRATEGY_IDS") or ["long_breakout_continuation"]

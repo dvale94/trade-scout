@@ -20,6 +20,8 @@ from .policy.repository import PolicyRepository
 from .runtime_context import EnabledStrategy, RuntimeContext
 from .strategies.types import SetupCandidate
 from .strategy import Candidate
+from .execution.models import ExecutionRequest, ExecutionStatus
+from .execution.queue import ActiveExecutionRequestExistsError, get_connection, insert_request, utc_now_iso
 
 POLICY_NAME = "execution_policy"
 
@@ -81,6 +83,7 @@ class AlertPipeline:
     ):
         self.context = context
         self.policy_repository = policy_repository or PolicyRepository(config.EXECUTION_DB_PATH)
+        self.execution_db_path = getattr(self.policy_repository, "db_path", config.EXECUTION_DB_PATH)
         self.policy_name = policy_name
         self._policy_runtime_ready = False
         try:
@@ -165,6 +168,57 @@ class AlertPipeline:
         print(
             f"[policy] error alert_id={alert_id} stage={stage} "
             f"policy_name={self.policy_name} mode=SHADOW error={error}"
+        )
+
+    def _should_auto_create_execution_request(self, *, symbol: str) -> bool:
+        mode = _normalized_auto_execution_mode(config.AUTO_EXECUTION_MODE)
+        normalized_symbol = _normalized_symbol(symbol)
+        if mode == "OFF":
+            return False
+        if mode == "ALL":
+            return True
+        return normalized_symbol in _normalized_symbol_set(config.AUTO_EXECUTION_SYMBOLS)
+
+    def _process_auto_execution(self, *, alert_id: str, symbol: str) -> None:
+        mode = _normalized_auto_execution_mode(config.AUTO_EXECUTION_MODE)
+        if not self._should_auto_create_execution_request(symbol=symbol):
+            return
+
+        try:
+            conn = get_connection(self.execution_db_path)
+        except Exception as exc:
+            print(
+                f"[execution-auto] error alert_id={alert_id} symbol={symbol} "
+                f"mode={mode} stage=get_connection error={exc}"
+            )
+            return
+
+        try:
+            try:
+                insert_request(
+                    conn,
+                    ExecutionRequest(
+                        request_id=str(uuid4()),
+                        alert_id=alert_id,
+                        requested_ts_utc=utc_now_iso(),
+                        status=ExecutionStatus.PENDING,
+                        requested_by="auto_execution",
+                        reason=f"AUTO_EXECUTION_{mode}",
+                    ),
+                )
+            except ActiveExecutionRequestExistsError:
+                return
+        except Exception as exc:
+            print(
+                f"[execution-auto] error alert_id={alert_id} symbol={symbol} "
+                f"mode={mode} stage=insert_request error={exc}"
+            )
+            return
+        finally:
+            conn.close()
+
+        print(
+            f"[execution-auto] inserted alert_id={alert_id} symbol={symbol} mode={mode}"
         )
 
     def process(
@@ -285,6 +339,11 @@ class AlertPipeline:
             )
             self._log_intent_and_context(symbol, intent_row, alert_context_row)
 
+            self._process_auto_execution(
+                alert_id=str(candidate.alert_id),
+                symbol=symbol,
+            )
+
             self.context.watch_mgr.add(
                 watch.Watch(
                     alert_id=candidate.alert_id,
@@ -341,3 +400,22 @@ def _policy_config_from_definition_row(policy_definition_row) -> PolicyConfig:
         description=str(description),
         filters=dict(raw_filters),
     )
+
+
+def _normalized_auto_execution_mode(value: object) -> str:
+    normalized = str(value or "").strip().upper()
+    if normalized in {"OFF", "FILTERED", "ALL"}:
+        return normalized
+    return "OFF"
+
+
+def _normalized_symbol(value: object) -> str:
+    return str(value or "").strip().upper()
+
+
+def _normalized_symbol_set(values: object) -> set[str]:
+    if isinstance(values, set):
+        return {_normalized_symbol(value) for value in values if _normalized_symbol(value)}
+    if isinstance(values, (list, tuple)):
+        return {_normalized_symbol(value) for value in values if _normalized_symbol(value)}
+    return set()
