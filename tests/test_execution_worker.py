@@ -1375,6 +1375,179 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual(PaperPositionActionStatus.NONE.value, position_row["pending_action_status"])
         self.assertIsNone(position_row["last_action_error"])
 
+    def test_initial_stop_submission_normalizes_crypto_qty_downward(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-stop-qty-norm", stop_px=94.5)
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET position_status = ?, remaining_qty = ?, entry_filled_qty = ?, pending_action_status = ?,
+                    entry_order_id = ?, entry_client_order_id = ?
+                WHERE request_id = ?
+                """,
+                (
+                    "OPEN",
+                    0.0115892179,
+                    0.0115892179,
+                    "PLACE_INITIAL_STOP",
+                    "po-entry-stop-qty-norm",
+                    "req-stop-qty-norm",
+                    "req-stop-qty-norm",
+                ),
+            )
+            conn.commit()
+
+            with patch(
+                "trade_scout.execution.service.find_existing_broker_order_by_client_order_id",
+                return_value=None,
+            ), patch(
+                "trade_scout.execution.service.submit_protective_stop_order",
+                return_value=self._broker_result("broker-stop-qty-norm", broker_status_raw="new"),
+            ) as submit_stop_mock:
+                processed = self.worker.service.process_position_actions(conn, limit=10)
+
+            stop_order = conn.execute(
+                "SELECT * FROM paper_orders WHERE request_id = ? AND order_role = ?",
+                ("req-stop-qty-norm", "STOP"),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(1, processed)
+        self.assertEqual(0.01158921, submit_stop_mock.call_args.kwargs["qty"])
+        self.assertEqual(0.01158921, stop_order["qty"])
+
+    def test_initial_stop_insufficient_balance_retries_once_with_available_qty(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-stop-qty-retry", stop_px=94.5)
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET position_status = ?, remaining_qty = ?, entry_filled_qty = ?, pending_action_status = ?,
+                    entry_order_id = ?, entry_client_order_id = ?
+                WHERE request_id = ?
+                """,
+                (
+                    "OPEN",
+                    0.011589217,
+                    0.011589217,
+                    "PLACE_INITIAL_STOP",
+                    "po-entry-stop-qty-retry",
+                    "req-stop-qty-retry",
+                    "req-stop-qty-retry",
+                ),
+            )
+            conn.commit()
+
+            with patch(
+                "trade_scout.execution.service.find_existing_broker_order_by_client_order_id",
+                return_value=None,
+            ), patch(
+                "trade_scout.execution.service.submit_protective_stop_order",
+                side_effect=[
+                    RuntimeError(
+                        "Alpaca stop submission failed status=403 detail="
+                        '{"message":"insufficient balance for order (requested: 0.011589217, available: 0.011531304)"}'
+                    ),
+                    self._broker_result("broker-stop-qty-retry", broker_status_raw="new"),
+                ],
+            ) as submit_stop_mock:
+                processed = self.worker.service.process_position_actions(conn, limit=10)
+
+            stop_order = conn.execute(
+                "SELECT * FROM paper_orders WHERE request_id = ? AND order_role = ?",
+                ("req-stop-qty-retry", "STOP"),
+            ).fetchone()
+            position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-stop-qty-retry",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(1, processed)
+        self.assertEqual(2, submit_stop_mock.call_count)
+        self.assertEqual(0.01158921, submit_stop_mock.call_args_list[0].kwargs["qty"])
+        self.assertEqual(0.01153130, submit_stop_mock.call_args_list[1].kwargs["qty"])
+        self.assertEqual(0.0115313, stop_order["qty"])
+        self.assertEqual(PaperPositionActionStatus.NONE.value, position_row["pending_action_status"])
+        self.assertIsNone(position_row["last_action_error"])
+
+    def test_initial_stop_deterministic_insufficient_balance_marks_position_error_and_stops_retrying(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-stop-balance-error", stop_px=94.5)
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET position_status = ?, remaining_qty = ?, entry_filled_qty = ?, pending_action_status = ?,
+                    entry_order_id = ?, entry_client_order_id = ?
+                WHERE request_id = ?
+                """,
+                (
+                    "OPEN",
+                    0.011589217,
+                    0.011589217,
+                    "PLACE_INITIAL_STOP",
+                    "po-entry-stop-balance-error",
+                    "req-stop-balance-error",
+                    "req-stop-balance-error",
+                ),
+            )
+            conn.commit()
+
+            with patch(
+                "trade_scout.execution.service.find_existing_broker_order_by_client_order_id",
+                return_value=None,
+            ), patch(
+                "trade_scout.execution.service.submit_protective_stop_order",
+                side_effect=[
+                    RuntimeError(
+                        "Alpaca stop submission failed status=403 detail="
+                        '{"message":"insufficient balance for order (requested: 0.011589217, available: 0.011531304)"}'
+                    ),
+                    RuntimeError(
+                        "Alpaca stop submission failed status=403 detail="
+                        '{"message":"insufficient balance for order (requested: 0.011531300, available: 0.011531304)"}'
+                    ),
+                ],
+            ) as submit_stop_mock:
+                processed = self.worker.service.process_position_actions(conn, limit=10)
+
+            position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-stop-balance-error",),
+            ).fetchone()
+            stop_count = conn.execute(
+                "SELECT COUNT(*) AS n FROM paper_orders WHERE request_id = ? AND order_role = ?",
+                ("req-stop-balance-error", "STOP"),
+            ).fetchone()["n"]
+
+            with patch(
+                "trade_scout.execution.service.submit_protective_stop_order",
+                side_effect=AssertionError("submit_protective_stop_order should not be retried after deterministic rejection"),
+            ):
+                second_processed = self.worker.service.process_position_actions(conn, limit=10)
+
+            second_position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-stop-balance-error",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(1, processed)
+        self.assertEqual(2, submit_stop_mock.call_count)
+        self.assertEqual(PaperPositionStatus.ERROR.value, position_row["position_status"])
+        self.assertEqual(PaperPositionActionStatus.NONE.value, position_row["pending_action_status"])
+        self.assertIn("initial stop rejected: insufficient balance", position_row["last_action_error"])
+        self.assertEqual(0, stop_count)
+        self.assertEqual(0, second_processed)
+        self.assertEqual(PaperPositionStatus.ERROR.value, second_position_row["position_status"])
+        self.assertEqual(PaperPositionActionStatus.NONE.value, second_position_row["pending_action_status"])
+
     def test_process_position_actions_is_idempotent_for_existing_local_stop(self) -> None:
         conn = get_connection(self.db_path)
         try:
@@ -1529,6 +1702,188 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual("PARTIAL", position_row["position_status"])
         self.assertEqual(PaperPositionActionStatus.NONE.value, position_row["pending_action_status"])
         self.assertIsNone(position_row["last_action_error"])
+
+    def test_rearmed_stop_submission_normalizes_crypto_qty_downward(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-stop-rearm-qty-norm", stop_px=91.5)
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET position_status = ?, remaining_qty = ?, entry_filled_qty = ?, tp1_filled_qty = ?,
+                    pending_action_status = ?, stop_qty = ?, stop_price = ?, stop_limit_price = ?, entry_order_id = ?
+                WHERE request_id = ?
+                """,
+                (
+                    "PARTIAL",
+                    0.0115892179,
+                    0.0231784358,
+                    0.0115892179,
+                    "REARM_STOP_AFTER_TP1",
+                    0.0231784358,
+                    91.5,
+                    91.5,
+                    "po-entry-rearm-qty-norm",
+                    "req-stop-rearm-qty-norm",
+                ),
+            )
+            conn.commit()
+
+            with patch(
+                "trade_scout.execution.service.find_existing_broker_order_by_client_order_id",
+                return_value=None,
+            ), patch(
+                "trade_scout.execution.service.submit_protective_stop_order",
+                return_value=self._broker_result("broker-stop-rearm-qty-norm", broker_status_raw="new"),
+            ) as submit_stop_mock:
+                processed = self.worker.service.process_position_actions(conn, limit=10)
+
+            stop_order = conn.execute(
+                "SELECT * FROM paper_orders WHERE request_id = ? AND order_role = ?",
+                ("req-stop-rearm-qty-norm", "STOP"),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(1, processed)
+        self.assertEqual(0.01158921, submit_stop_mock.call_args.kwargs["qty"])
+        self.assertEqual(0.01158921, stop_order["qty"])
+
+    def test_rearmed_stop_insufficient_balance_retries_once_with_available_qty(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-stop-rearm-qty-retry", stop_px=91.5)
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET position_status = ?, remaining_qty = ?, entry_filled_qty = ?, tp1_filled_qty = ?,
+                    pending_action_status = ?, stop_qty = ?, stop_price = ?, stop_limit_price = ?, entry_order_id = ?
+                WHERE request_id = ?
+                """,
+                (
+                    "PARTIAL",
+                    0.011589217,
+                    0.023178434,
+                    0.011589217,
+                    "REARM_STOP_AFTER_TP1",
+                    0.023178434,
+                    91.5,
+                    91.5,
+                    "po-entry-rearm-qty-retry",
+                    "req-stop-rearm-qty-retry",
+                ),
+            )
+            conn.commit()
+
+            with patch(
+                "trade_scout.execution.service.find_existing_broker_order_by_client_order_id",
+                return_value=None,
+            ), patch(
+                "trade_scout.execution.service.submit_protective_stop_order",
+                side_effect=[
+                    RuntimeError(
+                        "Alpaca stop submission failed status=403 detail="
+                        '{"message":"insufficient balance for order (requested: 0.011589217, available: 0.011531304)"}'
+                    ),
+                    self._broker_result("broker-stop-rearm-qty-retry", broker_status_raw="new"),
+                ],
+            ) as submit_stop_mock:
+                processed = self.worker.service.process_position_actions(conn, limit=10)
+
+            stop_order = conn.execute(
+                "SELECT * FROM paper_orders WHERE request_id = ? AND order_role = ?",
+                ("req-stop-rearm-qty-retry", "STOP"),
+            ).fetchone()
+            position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-stop-rearm-qty-retry",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(1, processed)
+        self.assertEqual(2, submit_stop_mock.call_count)
+        self.assertEqual(0.01158921, submit_stop_mock.call_args_list[0].kwargs["qty"])
+        self.assertEqual(0.01153130, submit_stop_mock.call_args_list[1].kwargs["qty"])
+        self.assertEqual(0.0115313, stop_order["qty"])
+        self.assertEqual(PaperPositionActionStatus.NONE.value, position_row["pending_action_status"])
+        self.assertIsNone(position_row["last_action_error"])
+
+    def test_rearmed_stop_deterministic_insufficient_balance_marks_position_error_and_stops_retrying(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-stop-rearm-balance-error", stop_px=91.5)
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET position_status = ?, remaining_qty = ?, entry_filled_qty = ?, tp1_filled_qty = ?,
+                    pending_action_status = ?, stop_qty = ?, stop_price = ?, stop_limit_price = ?, entry_order_id = ?
+                WHERE request_id = ?
+                """,
+                (
+                    "PARTIAL",
+                    0.011589217,
+                    0.023178434,
+                    0.011589217,
+                    "REARM_STOP_AFTER_TP1",
+                    0.023178434,
+                    91.5,
+                    91.5,
+                    "po-entry-rearm-balance-error",
+                    "req-stop-rearm-balance-error",
+                ),
+            )
+            conn.commit()
+
+            with patch(
+                "trade_scout.execution.service.find_existing_broker_order_by_client_order_id",
+                return_value=None,
+            ), patch(
+                "trade_scout.execution.service.submit_protective_stop_order",
+                side_effect=[
+                    RuntimeError(
+                        "Alpaca stop submission failed status=403 detail="
+                        '{"message":"insufficient balance for order (requested: 0.011589217, available: 0.011531304)"}'
+                    ),
+                    RuntimeError(
+                        "Alpaca stop submission failed status=403 detail="
+                        '{"message":"insufficient balance for order (requested: 0.011531300, available: 0.011531304)"}'
+                    ),
+                ],
+            ) as submit_stop_mock:
+                processed = self.worker.service.process_position_actions(conn, limit=10)
+
+            position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-stop-rearm-balance-error",),
+            ).fetchone()
+            stop_count = conn.execute(
+                "SELECT COUNT(*) AS n FROM paper_orders WHERE request_id = ? AND order_role = ?",
+                ("req-stop-rearm-balance-error", "STOP"),
+            ).fetchone()["n"]
+
+            with patch(
+                "trade_scout.execution.service.submit_protective_stop_order",
+                side_effect=AssertionError("submit_protective_stop_order should not be retried after deterministic rearmed-stop rejection"),
+            ):
+                second_processed = self.worker.service.process_position_actions(conn, limit=10)
+
+            second_position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-stop-rearm-balance-error",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(1, processed)
+        self.assertEqual(2, submit_stop_mock.call_count)
+        self.assertEqual(PaperPositionStatus.ERROR.value, position_row["position_status"])
+        self.assertEqual(PaperPositionActionStatus.NONE.value, position_row["pending_action_status"])
+        self.assertIn("rearmed stop rejected: insufficient balance", position_row["last_action_error"])
+        self.assertEqual(0, stop_count)
+        self.assertEqual(0, second_processed)
+        self.assertEqual(PaperPositionStatus.ERROR.value, second_position_row["position_status"])
+        self.assertEqual(PaperPositionActionStatus.NONE.value, second_position_row["pending_action_status"])
 
     def test_rearmed_stop_local_reuse_is_idempotent(self) -> None:
         conn = get_connection(self.db_path)

@@ -376,3 +376,16 @@ class ExecutionRepository:
             plan_id=plan_id,
             last_action_error=last_action_error,
         )
+
+    def mark_paper_position_error(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        plan_id: str,
+        last_action_error: str,
+    ) -> sqlite3.Row | None:
+        return queue.mark_paper_position_error(
+            conn,
+            plan_id=plan_id,
+            last_action_error=last_action_error,
+        )
