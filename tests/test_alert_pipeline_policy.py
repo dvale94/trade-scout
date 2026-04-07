@@ -438,3 +438,264 @@ class _PatchBundle(dict):
         for stop in reversed(self._stoppers):
             stop()
         return False
+
+
+class AlertPipelineAutoExecutionIntegrationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.temp_dir.name) / "execution.db")
+        init_db(self.db_path)
+        self.policy_repository = PolicyRepository(self.db_path)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def test_off_mode_does_not_auto_create_execution_request(self) -> None:
+        pipeline, context = self._make_pipeline()
+
+        with self._patch_alert_side_effects() as side_effects, patch(
+            "trade_scout.alert_pipeline.config.AUTO_EXECUTION_MODE",
+            "OFF",
+        ), patch(
+            "trade_scout.alert_pipeline.config.AUTO_EXECUTION_SYMBOLS",
+            {"BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD"},
+        ), patch(
+            "trade_scout.alert_pipeline.uuid4",
+            side_effect=["provisional-1", "alert-1"],
+        ):
+            pipeline.process(**self._process_kwargs(symbol="BTC/USD"))
+
+        conn = get_connection(self.db_path)
+        try:
+            row_count = conn.execute("SELECT COUNT(*) AS n FROM execution_requests").fetchone()["n"]
+        finally:
+            conn.close()
+
+        self.assertEqual(0, row_count)
+        self.assertTrue(side_effects["log_alert"].called)
+        self.assertEqual(1, len(context.watch_mgr.added))
+
+    def test_filtered_mode_auto_creates_requests_for_allowed_symbols_only(self) -> None:
+        allowed_symbols = ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD"]
+
+        for idx, symbol in enumerate(allowed_symbols, start=1):
+            pipeline, _ = self._make_pipeline()
+            with self._patch_alert_side_effects(), patch(
+                "trade_scout.alert_pipeline.config.AUTO_EXECUTION_MODE",
+                "FILTERED",
+            ), patch(
+                "trade_scout.alert_pipeline.config.AUTO_EXECUTION_SYMBOLS",
+                set(allowed_symbols),
+            ), patch(
+                "trade_scout.alert_pipeline.uuid4",
+                side_effect=[f"provisional-{idx}", f"alert-{idx}", f"request-{idx}"],
+            ):
+                pipeline.process(**self._process_kwargs(symbol=symbol))
+
+        pipeline, _ = self._make_pipeline()
+        with self._patch_alert_side_effects(), patch(
+            "trade_scout.alert_pipeline.config.AUTO_EXECUTION_MODE",
+            "FILTERED",
+        ), patch(
+            "trade_scout.alert_pipeline.config.AUTO_EXECUTION_SYMBOLS",
+            set(allowed_symbols),
+        ), patch(
+            "trade_scout.alert_pipeline.uuid4",
+            side_effect=["provisional-non", "alert-non"],
+        ):
+            pipeline.process(**self._process_kwargs(symbol="DOGE/USD"))
+
+        conn = get_connection(self.db_path)
+        try:
+            rows = conn.execute(
+                "SELECT alert_id FROM execution_requests ORDER BY alert_id ASC"
+            ).fetchall()
+        finally:
+            conn.close()
+
+        self.assertEqual(["alert-1", "alert-2", "alert-3", "alert-4"], [row["alert_id"] for row in rows])
+
+    def test_all_mode_auto_creates_request_for_any_symbol(self) -> None:
+        pipeline, _ = self._make_pipeline()
+
+        with self._patch_alert_side_effects(), patch(
+            "trade_scout.alert_pipeline.config.AUTO_EXECUTION_MODE",
+            "ALL",
+        ), patch(
+            "trade_scout.alert_pipeline.config.AUTO_EXECUTION_SYMBOLS",
+            set(),
+        ), patch(
+            "trade_scout.alert_pipeline.uuid4",
+            side_effect=["provisional-1", "alert-1", "request-1"],
+        ):
+            pipeline.process(**self._process_kwargs(symbol="DOGE/USD"))
+
+        conn = get_connection(self.db_path)
+        try:
+            row = conn.execute("SELECT * FROM execution_requests WHERE alert_id = ?", ("alert-1",)).fetchone()
+        finally:
+            conn.close()
+
+        self.assertIsNotNone(row)
+        self.assertEqual("auto_execution", row["requested_by"])
+        self.assertEqual("AUTO_EXECUTION_ALL", row["reason"])
+
+    def test_duplicate_processing_does_not_duplicate_execution_request(self) -> None:
+        pipeline, _ = self._make_pipeline()
+
+        with self._patch_alert_side_effects(), patch(
+            "trade_scout.alert_pipeline.config.AUTO_EXECUTION_MODE",
+            "FILTERED",
+        ), patch(
+            "trade_scout.alert_pipeline.config.AUTO_EXECUTION_SYMBOLS",
+            {"BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD"},
+        ), patch(
+            "trade_scout.alert_pipeline.uuid4",
+            side_effect=["provisional-1", "alert-1", "request-1", "provisional-2", "alert-1", "request-2"],
+        ):
+            pipeline.process(**self._process_kwargs(symbol="BTC/USD"))
+            pipeline.process(**self._process_kwargs(symbol="BTC/USD"))
+
+        conn = get_connection(self.db_path)
+        try:
+            row_count = conn.execute("SELECT COUNT(*) AS n FROM execution_requests").fetchone()["n"]
+        finally:
+            conn.close()
+
+        self.assertEqual(1, row_count)
+
+    def test_auto_execution_log_includes_alert_symbol_and_mode(self) -> None:
+        pipeline, _ = self._make_pipeline()
+
+        with self._patch_alert_side_effects(), patch(
+            "trade_scout.alert_pipeline.config.AUTO_EXECUTION_MODE",
+            "FILTERED",
+        ), patch(
+            "trade_scout.alert_pipeline.config.AUTO_EXECUTION_SYMBOLS",
+            {"BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD"},
+        ), patch(
+            "trade_scout.alert_pipeline.uuid4",
+            side_effect=["provisional-1", "alert-1", "request-1"],
+        ), patch("builtins.print") as print_mock:
+            pipeline.process(**self._process_kwargs(symbol="BTC/USD"))
+
+        self.assertTrue(
+            any(
+                "[execution-auto] inserted alert_id=alert-1 symbol=BTC/USD mode=FILTERED"
+                in str(call.args[0])
+                for call in print_mock.call_args_list
+                if call.args
+            )
+        )
+
+    def test_auto_execution_insert_failure_does_not_break_alert_flow(self) -> None:
+        pipeline, context = self._make_pipeline()
+
+        with self._patch_alert_side_effects() as side_effects, patch(
+            "trade_scout.alert_pipeline.config.AUTO_EXECUTION_MODE",
+            "FILTERED",
+        ), patch(
+            "trade_scout.alert_pipeline.config.AUTO_EXECUTION_SYMBOLS",
+            {"BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD"},
+        ), patch(
+            "trade_scout.alert_pipeline.insert_request",
+            side_effect=sqlite3.OperationalError("execution db boom"),
+        ), patch(
+            "trade_scout.alert_pipeline.uuid4",
+            side_effect=["provisional-1", "alert-1", "request-1"],
+        ), patch("builtins.print") as print_mock:
+            pipeline.process(**self._process_kwargs(symbol="BTC/USD"))
+
+        self.assertTrue(side_effects["notify"].called)
+        self.assertEqual(1, len(context.watch_mgr.added))
+        self.assertTrue(
+            any(
+                "[execution-auto] error alert_id=alert-1 symbol=BTC/USD mode=FILTERED "
+                "stage=insert_request error=execution db boom"
+                in str(call.args[0])
+                for call in print_mock.call_args_list
+                if call.args
+            )
+        )
+
+    def _make_pipeline(self):
+        context = SimpleNamespace(
+            profile=SimpleNamespace(timeframe_min=5, watch_timeout_min=240),
+            config_hash="cfg-123",
+            cooldown=_FakeCooldown(),
+            telemetry=_FakeTelemetry(),
+            watch_mgr=_FakeWatchManager(),
+        )
+        return AlertPipeline(context, policy_repository=self.policy_repository), context
+
+    def _process_kwargs(self, *, symbol: str):
+        strategy = SimpleNamespace(
+            build_trade_plan=lambda symbol, profile, setup_candidate: SimpleNamespace(
+                timeframe_min=profile.timeframe_min,
+                entry_low=100.0,
+                entry_high=101.0,
+                stop_px=95.0,
+                t1_px=110.0,
+                t2_px=115.0,
+                stop_distance=6.0,
+            )
+        )
+        metadata = SimpleNamespace(
+            strategy_id="long_breakout_continuation",
+            strategy_version="1.0.0",
+            setup_family="breakout_continuation",
+            strategy_params_json="{}",
+            strategy_params_hash="params-123",
+        )
+        return {
+            "enabled_strategy": SimpleNamespace(strategy=strategy, metadata=metadata),
+            "symbol": symbol,
+            "now": datetime(2026, 4, 5, 12, 0, tzinfo=timezone.utc),
+            "ts": datetime(2026, 4, 5, 12, 0, tzinfo=timezone.utc),
+            "setup_candidate": SimpleNamespace(
+                score=8.2,
+                reasons=["strong breakout"],
+                tier="A",
+            ),
+            "computed_for_log": {
+                "close": 100.5,
+                "atr": 1.2,
+                "ma20": 99.0,
+                "ma50": 98.0,
+                "ma200": 95.0,
+                "breakout_level": 100.0,
+                "breakout_distance_atr": 0.5,
+                "ma20_distance_atr": 0.4,
+                "ma50_distance_atr": 0.8,
+                "ma200_distance_atr": 1.5,
+                "ma20_slope_pct": 0.2,
+                "ma50_slope_pct": 0.3,
+                "range_pct": 1.0,
+                "close_location_in_bar": 0.9,
+                "anchor_symbol": "SPY",
+                "anchor_regime": "bull",
+                "anchor_close": 500.0,
+                "anchor_ma50": 495.0,
+                "anchor_ma200": 480.0,
+                "vol_z": 0.1,
+                "extended_atr": 0.2,
+            },
+        }
+
+    def _patch_alert_side_effects(self):
+        journal_log_alert = patch("trade_scout.alert_pipeline.journal.log_alert")
+        journal_log_intent = patch("trade_scout.alert_pipeline.journal.log_alert_intent")
+        journal_log_context = patch("trade_scout.alert_pipeline.journal.log_alert_context")
+        discord_notify = patch("trade_scout.alert_pipeline.notifier.discord_notify")
+        return _PatchBundle(
+            log_alert=journal_log_alert.start(),
+            log_intent=journal_log_intent.start(),
+            log_context=journal_log_context.start(),
+            notify=discord_notify.start(),
+            stoppers=[
+                journal_log_alert.stop,
+                journal_log_intent.stop,
+                journal_log_context.stop,
+                discord_notify.stop,
+            ],
+        )
