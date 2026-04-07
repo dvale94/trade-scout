@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+from decimal import Decimal, ROUND_DOWN
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Mapping, Optional
@@ -24,6 +26,12 @@ from trade_scout.execution.repository import ExecutionRepository
 
 
 class ExecutionService:
+    CRYPTO_EXIT_QTY_DECIMALS = 8
+    _INSUFFICIENT_BALANCE_RE = re.compile(
+        r"requested:\s*([0-9.]+)\s*,\s*available:\s*([0-9.]+)",
+        re.IGNORECASE,
+    )
+
     def __init__(
         self,
         *,
@@ -610,6 +618,12 @@ class ExecutionService:
         if stop_price is None or stop_price <= 0:
             raise RuntimeError("paper trade plan stop_px is missing or invalid")
         stop_limit_price = stop_price
+        stop_submission_qty = self._normalize_exit_qty(
+            symbol=str(position_row["symbol"]),
+            qty=remaining_qty,
+        )
+        if stop_submission_qty <= 0:
+            raise RuntimeError("initial stop action requires normalized stop qty > 0")
         stop_client_order_id = self._build_initial_stop_client_order_id(plan_id)
         parent_paper_order_id = str(position_row["entry_order_id"] or "") or None
 
@@ -619,7 +633,7 @@ class ExecutionService:
                 conn,
                 position_row=position_row,
                 stop_order_row=local_stop_order,
-                stop_qty=remaining_qty,
+                stop_qty=self._coerce_float(local_stop_order["qty"]) or stop_submission_qty,
                 stop_price=stop_price,
                 stop_limit_price=stop_limit_price,
                 log_label="initial stop",
@@ -636,7 +650,7 @@ class ExecutionService:
                 client_order_id=stop_client_order_id,
                 symbol=str(position_row["symbol"]),
                 side=str(position_row["side"]),
-                qty=remaining_qty,
+                qty=stop_submission_qty,
                 notional=None,
                 order_type="stop_limit",
                 time_in_force="gtc",
@@ -650,20 +664,24 @@ class ExecutionService:
                 conn,
                 position_row=position_row,
                 stop_order_row=local_stop_order,
-                stop_qty=remaining_qty,
+                stop_qty=stop_submission_qty,
                 stop_price=stop_price,
                 stop_limit_price=stop_limit_price,
                 log_label="initial stop",
             )
 
-        stop_result = self._get_stop_order_submitter()(
+        stop_result, stop_submission_qty = self._submit_initial_stop_order(
+            conn,
+            position_row=position_row,
             client_order_id=stop_client_order_id,
             symbol=str(position_row["symbol"]),
             side=str(position_row["side"]),
-            qty=remaining_qty,
+            qty=stop_submission_qty,
             stop_price=stop_price,
             limit_price=stop_limit_price,
         )
+        if stop_result is None:
+            return self.repository.get_paper_position_by_plan_id(conn, plan_id)
         local_stop_order = self.repository.insert_paper_order(
             conn,
             plan_id=plan_id,
@@ -673,7 +691,7 @@ class ExecutionService:
             client_order_id=stop_client_order_id,
             symbol=str(position_row["symbol"]),
             side=str(position_row["side"]),
-            qty=remaining_qty,
+            qty=stop_submission_qty,
             notional=None,
             order_type="stop_limit",
             time_in_force="gtc",
@@ -691,11 +709,89 @@ class ExecutionService:
             conn,
             position_row=position_row,
             stop_order_row=local_stop_order,
-            stop_qty=remaining_qty,
+            stop_qty=stop_submission_qty,
             stop_price=stop_price,
             stop_limit_price=stop_limit_price,
             log_label="initial stop",
         )
+
+    def _submit_initial_stop_order(
+        self,
+        conn,
+        *,
+        position_row,
+        client_order_id: str,
+        symbol: str,
+        side: str,
+        qty: float,
+        stop_price: float,
+        limit_price: float | None,
+    ) -> tuple[object | None, float]:
+        requested_qty = qty
+        try:
+            return (
+                self._get_stop_order_submitter()(
+                    client_order_id=client_order_id,
+                    symbol=symbol,
+                    side=side,
+                    qty=requested_qty,
+                    stop_price=stop_price,
+                    limit_price=limit_price,
+                ),
+                requested_qty,
+            )
+        except Exception as exc:
+            available_qty = self._extract_available_qty_from_insufficient_balance_error(exc)
+            if available_qty is not None:
+                retry_qty = self._normalize_exit_qty(symbol=symbol, qty=available_qty)
+                if 0 < retry_qty < requested_qty:
+                    try:
+                        return (
+                            self._get_stop_order_submitter()(
+                                client_order_id=client_order_id,
+                                symbol=symbol,
+                                side=side,
+                                qty=retry_qty,
+                                stop_price=stop_price,
+                                limit_price=limit_price,
+                            ),
+                            retry_qty,
+                        )
+                    except Exception as retry_exc:
+                        error_message = self._format_initial_stop_rejection_error(
+                            requested_qty=requested_qty,
+                            available_qty=available_qty,
+                            error=retry_exc,
+                        )
+                        self.repository.mark_paper_position_error(
+                            conn,
+                            plan_id=str(position_row["plan_id"]),
+                            last_action_error=error_message,
+                        )
+                        print(
+                            f"[execution-worker] initial stop rejected plan_id={position_row['plan_id']} "
+                            f"requested_qty={requested_qty} available_qty={available_qty} error={retry_exc}"
+                        )
+                        return None, retry_qty
+
+            if self._is_insufficient_balance_error(exc):
+                error_message = self._format_initial_stop_rejection_error(
+                    requested_qty=requested_qty,
+                    available_qty=available_qty,
+                    error=exc,
+                )
+                self.repository.mark_paper_position_error(
+                    conn,
+                    plan_id=str(position_row["plan_id"]),
+                    last_action_error=error_message,
+                )
+                print(
+                    f"[execution-worker] initial stop rejected plan_id={position_row['plan_id']} "
+                    f"requested_qty={requested_qty} available_qty={available_qty} error={exc}"
+                )
+                return None, requested_qty
+
+            raise
 
     def _finalize_stop_state(
         self,
@@ -1176,6 +1272,44 @@ class ExecutionService:
     @staticmethod
     def _build_rearm_stop_client_order_id(plan_id: str) -> str:
         return f"stop:rearm:tp1:{plan_id}"
+
+    @classmethod
+    def _normalize_exit_qty(cls, *, symbol: str, qty: float) -> float:
+        if config.MARKET_TYPE != "crypto":
+            return qty
+        quant = Decimal("1").scaleb(-cls.CRYPTO_EXIT_QTY_DECIMALS)
+        normalized = Decimal(str(qty)).quantize(quant, rounding=ROUND_DOWN)
+        return float(normalized)
+
+    @classmethod
+    def _is_insufficient_balance_error(cls, error: Exception) -> bool:
+        return "insufficient balance" in str(error).lower()
+
+    @classmethod
+    def _extract_available_qty_from_insufficient_balance_error(cls, error: Exception) -> float | None:
+        if not cls._is_insufficient_balance_error(error):
+            return None
+        match = cls._INSUFFICIENT_BALANCE_RE.search(str(error))
+        if match is None:
+            return None
+        return float(match.group(2))
+
+    @staticmethod
+    def _format_initial_stop_rejection_error(
+        *,
+        requested_qty: float,
+        available_qty: float | None,
+        error: Exception,
+    ) -> str:
+        if available_qty is None:
+            return (
+                "initial stop rejected: insufficient balance "
+                f"requested_qty={requested_qty} error={error}"
+            )
+        return (
+            "initial stop rejected: insufficient balance "
+            f"requested_qty={requested_qty} available_qty={available_qty} error={error}"
+        )
 
     @staticmethod
     def _build_tp1_client_order_id(plan_id: str) -> str:

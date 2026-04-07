@@ -1756,6 +1756,33 @@ def update_paper_position_action_error(
     return get_paper_position_by_plan_id(conn, plan_id)
 
 
+def mark_paper_position_error(
+    conn: sqlite3.Connection,
+    *,
+    plan_id: str,
+    last_action_error: str,
+) -> sqlite3.Row | None:
+    conn.execute(
+        """
+        UPDATE paper_positions
+        SET position_status = ?,
+            pending_action_status = ?,
+            last_action_error = ?,
+            updated_ts_utc = ?
+        WHERE plan_id = ?
+        """,
+        (
+            PaperPositionStatus.ERROR.value,
+            PaperPositionActionStatus.NONE.value,
+            last_action_error,
+            utc_now_iso(),
+            plan_id,
+        ),
+    )
+    conn.commit()
+    return get_paper_position_by_plan_id(conn, plan_id)
+
+
 def update_trade_plan_entry_summary(
     conn: sqlite3.Connection,
     *,
