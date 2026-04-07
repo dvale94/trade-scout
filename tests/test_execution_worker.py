@@ -3243,6 +3243,88 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertIsNone(position_row["active_stop_paper_order_id"])
         self.assertEqual("2026-03-25T19:00:00+00:00", position_row["closed_ts_utc"])
 
+    def test_accepted_stop_with_zero_fill_does_not_trigger_stop_reconciliation(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-stop-accepted")
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-stop-accepted",
+                request_id="req-stop-accepted",
+                client_order_id="stop:plan-req-stop-accepted",
+                broker_order_id="broker-stop-accepted",
+                order_status="ACCEPTED",
+                order_role="STOP",
+                order_type="stop_limit",
+                qty=0.8,
+                notional=None,
+                limit_price=95.0,
+                stop_price=95.0,
+                broker_status_raw="new",
+                side="SHORT",
+                reduce_only=1,
+            )
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET position_status = ?, entry_filled_qty = ?, remaining_qty = ?, pending_action_status = ?,
+                    active_stop_paper_order_id = ?, stop_qty = ?, stop_price = ?, stop_limit_price = ?, opened_ts_utc = ?
+                WHERE request_id = ?
+                """,
+                (
+                    "OPEN",
+                    0.8,
+                    0.8,
+                    "NONE",
+                    "po-stop-accepted",
+                    0.8,
+                    95.0,
+                    95.0,
+                    "2026-03-25T18:55:00+00:00",
+                    "req-stop-accepted",
+                ),
+            )
+            conn.commit()
+            stop_order_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+                ("po-stop-accepted",),
+            ).fetchone()
+
+            with patch("builtins.print") as print_mock:
+                reconciled = self.worker.reconcile_paper_order(
+                    conn,
+                    stop_order_row,
+                    self._broker_result(
+                        "broker-stop-accepted",
+                        broker_status_raw="accepted",
+                        accepted_ts_utc="2026-03-25T19:00:00+00:00",
+                        filled_qty=0.0,
+                        filled_avg_price=None,
+                    ),
+                )
+
+            fill_row = get_paper_fill_by_order_id_and_role(conn, "po-stop-accepted", "STOP")
+            position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-stop-accepted",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual("ACCEPTED", reconciled["order_status"])
+        self.assertIsNone(fill_row)
+        self.assertEqual(0.8, position_row["remaining_qty"])
+        self.assertEqual(PaperPositionStatus.OPEN.value, position_row["position_status"])
+        self.assertEqual("po-stop-accepted", position_row["active_stop_paper_order_id"])
+        self.assertFalse(
+            any(
+                "[execution-worker] reconciled stop fill plan_id=plan-req-stop-accepted"
+                in str(call.args[0])
+                for call in print_mock.call_args_list
+                if call.args
+            )
+        )
+
     def test_tp1_then_rearmed_stop_fill_closes_remaining_position(self) -> None:
         conn = get_connection(self.db_path)
         try:
