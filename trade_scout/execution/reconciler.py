@@ -168,6 +168,17 @@ class ExecutionReconciler:
         if str(paper_order_row["order_role"]) != PaperOrderRole.STOP.value:
             return
 
+        stop_filled_qty = broker_snapshot.filled_qty
+        if stop_filled_qty is None or float(stop_filled_qty) <= 0:
+            return
+
+        stop_order_status = str(paper_order_row["order_status"])
+        if stop_order_status not in {
+            PaperOrderStatus.PARTIALLY_FILLED.value,
+            PaperOrderStatus.FILLED.value,
+        }:
+            return
+
         self.repository.upsert_paper_fill_from_broker_snapshot(
             conn,
             paper_order_row=paper_order_row,
@@ -175,11 +186,7 @@ class ExecutionReconciler:
             fill_role=PaperFillRole.STOP.value,
         )
 
-        stop_filled_qty = broker_snapshot.filled_qty
-        if stop_filled_qty is None:
-            return
-
-        stop_order_terminal = str(paper_order_row["order_status"]) in {
+        stop_order_terminal = stop_order_status in {
             PaperOrderStatus.FILLED.value,
             PaperOrderStatus.CANCELED.value,
             PaperOrderStatus.REJECTED.value,
