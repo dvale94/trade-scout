@@ -1133,7 +1133,7 @@ class ExecutionService:
         if stop_status in {"CANCELED", "REJECTED", "EXPIRED"}:
             return self._advance_to_submit_tp2(conn, position_row)
         if stop_status == "FILLED":
-            raise RuntimeError("cannot advance TP2 submission after stop already filled")
+            return self._resolve_tp2_action_after_stop_filled(conn, position_row)
 
         broker_order_id = self._coerce_optional_str(stop_order_row["broker_order_id"])
         if not broker_order_id:
@@ -1152,6 +1152,31 @@ class ExecutionService:
         raise RuntimeError(
             f"stop cancel did not reach terminal non-filled state order_status={stop_order_row['order_status']}"
         )
+
+    def _resolve_tp2_action_after_stop_filled(self, conn, position_row):
+        plan_id = str(position_row["plan_id"])
+        updated_position = self.repository.update_paper_position_stop_state(
+            conn,
+            plan_id=plan_id,
+            active_stop_paper_order_id=None,
+            stop_qty=self._coerce_float(position_row["stop_qty"]),
+            stop_price=self._coerce_float(position_row["stop_price"]),
+            stop_limit_price=self._coerce_float(position_row["stop_limit_price"]),
+        )
+        updated_position = self.repository.update_paper_position_pending_action(
+            conn,
+            plan_id=plan_id,
+            pending_action_status=PaperPositionActionStatus.NONE.value,
+        )
+        updated_position = self.repository.update_paper_position_action_error(
+            conn,
+            plan_id=plan_id,
+            last_action_error=None,
+        )
+        print(
+            f"[execution-worker] resolved tp2 action plan_id={plan_id} reason=stop_already_filled"
+        )
+        return updated_position
 
     def _advance_to_submit_tp2(self, conn, position_row):
         plan_id = str(position_row["plan_id"])
