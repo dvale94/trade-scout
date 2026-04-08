@@ -2919,6 +2919,162 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual(PaperPositionActionStatus.WAIT_TP2_FILL.value, position_row["pending_action_status"])
         self.assertEqual(0.275, tp2_row["qty"])
 
+    def test_tp2_submission_retries_once_with_recoverable_available_qty(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-tp2-balance-retry", t2_px=116.0)
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET position_status = ?, remaining_qty = ?, entry_filled_qty = ?, tp1_filled_qty = ?, pending_action_status = ?
+                WHERE request_id = ?
+                """,
+                ("PARTIAL", 0.011589217, 0.023178434, 0.011589217, "SUBMIT_TP2", "req-tp2-balance-retry"),
+            )
+            conn.commit()
+
+            with patch(
+                "trade_scout.execution.service.find_existing_broker_order_by_client_order_id",
+                return_value=None,
+            ), patch(
+                "trade_scout.execution.service.submit_take_profit_order",
+                side_effect=[
+                    RuntimeError(
+                        "Alpaca limit submission failed status=403 detail="
+                        '{"message":"insufficient balance for order (requested: 0.011589217, available: 0.011531304)"}'
+                    ),
+                    self._broker_result("broker-tp2-balance-retry", broker_status_raw="new"),
+                ],
+            ) as tp2_submit_mock:
+                processed = self.worker.service.process_position_actions(conn, limit=10)
+
+            tp2_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE request_id = ? AND order_role = ?",
+                ("req-tp2-balance-retry", "TP2"),
+            ).fetchone()
+            position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-tp2-balance-retry",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(1, processed)
+        self.assertEqual(2, tp2_submit_mock.call_count)
+        self.assertEqual(0.01158921, tp2_submit_mock.call_args_list[0].kwargs["qty"])
+        self.assertEqual(0.01153130, tp2_submit_mock.call_args_list[1].kwargs["qty"])
+        self.assertEqual(0.0115313, tp2_row["qty"])
+        self.assertEqual(PaperPositionActionStatus.WAIT_TP2_FILL.value, position_row["pending_action_status"])
+        self.assertIsNone(position_row["last_action_error"])
+
+    def test_tp2_submission_repeated_insufficient_balance_marks_position_error_and_stops_retrying(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-tp2-balance-error", t2_px=116.0)
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET position_status = ?, remaining_qty = ?, entry_filled_qty = ?, tp1_filled_qty = ?, pending_action_status = ?
+                WHERE request_id = ?
+                """,
+                ("PARTIAL", 0.011589217, 0.023178434, 0.011589217, "SUBMIT_TP2", "req-tp2-balance-error"),
+            )
+            conn.commit()
+
+            with patch(
+                "trade_scout.execution.service.find_existing_broker_order_by_client_order_id",
+                return_value=None,
+            ), patch(
+                "trade_scout.execution.service.submit_take_profit_order",
+                side_effect=[
+                    RuntimeError(
+                        "Alpaca limit submission failed status=403 detail="
+                        '{"message":"insufficient balance for order (requested: 0.011589217, available: 0.011531304)"}'
+                    ),
+                    RuntimeError(
+                        "Alpaca limit submission failed status=403 detail="
+                        '{"message":"insufficient balance for order (requested: 0.011531300, available: 0.011531304)"}'
+                    ),
+                ],
+            ) as tp2_submit_mock:
+                processed = self.worker.service.process_position_actions(conn, limit=10)
+
+            position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-tp2-balance-error",),
+            ).fetchone()
+            tp2_count = conn.execute(
+                "SELECT COUNT(*) AS n FROM paper_orders WHERE request_id = ? AND order_role = ?",
+                ("req-tp2-balance-error", "TP2"),
+            ).fetchone()["n"]
+
+            with patch(
+                "trade_scout.execution.service.submit_take_profit_order",
+                side_effect=AssertionError("submit_take_profit_order should not be retried after deterministic tp2 rejection"),
+            ):
+                second_processed = self.worker.service.process_position_actions(conn, limit=10)
+
+            second_position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-tp2-balance-error",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(1, processed)
+        self.assertEqual(2, tp2_submit_mock.call_count)
+        self.assertEqual(0, tp2_count)
+        self.assertEqual(PaperPositionStatus.ERROR.value, position_row["position_status"])
+        self.assertEqual(PaperPositionActionStatus.NONE.value, position_row["pending_action_status"])
+        self.assertIn("tp2 rejected: insufficient balance", position_row["last_action_error"])
+        self.assertEqual(0, second_processed)
+        self.assertEqual(PaperPositionStatus.ERROR.value, second_position_row["position_status"])
+        self.assertEqual(PaperPositionActionStatus.NONE.value, second_position_row["pending_action_status"])
+
+    def test_tp2_submission_insufficient_balance_without_usable_retry_marks_position_error(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-tp2-no-retry", t2_px=116.0)
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET position_status = ?, remaining_qty = ?, entry_filled_qty = ?, tp1_filled_qty = ?, pending_action_status = ?
+                WHERE request_id = ?
+                """,
+                ("PARTIAL", 0.011589217, 0.023178434, 0.011589217, "SUBMIT_TP2", "req-tp2-no-retry"),
+            )
+            conn.commit()
+
+            with patch(
+                "trade_scout.execution.service.find_existing_broker_order_by_client_order_id",
+                return_value=None,
+            ), patch(
+                "trade_scout.execution.service.submit_take_profit_order",
+                side_effect=RuntimeError(
+                    "Alpaca limit submission failed status=403 detail="
+                    '{"message":"insufficient balance for order (requested: 0.011589217, available: 0.000000000)"}'
+                ),
+            ) as tp2_submit_mock:
+                processed = self.worker.service.process_position_actions(conn, limit=10)
+
+            position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-tp2-no-retry",),
+            ).fetchone()
+            tp2_count = conn.execute(
+                "SELECT COUNT(*) AS n FROM paper_orders WHERE request_id = ? AND order_role = ?",
+                ("req-tp2-no-retry", "TP2"),
+            ).fetchone()["n"]
+        finally:
+            conn.close()
+
+        self.assertEqual(1, processed)
+        self.assertEqual(1, tp2_submit_mock.call_count)
+        self.assertEqual(0, tp2_count)
+        self.assertEqual(PaperPositionStatus.ERROR.value, position_row["position_status"])
+        self.assertEqual(PaperPositionActionStatus.NONE.value, position_row["pending_action_status"])
+        self.assertIn("tp2 rejected: insufficient balance", position_row["last_action_error"])
+
     def test_repeated_tp2_action_processing_does_not_duplicate_tp2_orders(self) -> None:
         conn = get_connection(self.db_path)
         try:

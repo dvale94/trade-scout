@@ -1180,6 +1180,12 @@ class ExecutionService:
         tp2_qty = self._coerce_float(position_row["remaining_qty"])
         if tp2_qty is None or tp2_qty <= 0:
             raise RuntimeError("tp2 submission requires remaining_qty > 0")
+        tp2_submission_qty = self._normalize_exit_qty(
+            symbol=str(position_row["symbol"]),
+            qty=tp2_qty,
+        )
+        if tp2_submission_qty <= 0:
+            raise RuntimeError("tp2 submission requires normalized remaining_qty > 0")
 
         tp2_price = self._coerce_float(trade_plan["t2_px"])
         if tp2_price is None or tp2_price <= 0:
@@ -1205,7 +1211,7 @@ class ExecutionService:
                 client_order_id=tp2_client_order_id,
                 symbol=str(position_row["symbol"]),
                 side=str(position_row["side"]),
-                qty=tp2_qty,
+                qty=tp2_submission_qty,
                 notional=None,
                 order_type="limit",
                 time_in_force="gtc",
@@ -1221,13 +1227,17 @@ class ExecutionService:
                 tp2_order_row=local_tp2_order,
             )
 
-        tp2_result = self._get_tp1_order_submitter()(
+        tp2_result, tp2_submission_qty = self._submit_tp2_order_with_balance_handling(
+            conn,
+            position_row=position_row,
             client_order_id=tp2_client_order_id,
             symbol=str(position_row["symbol"]),
             side=str(position_row["side"]),
-            qty=tp2_qty,
+            qty=tp2_submission_qty,
             limit_price=tp2_price,
         )
+        if tp2_result is None:
+            return self.repository.get_paper_position_by_plan_id(conn, plan_id)
         local_tp2_order = self.repository.insert_paper_order(
             conn,
             plan_id=plan_id,
@@ -1237,7 +1247,7 @@ class ExecutionService:
             client_order_id=tp2_client_order_id,
             symbol=str(position_row["symbol"]),
             side=str(position_row["side"]),
-            qty=tp2_qty,
+            qty=tp2_submission_qty,
             notional=None,
             order_type="limit",
             time_in_force="gtc",
@@ -1256,6 +1266,81 @@ class ExecutionService:
             position_row=position_row,
             tp2_order_row=local_tp2_order,
         )
+
+    def _submit_tp2_order_with_balance_handling(
+        self,
+        conn,
+        *,
+        position_row,
+        client_order_id: str,
+        symbol: str,
+        side: str,
+        qty: float,
+        limit_price: float,
+    ) -> tuple[object | None, float]:
+        requested_qty = qty
+        try:
+            return (
+                self._get_tp1_order_submitter()(
+                    client_order_id=client_order_id,
+                    symbol=symbol,
+                    side=side,
+                    qty=requested_qty,
+                    limit_price=limit_price,
+                ),
+                requested_qty,
+            )
+        except Exception as exc:
+            available_qty = self._extract_available_qty_from_insufficient_balance_error(exc)
+            if available_qty is not None:
+                retry_qty = self._normalize_exit_qty(symbol=symbol, qty=available_qty)
+                if 0 < retry_qty < requested_qty:
+                    try:
+                        return (
+                            self._get_tp1_order_submitter()(
+                                client_order_id=client_order_id,
+                                symbol=symbol,
+                                side=side,
+                                qty=retry_qty,
+                                limit_price=limit_price,
+                            ),
+                            retry_qty,
+                        )
+                    except Exception as retry_exc:
+                        error_message = self._format_tp2_rejection_error(
+                            requested_qty=requested_qty,
+                            available_qty=available_qty,
+                            error=retry_exc,
+                        )
+                        self.repository.mark_paper_position_error(
+                            conn,
+                            plan_id=str(position_row["plan_id"]),
+                            last_action_error=error_message,
+                        )
+                        print(
+                            f"[execution-worker] tp2 rejected plan_id={position_row['plan_id']} "
+                            f"requested_qty={requested_qty} available_qty={available_qty} error={retry_exc}"
+                        )
+                        return None, retry_qty
+
+            if self._is_insufficient_balance_error(exc):
+                error_message = self._format_tp2_rejection_error(
+                    requested_qty=requested_qty,
+                    available_qty=available_qty,
+                    error=exc,
+                )
+                self.repository.mark_paper_position_error(
+                    conn,
+                    plan_id=str(position_row["plan_id"]),
+                    last_action_error=error_message,
+                )
+                print(
+                    f"[execution-worker] tp2 rejected plan_id={position_row['plan_id']} "
+                    f"requested_qty={requested_qty} available_qty={available_qty} error={exc}"
+                )
+                return None, requested_qty
+
+            raise
 
     def _finalize_tp2_submission_state(self, conn, *, position_row, tp2_order_row):
         plan_id = str(position_row["plan_id"])
@@ -1324,6 +1409,23 @@ class ExecutionService:
             )
         return (
             f"{log_label} rejected: insufficient balance "
+            f"requested_qty={requested_qty} available_qty={available_qty} error={error}"
+        )
+
+    @staticmethod
+    def _format_tp2_rejection_error(
+        *,
+        requested_qty: float,
+        available_qty: float | None,
+        error: Exception,
+    ) -> str:
+        if available_qty is None:
+            return (
+                "tp2 rejected: insufficient balance "
+                f"requested_qty={requested_qty} error={error}"
+            )
+        return (
+            "tp2 rejected: insufficient balance "
             f"requested_qty={requested_qty} available_qty={available_qty} error={error}"
         )
 
