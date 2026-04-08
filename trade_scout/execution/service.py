@@ -1428,10 +1428,6 @@ class ExecutionService:
         }:
             return None
 
-        remaining_qty = self._coerce_float(position_row["remaining_qty"])
-        if remaining_qty is None or remaining_qty <= 0:
-            return None
-
         pending_action_status = str(position_row["pending_action_status"])
         if pending_action_status not in {
             PaperPositionActionStatus.NONE.value,
@@ -1444,9 +1440,15 @@ class ExecutionService:
         if active_stop_paper_order_id or active_tp2_paper_order_id:
             return None
 
-        plan_id = str(position_row["plan_id"])
-        if self.repository.has_filled_exit_order(conn, plan_id):
+        remaining_qty = self._coerce_float(position_row["remaining_qty"])
+        if remaining_qty is None or remaining_qty <= 0:
             if pending_action_status == PaperPositionActionStatus.WAIT_TP2_FILL.value:
+                plan_id = str(position_row["plan_id"])
+                updated_position = self.repository.update_paper_position_tp2_state(
+                    conn,
+                    plan_id=plan_id,
+                    active_tp2_paper_order_id=None,
+                )
                 updated_position = self.repository.update_paper_position_pending_action(
                     conn,
                     plan_id=plan_id,
@@ -1459,10 +1461,19 @@ class ExecutionService:
                 )
                 print(
                     f"[execution-worker] resolved residual plan_id={plan_id} "
-                    f"action=clear_stale_wait reason=terminal_exit_recorded source={source}"
+                    f"action=clear_stale_wait reason=no_remaining_qty source={source}"
                 )
                 return updated_position
             return None
+
+        plan_id = str(position_row["plan_id"])
+        if self.repository.has_filled_exit_order(conn, plan_id):
+            if pending_action_status == PaperPositionActionStatus.NONE.value:
+                return None
+            print(
+                f"[execution-worker] continuing residual classification plan_id={plan_id} "
+                f"reason=terminal_exit_recorded source={source}"
+            )
 
         residual_notional = self._estimate_residual_notional(position_row)
         dust_threshold = self._residual_dust_notional_threshold()

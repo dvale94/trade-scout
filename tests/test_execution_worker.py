@@ -3786,10 +3786,25 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual(PaperPositionActionStatus.NONE.value, position_row["pending_action_status"])
         self.assertEqual(PaperPositionStatus.PARTIAL.value, position_row["position_status"])
 
-    def test_stale_wait_tp2_fill_with_tiny_residual_closes_as_dust_without_fill_rows(self) -> None:
+    def test_stale_wait_tp2_fill_with_terminal_exit_recorded_and_tiny_residual_closes_as_dust(self) -> None:
         conn = get_connection(self.db_path)
         try:
             self._insert_trade_plan_row(conn, request_id="req-residual-dust")
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-stop-residual-dust",
+                request_id="req-residual-dust",
+                client_order_id="stop:rearm:tp1:plan-req-residual-dust",
+                broker_order_id="broker-stop-residual-dust",
+                order_status="FILLED",
+                order_role="STOP",
+                order_type="stop_limit",
+                qty=0.0005,
+                notional=None,
+                limit_price=95.0,
+                stop_price=95.0,
+                broker_status_raw="filled",
+            )
             conn.execute(
                 """
                 UPDATE paper_positions
@@ -3890,10 +3905,25 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertIsNone(position_row["active_tp2_paper_order_id"])
         self.assertEqual(0, stop_count)
 
-    def test_stale_wait_tp2_fill_with_meaningful_residual_schedules_reprotection(self) -> None:
+    def test_stale_wait_tp2_fill_with_terminal_exit_recorded_and_meaningful_residual_schedules_reprotection(self) -> None:
         conn = get_connection(self.db_path)
         try:
             self._insert_trade_plan_row(conn, request_id="req-stale-wait-reprotect", stop_px=95.0)
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-stop-stale-wait-reprotect",
+                request_id="req-stale-wait-reprotect",
+                client_order_id="stop:rearm:tp1:plan-req-stale-wait-reprotect",
+                broker_order_id="broker-stop-stale-wait-reprotect",
+                order_status="FILLED",
+                order_role="STOP",
+                order_type="stop_limit",
+                qty=0.2,
+                notional=None,
+                limit_price=95.0,
+                stop_price=95.0,
+                broker_status_raw="filled",
+            )
             conn.execute(
                 """
                 UPDATE paper_positions
