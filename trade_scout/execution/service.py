@@ -29,6 +29,7 @@ from trade_scout.execution.repository import ExecutionRepository
 class ExecutionService:
     CRYPTO_EXIT_QTY_DECIMALS = 8
     DEFAULT_RESIDUAL_DUST_NOTIONAL = 1.0
+    _BROKER_REJECT_CODE_RE = re.compile(r'"code"\s*:\s*([0-9]+)|code[=\s:]+([0-9]+)', re.IGNORECASE)
     _INSUFFICIENT_BALANCE_RE = re.compile(
         r"requested:\s*([0-9.]+)\s*,\s*available:\s*([0-9.]+)",
         re.IGNORECASE,
@@ -238,6 +239,8 @@ class ExecutionService:
                 request_id,
                 code="BROKER_SUBMIT_FAILED",
                 message=str(exc),
+                broker_reject_category=self._classify_broker_submit_failure(exc),
+                broker_reject_code=self._extract_broker_reject_code(exc),
             )
             print(f"[execution-worker] failed request_id={request_id} error={exc}")
 
@@ -1599,6 +1602,26 @@ class ExecutionService:
             "tp2 rejected: insufficient balance "
             f"requested_qty={requested_qty} available_qty={available_qty} error={error}"
         )
+
+    @staticmethod
+    def _classify_broker_submit_failure(error: Exception) -> str:
+        error_text = str(error).lower()
+        if "potential wash trade detected" in error_text or "opposite side limit order exists" in error_text:
+            return "WASH_TRADE_CONFLICT"
+        if "insufficient balance" in error_text or "insufficient buying power" in error_text:
+            return "INSUFFICIENT_BALANCE"
+        if "read timed out" in error_text or "connection timed out" in error_text or "connect timeout" in error_text:
+            return "NETWORK_TIMEOUT"
+        if "alpaca" in error_text or "broker" in error_text or "status=" in error_text:
+            return "BROKER_REJECT_OTHER"
+        return "UNKNOWN"
+
+    @classmethod
+    def _extract_broker_reject_code(cls, error: Exception) -> str | None:
+        match = cls._BROKER_REJECT_CODE_RE.search(str(error))
+        if match is None:
+            return None
+        return match.group(1) or match.group(2)
 
     @staticmethod
     def _build_tp1_client_order_id(plan_id: str) -> str:

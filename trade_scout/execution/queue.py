@@ -86,6 +86,8 @@ def init_db(db_path: str) -> None:
             )
             """
         )
+        _ensure_execution_request_column(conn, "broker_reject_category", "TEXT")
+        _ensure_execution_request_column(conn, "broker_reject_code", "TEXT")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS paper_trade_plans (
@@ -388,6 +390,19 @@ def init_db(db_path: str) -> None:
         conn.close()
 
 
+def _ensure_execution_request_column(
+    conn: sqlite3.Connection, column_name: str, column_type: str
+) -> None:
+    existing_columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(execution_requests)").fetchall()
+    }
+    if column_name in existing_columns:
+        return
+    conn.execute(f"ALTER TABLE execution_requests ADD COLUMN {column_name} {column_type}")
+    conn.commit()
+
+
 def _ensure_paper_positions_columns(conn: sqlite3.Connection) -> None:
     existing_columns = {
         row["name"]
@@ -595,17 +610,32 @@ def mark_submitted(
 
 
 def mark_failed(
-    conn: sqlite3.Connection, request_id: str, code: str, message: str
+    conn: sqlite3.Connection,
+    request_id: str,
+    code: str,
+    message: str,
+    *,
+    broker_reject_category: str | None = None,
+    broker_reject_code: str | None = None,
 ) -> None:
     conn.execute(
         """
         UPDATE execution_requests
         SET status = ?,
             error_code = ?,
-            error_message = ?
+            error_message = ?,
+            broker_reject_category = ?,
+            broker_reject_code = ?
         WHERE request_id = ?
         """,
-        (ExecutionStatus.FAILED.value, code, message, request_id),
+        (
+            ExecutionStatus.FAILED.value,
+            code,
+            message,
+            broker_reject_category,
+            broker_reject_code,
+            request_id,
+        ),
     )
     conn.commit()
 

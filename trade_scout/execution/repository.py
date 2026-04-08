@@ -68,8 +68,17 @@ class ExecutionRepository:
         *,
         code: str,
         message: str,
+        broker_reject_category: str | None = None,
+        broker_reject_code: str | None = None,
     ) -> None:
-        queue.mark_failed(conn, request_id, code, message)
+        queue.mark_failed(
+            conn,
+            request_id,
+            code,
+            message,
+            broker_reject_category=broker_reject_category,
+            broker_reject_code=broker_reject_code,
+        )
 
     def get_open_paper_orders_for_sync(
         self,

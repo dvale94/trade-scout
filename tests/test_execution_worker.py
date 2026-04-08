@@ -90,6 +90,7 @@ class ExecutionWorkerTest(unittest.TestCase):
             order_columns = self._table_columns(conn, "paper_orders")
             fill_columns = self._table_columns(conn, "paper_fills")
             position_columns = self._table_columns(conn, "paper_positions")
+            request_columns = self._table_columns(conn, "execution_requests")
             policy_definition_columns = self._table_columns(conn, "policy_definitions")
             policy_decision_columns = self._table_columns(conn, "policy_decisions")
             policy_activation_columns = self._table_columns(conn, "policy_activation_history")
@@ -170,6 +171,8 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertIn("mode", policy_activation_columns)
         self.assertIn("effective_from_ts_utc", policy_activation_columns)
         self.assertIn("effective_to_ts_utc", policy_activation_columns)
+        self.assertIn("broker_reject_category", request_columns)
+        self.assertIn("broker_reject_code", request_columns)
 
     def test_init_db_creates_policy_indexes(self) -> None:
         conn = get_connection(self.db_path)
@@ -452,6 +455,114 @@ class ExecutionWorkerTest(unittest.TestCase):
 
         self.assertEqual("SUBMITTED", request_row["status"])
         self.assertEqual("broker-1", request_row["broker_order_id"])
+
+    def test_broker_submit_failure_records_wash_trade_category(self) -> None:
+        self._insert_pending_request(request_id="req-broker-wash", alert_id="alert-broker-wash")
+
+        with patch(
+            "trade_scout.execution.service.find_existing_broker_order",
+            return_value=None,
+        ), patch(
+            "trade_scout.execution.service.submit_validated_order",
+            side_effect=RuntimeError(
+                'Alpaca order submission failed status=403 detail={"code":40310000,"message":"potential wash trade detected: opposite side limit order exists"}'
+            ),
+        ):
+            attempted = self.worker.run_once()
+
+        conn = get_connection(self.db_path)
+        try:
+            request_row = conn.execute(
+                "SELECT * FROM execution_requests WHERE request_id = ?",
+                ("req-broker-wash",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(1, attempted)
+        self.assertEqual(ExecutionStatus.FAILED.value, request_row["status"])
+        self.assertEqual("BROKER_SUBMIT_FAILED", request_row["error_code"])
+        self.assertEqual("WASH_TRADE_CONFLICT", request_row["broker_reject_category"])
+        self.assertEqual("40310000", request_row["broker_reject_code"])
+        self.assertIn("potential wash trade detected", request_row["error_message"])
+
+    def test_broker_submit_failure_records_insufficient_balance_category(self) -> None:
+        self._insert_pending_request(request_id="req-broker-balance", alert_id="alert-broker-balance")
+
+        with patch(
+            "trade_scout.execution.service.find_existing_broker_order",
+            return_value=None,
+        ), patch(
+            "trade_scout.execution.service.submit_validated_order",
+            side_effect=RuntimeError(
+                'Alpaca order submission failed status=403 detail={"message":"insufficient buying power for order"}'
+            ),
+        ):
+            self.worker.run_once()
+
+        conn = get_connection(self.db_path)
+        try:
+            request_row = conn.execute(
+                "SELECT * FROM execution_requests WHERE request_id = ?",
+                ("req-broker-balance",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(ExecutionStatus.FAILED.value, request_row["status"])
+        self.assertEqual("INSUFFICIENT_BALANCE", request_row["broker_reject_category"])
+        self.assertIsNone(request_row["broker_reject_code"])
+        self.assertIn("insufficient buying power", request_row["error_message"])
+
+    def test_broker_submit_failure_records_network_timeout_category(self) -> None:
+        self._insert_pending_request(request_id="req-broker-timeout", alert_id="alert-broker-timeout")
+
+        with patch(
+            "trade_scout.execution.service.find_existing_broker_order",
+            return_value=None,
+        ), patch(
+            "trade_scout.execution.service.submit_validated_order",
+            side_effect=RuntimeError("HTTPSConnectionPool(host='paper-api.alpaca.markets'): Read timed out."),
+        ):
+            self.worker.run_once()
+
+        conn = get_connection(self.db_path)
+        try:
+            request_row = conn.execute(
+                "SELECT * FROM execution_requests WHERE request_id = ?",
+                ("req-broker-timeout",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(ExecutionStatus.FAILED.value, request_row["status"])
+        self.assertEqual("NETWORK_TIMEOUT", request_row["broker_reject_category"])
+        self.assertIsNone(request_row["broker_reject_code"])
+
+    def test_broker_submit_failure_records_generic_broker_reject_category(self) -> None:
+        self._insert_pending_request(request_id="req-broker-other", alert_id="alert-broker-other")
+
+        with patch(
+            "trade_scout.execution.service.find_existing_broker_order",
+            return_value=None,
+        ), patch(
+            "trade_scout.execution.service.submit_validated_order",
+            side_effect=RuntimeError('Alpaca order submission failed status=422 detail={"message":"unprocessable entity"}'),
+        ):
+            self.worker.run_once()
+
+        conn = get_connection(self.db_path)
+        try:
+            request_row = conn.execute(
+                "SELECT * FROM execution_requests WHERE request_id = ?",
+                ("req-broker-other",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(ExecutionStatus.FAILED.value, request_row["status"])
+        self.assertEqual("BROKER_REJECT_OTHER", request_row["broker_reject_category"])
+        self.assertIsNone(request_row["broker_reject_code"])
 
     def test_insert_request_preserves_requested_ts_utc(self) -> None:
         requested_ts_utc = "2026-03-25T15:45:30+00:00"
