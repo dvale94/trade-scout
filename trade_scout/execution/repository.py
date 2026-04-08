@@ -123,6 +123,9 @@ class ExecutionRepository:
     ) -> list[sqlite3.Row]:
         return queue.get_positions_eligible_for_trigger_evaluation(conn, limit=limit)
 
+    def has_filled_exit_order(self, conn: sqlite3.Connection, plan_id: str) -> bool:
+        return queue.has_filled_exit_order(conn, plan_id)
+
     def create_paper_trade_plan(self, conn: sqlite3.Connection, **kwargs) -> sqlite3.Row:
         return queue.create_paper_trade_plan(conn, **kwargs)
 
@@ -388,4 +391,17 @@ class ExecutionRepository:
             conn,
             plan_id=plan_id,
             last_action_error=last_action_error,
+        )
+
+    def close_paper_position_as_dust(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        plan_id: str,
+        closed_ts_utc: str | None = None,
+    ) -> sqlite3.Row | None:
+        return queue.close_paper_position_as_dust(
+            conn,
+            plan_id=plan_id,
+            closed_ts_utc=closed_ts_utc,
         )

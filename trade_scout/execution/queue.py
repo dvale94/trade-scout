@@ -780,6 +780,26 @@ def get_positions_eligible_for_trigger_evaluation(
     return list(rows)
 
 
+def has_filled_exit_order(conn: sqlite3.Connection, plan_id: str) -> bool:
+    row = conn.execute(
+        """
+        SELECT 1
+        FROM paper_orders
+        WHERE plan_id = ?
+          AND order_role IN (?, ?)
+          AND order_status = ?
+        LIMIT 1
+        """,
+        (
+            plan_id,
+            PaperOrderRole.STOP.value,
+            PaperOrderRole.TP2.value,
+            PaperOrderStatus.FILLED.value,
+        ),
+    ).fetchone()
+    return row is not None
+
+
 def create_paper_trade_plan(
     conn: sqlite3.Connection,
     *,
@@ -1775,6 +1795,44 @@ def mark_paper_position_error(
             PaperPositionStatus.ERROR.value,
             PaperPositionActionStatus.NONE.value,
             last_action_error,
+            utc_now_iso(),
+            plan_id,
+        ),
+    )
+    conn.commit()
+    return get_paper_position_by_plan_id(conn, plan_id)
+
+
+def close_paper_position_as_dust(
+    conn: sqlite3.Connection,
+    *,
+    plan_id: str,
+    closed_ts_utc: str | None = None,
+) -> sqlite3.Row | None:
+    position_row = get_paper_position_by_plan_id(conn, plan_id)
+    if position_row is None:
+        return None
+
+    next_closed_ts_utc = position_row["closed_ts_utc"] or closed_ts_utc or utc_now_iso()
+    conn.execute(
+        """
+        UPDATE paper_positions
+        SET position_status = ?,
+            pending_action_status = ?,
+            remaining_qty = ?,
+            active_stop_paper_order_id = NULL,
+            active_tp1_paper_order_id = NULL,
+            active_tp2_paper_order_id = NULL,
+            closed_ts_utc = ?,
+            last_action_error = NULL,
+            updated_ts_utc = ?
+        WHERE plan_id = ?
+        """,
+        (
+            PaperPositionStatus.CLOSED.value,
+            PaperPositionActionStatus.NONE.value,
+            0.0,
+            next_closed_ts_utc,
             utc_now_iso(),
             plan_id,
         ),

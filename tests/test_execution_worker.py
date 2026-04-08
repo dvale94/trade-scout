@@ -3786,6 +3786,171 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual(PaperPositionActionStatus.NONE.value, position_row["pending_action_status"])
         self.assertEqual(PaperPositionStatus.PARTIAL.value, position_row["position_status"])
 
+    def test_stale_wait_tp2_fill_with_tiny_residual_closes_as_dust_without_fill_rows(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-residual-dust")
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET position_status = ?, entry_filled_qty = ?, entry_avg_fill_px = ?, remaining_qty = ?,
+                    pending_action_status = ?, active_tp2_paper_order_id = ?, active_stop_paper_order_id = ?,
+                    tp1_filled_qty = ?, tp2_filled_qty = ?
+                WHERE request_id = ?
+                """,
+                (
+                    "PARTIAL",
+                    0.1005,
+                    100.0,
+                    0.0005,
+                    "WAIT_TP2_FILL",
+                    None,
+                    None,
+                    0.1,
+                    0.0,
+                    "req-residual-dust",
+                ),
+            )
+            conn.commit()
+
+            processed = self.worker.service.process_position_actions(conn, limit=10)
+            position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-residual-dust",),
+            ).fetchone()
+            fill_count = conn.execute(
+                "SELECT COUNT(*) AS n FROM paper_fills WHERE request_id = ?",
+                ("req-residual-dust",),
+            ).fetchone()["n"]
+
+            second_processed = self.worker.service.process_position_actions(conn, limit=10)
+            second_position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-residual-dust",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(1, processed)
+        self.assertEqual(PaperPositionStatus.CLOSED.value, position_row["position_status"])
+        self.assertEqual(PaperPositionActionStatus.NONE.value, position_row["pending_action_status"])
+        self.assertEqual(0.0, position_row["remaining_qty"])
+        self.assertIsNone(position_row["active_stop_paper_order_id"])
+        self.assertIsNone(position_row["active_tp2_paper_order_id"])
+        self.assertIsNotNone(position_row["closed_ts_utc"])
+        self.assertEqual(0, fill_count)
+        self.assertEqual(0, second_processed)
+        self.assertEqual(PaperPositionStatus.CLOSED.value, second_position_row["position_status"])
+        self.assertEqual(0.0, second_position_row["remaining_qty"])
+
+    def test_partial_none_without_stop_or_tp2_schedules_residual_reprotection(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-residual-reprotect", stop_px=95.0)
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET position_status = ?, entry_filled_qty = ?, entry_avg_fill_px = ?, remaining_qty = ?,
+                    pending_action_status = ?, active_tp2_paper_order_id = ?, active_stop_paper_order_id = ?,
+                    tp1_filled_qty = ?, tp2_filled_qty = ?
+                WHERE request_id = ?
+                """,
+                (
+                    "PARTIAL",
+                    0.5,
+                    100.0,
+                    0.2,
+                    "NONE",
+                    None,
+                    None,
+                    0.3,
+                    0.0,
+                    "req-residual-reprotect",
+                ),
+            )
+            conn.commit()
+
+            processed = self.worker.service.process_position_actions(conn, limit=10)
+            position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-residual-reprotect",),
+            ).fetchone()
+            stop_count = conn.execute(
+                "SELECT COUNT(*) AS n FROM paper_orders WHERE request_id = ? AND order_role = ?",
+                ("req-residual-reprotect", "STOP"),
+            ).fetchone()["n"]
+        finally:
+            conn.close()
+
+        self.assertEqual(1, processed)
+        self.assertEqual(PaperPositionStatus.PARTIAL.value, position_row["position_status"])
+        self.assertEqual(PaperPositionActionStatus.REARM_STOP_AFTER_TP1.value, position_row["pending_action_status"])
+        self.assertEqual(0.2, position_row["remaining_qty"])
+        self.assertIsNone(position_row["active_stop_paper_order_id"])
+        self.assertIsNone(position_row["active_tp2_paper_order_id"])
+        self.assertEqual(0, stop_count)
+
+    def test_stale_wait_tp2_fill_with_meaningful_residual_schedules_reprotection(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-stale-wait-reprotect", stop_px=95.0)
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET position_status = ?, entry_filled_qty = ?, entry_avg_fill_px = ?, remaining_qty = ?,
+                    pending_action_status = ?, active_tp2_paper_order_id = ?, active_stop_paper_order_id = ?,
+                    tp1_filled_qty = ?, tp2_filled_qty = ?
+                WHERE request_id = ?
+                """,
+                (
+                    "PARTIAL",
+                    0.5,
+                    100.0,
+                    0.2,
+                    "WAIT_TP2_FILL",
+                    None,
+                    None,
+                    0.3,
+                    0.0,
+                    "req-stale-wait-reprotect",
+                ),
+            )
+            conn.commit()
+
+            processed = self.worker.service.process_position_actions(conn, limit=10)
+            position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-stale-wait-reprotect",),
+            ).fetchone()
+
+            with patch(
+                "trade_scout.execution.service.find_existing_broker_order_by_client_order_id",
+                return_value=None,
+            ), patch(
+                "trade_scout.execution.service.submit_protective_stop_order",
+                return_value=self._broker_result("broker-residual-reprotect", broker_status_raw="new"),
+            ):
+                second_processed = self.worker.service.process_position_actions(conn, limit=10)
+
+            second_position_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-stale-wait-reprotect",),
+            ).fetchone()
+            stop_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE request_id = ? AND order_role = ?",
+                ("req-stale-wait-reprotect", "STOP"),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(1, processed)
+        self.assertEqual(PaperPositionActionStatus.REARM_STOP_AFTER_TP1.value, position_row["pending_action_status"])
+        self.assertIsNone(position_row["active_tp2_paper_order_id"])
+        self.assertEqual(1, second_processed)
+        self.assertEqual(PaperPositionActionStatus.NONE.value, second_position_row["pending_action_status"])
+        self.assertIsNotNone(second_position_row["active_stop_paper_order_id"])
+        self.assertIsNotNone(stop_row)
+
     def test_tp1_fill_updates_position_truth_and_schedules_rearm(self) -> None:
         conn = get_connection(self.db_path)
         try:

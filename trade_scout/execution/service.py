@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from decimal import Decimal, ROUND_DOWN
 import sqlite3
@@ -27,6 +28,7 @@ from trade_scout.execution.repository import ExecutionRepository
 
 class ExecutionService:
     CRYPTO_EXIT_QTY_DECIMALS = 8
+    DEFAULT_RESIDUAL_DUST_NOTIONAL = 1.0
     _INSUFFICIENT_BALANCE_RE = re.compile(
         r"requested:\s*([0-9.]+)\s*,\s*available:\s*([0-9.]+)",
         re.IGNORECASE,
@@ -256,6 +258,22 @@ class ExecutionService:
                     f"[execution-worker] position action failed plan_id={position_row['plan_id']} "
                     f"pending_action_status={position_row['pending_action_status']} error={exc}"
                 )
+        residual_positions = self.repository.get_positions_eligible_for_trigger_evaluation(conn, limit=limit)
+        for position_row in residual_positions:
+            try:
+                updated_position = self._process_residual_position_if_needed(conn, position_row)
+                if updated_position is not None:
+                    processed_count += 1
+            except Exception as exc:
+                self.repository.update_paper_position_action_error(
+                    conn,
+                    plan_id=str(position_row["plan_id"]),
+                    last_action_error=str(exc),
+                )
+                print(
+                    f"[execution-worker] residual handling failed plan_id={position_row['plan_id']} "
+                    f"pending_action_status={position_row['pending_action_status']} error={exc}"
+                )
         return processed_count
 
     def process_position_triggers(
@@ -298,6 +316,8 @@ class ExecutionService:
             return self._cancel_stop_for_tp2_if_needed(conn, position_row)
         if pending_action_status == PaperPositionActionStatus.SUBMIT_TP2.value:
             return self._submit_tp2_if_needed(conn, position_row)
+        if pending_action_status == PaperPositionActionStatus.WAIT_TP2_FILL.value:
+            return self._wait_tp2_fill_if_needed(conn, position_row)
         return position_row
 
     def evaluate_take_profit_triggers(
@@ -1389,6 +1409,121 @@ class ExecutionService:
             f"paper_order_id={tp2_order_row['paper_order_id']}"
         )
         return updated_position
+
+    def _wait_tp2_fill_if_needed(self, conn, position_row):
+        active_tp2_paper_order_id = self._coerce_optional_str(position_row["active_tp2_paper_order_id"])
+        if active_tp2_paper_order_id:
+            return position_row
+        updated_position = self._process_residual_position_if_needed(
+            conn,
+            position_row,
+            source="stale_wait_tp2_fill",
+        )
+        return updated_position or position_row
+
+    def _process_residual_position_if_needed(self, conn, position_row, *, source: str = "residual_scan"):
+        if str(position_row["position_status"]) not in {
+            PaperPositionStatus.OPEN.value,
+            PaperPositionStatus.PARTIAL.value,
+        }:
+            return None
+
+        remaining_qty = self._coerce_float(position_row["remaining_qty"])
+        if remaining_qty is None or remaining_qty <= 0:
+            return None
+
+        pending_action_status = str(position_row["pending_action_status"])
+        if pending_action_status not in {
+            PaperPositionActionStatus.NONE.value,
+            PaperPositionActionStatus.WAIT_TP2_FILL.value,
+        }:
+            return None
+
+        active_stop_paper_order_id = self._coerce_optional_str(position_row["active_stop_paper_order_id"])
+        active_tp2_paper_order_id = self._coerce_optional_str(position_row["active_tp2_paper_order_id"])
+        if active_stop_paper_order_id or active_tp2_paper_order_id:
+            return None
+
+        plan_id = str(position_row["plan_id"])
+        if self.repository.has_filled_exit_order(conn, plan_id):
+            if pending_action_status == PaperPositionActionStatus.WAIT_TP2_FILL.value:
+                updated_position = self.repository.update_paper_position_pending_action(
+                    conn,
+                    plan_id=plan_id,
+                    pending_action_status=PaperPositionActionStatus.NONE.value,
+                )
+                updated_position = self.repository.update_paper_position_action_error(
+                    conn,
+                    plan_id=plan_id,
+                    last_action_error=None,
+                )
+                print(
+                    f"[execution-worker] resolved residual plan_id={plan_id} "
+                    f"action=clear_stale_wait reason=terminal_exit_recorded source={source}"
+                )
+                return updated_position
+            return None
+
+        residual_notional = self._estimate_residual_notional(position_row)
+        dust_threshold = self._residual_dust_notional_threshold()
+        if residual_notional is not None and residual_notional <= dust_threshold:
+            updated_position = self.repository.close_paper_position_as_dust(conn, plan_id=plan_id)
+            print(
+                f"[execution-worker] closed residual dust plan_id={plan_id} "
+                f"remaining_qty={remaining_qty} residual_notional={residual_notional}"
+            )
+            return updated_position
+
+        next_action = self._residual_reprotection_action(position_row)
+        updated_position = self.repository.update_paper_position_tp2_state(
+            conn,
+            plan_id=plan_id,
+            active_tp2_paper_order_id=None,
+        )
+        updated_position = self.repository.update_paper_position_pending_action(
+            conn,
+            plan_id=plan_id,
+            pending_action_status=next_action,
+        )
+        updated_position = self.repository.update_paper_position_action_error(
+            conn,
+            plan_id=plan_id,
+            last_action_error=None,
+        )
+        print(
+            f"[execution-worker] scheduled residual protection plan_id={plan_id} "
+            f"next_action={next_action} source={source}"
+        )
+        return updated_position
+
+    def _estimate_residual_notional(self, position_row) -> float | None:
+        remaining_qty = self._coerce_float(position_row["remaining_qty"])
+        if remaining_qty is None or remaining_qty <= 0:
+            return None
+
+        fallback_prices = [
+            self._coerce_float(position_row["entry_avg_fill_px"]),
+            self._coerce_float(position_row["stop_price"]),
+            self._coerce_float(position_row["stop_limit_price"]),
+        ]
+        positive_prices = [price for price in fallback_prices if price is not None and price > 0]
+        if not positive_prices:
+            return None
+        return remaining_qty * max(positive_prices)
+
+    @classmethod
+    def _residual_dust_notional_threshold(cls) -> float:
+        raw = os.getenv("EXECUTION_RESIDUAL_DUST_NOTIONAL", str(cls.DEFAULT_RESIDUAL_DUST_NOTIONAL)).strip()
+        try:
+            return max(float(raw), 0.0)
+        except ValueError:
+            return cls.DEFAULT_RESIDUAL_DUST_NOTIONAL
+
+    @staticmethod
+    def _residual_reprotection_action(position_row) -> str:
+        if str(position_row["position_status"]) == PaperPositionStatus.OPEN.value:
+            return PaperPositionActionStatus.PLACE_INITIAL_STOP.value
+        return PaperPositionActionStatus.REARM_STOP_AFTER_TP1.value
 
     @staticmethod
     def _build_initial_stop_client_order_id(plan_id: str) -> str:
