@@ -29,9 +29,11 @@ _COMMON_TRADE_TIME_COLUMNS = (
 
 
 def _resolve_duckdb_path(duckdb_path: str | Path | None = None) -> Path:
-    if duckdb_path is None:
-        return _DEFAULT_DUCKDB_PATH
-    return Path(duckdb_path)
+    raw_path = _DEFAULT_DUCKDB_PATH if duckdb_path is None else Path(duckdb_path)
+    expanded_path = raw_path.expanduser()
+    if expanded_path.is_absolute():
+        return expanded_path
+    return (_REPO_ROOT / expanded_path).resolve()
 
 
 def connect_research_db(

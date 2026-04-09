@@ -17,9 +17,11 @@ _DEFAULT_EXECUTION_DB_PATH = Path(os.getenv("EXECUTION_DB_PATH", "./execution.db
 
 
 def _resolve_execution_db_path(execution_db_path: str | Path | None = None) -> Path:
-    if execution_db_path is None:
-        return _DEFAULT_EXECUTION_DB_PATH
-    return Path(execution_db_path)
+    raw_path = _DEFAULT_EXECUTION_DB_PATH if execution_db_path is None else Path(execution_db_path)
+    expanded_path = raw_path.expanduser()
+    if expanded_path.is_absolute():
+        return expanded_path
+    return (_REPO_ROOT / expanded_path).resolve()
 
 
 def connect_policy_db(
@@ -170,7 +172,12 @@ def counts_by_mode(decisions: pd.DataFrame) -> pd.DataFrame:
 
 
 def counts_by_feature(decisions: pd.DataFrame, feature_column: str) -> pd.DataFrame:
-    feature_df = flatten_policy_feature_snapshot(decisions)
+    feature_columns = {"symbol", "setup_family", "anchor_regime", "score", "score_bucket"}
+    existing_columns = set(decisions.columns)
+    if feature_column in existing_columns and feature_columns.intersection(existing_columns):
+        feature_df = decisions.copy()
+    else:
+        feature_df = flatten_policy_feature_snapshot(decisions)
     if feature_df.empty or feature_column not in feature_df.columns:
         return pd.DataFrame(columns=[feature_column, "count"])
     return (
