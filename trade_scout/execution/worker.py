@@ -22,6 +22,8 @@ class ExecutionWorkerConfig:
 
 
 class ExecutionWorker:
+    SYNC_FAILURE_LOG_THROTTLE_SECONDS = 60.0
+
     def __init__(
         self,
         config: ExecutionWorkerConfig,
@@ -38,6 +40,7 @@ class ExecutionWorker:
             alert_lookup=alert_lookup,
             max_alert_age_seconds=config.max_alert_age_seconds,
         )
+        self._sync_failure_log_state: dict[str, tuple[str, float]] = {}
 
     def run_forever(self) -> None:
         if not self.config.enabled:
@@ -89,7 +92,7 @@ class ExecutionWorker:
                     attempted_count += 1
                     self.service.process_validated_request(conn, validated_row)
 
-            self.reconciler.sync_open_paper_orders(conn, limit=self.config.sync_batch_size)
+            self.sync_open_paper_orders(conn, limit=self.config.sync_batch_size)
             self.service.process_position_actions(conn, limit=self.config.sync_batch_size)
         finally:
             conn.close()
@@ -102,7 +105,48 @@ class ExecutionWorker:
         self.service.process_validated_request(conn, request_row)
 
     def sync_open_paper_orders(self, conn, *, limit: int) -> int:
-        return self.reconciler.sync_open_paper_orders(conn, limit=limit)
+        synced_count = 0
+        open_orders = self.repository.get_open_paper_orders_for_sync(conn, limit=limit)
+        for paper_order_row in open_orders:
+            paper_order_id = str(paper_order_row["paper_order_id"])
+            broker_order_id = self.reconciler._coerce_optional_str(paper_order_row["broker_order_id"])
+            if not broker_order_id:
+                print(
+                    f"[execution-worker] skipped sync paper_order_id={paper_order_id} "
+                    "reason=missing broker_order_id"
+                )
+                continue
+
+            try:
+                broker_snapshot = self.reconciler._get_broker_order_fetcher()(broker_order_id)
+                if broker_snapshot is None:
+                    print(
+                        f"[execution-worker] skipped sync paper_order_id={paper_order_id} "
+                        f"broker_order_id={broker_order_id} reason=broker_order_not_found"
+                    )
+                    continue
+
+                reconciled = self.reconciler.reconcile_paper_order(conn, paper_order_row, broker_snapshot)
+                synced_count += 1
+                had_failure_state = paper_order_id in self._sync_failure_log_state
+                self._sync_failure_log_state.pop(paper_order_id, None)
+                if had_failure_state:
+                    print(
+                        f"[execution-worker] sync recovered paper_order_id={paper_order_id} "
+                        f"broker_order_id={broker_order_id}"
+                    )
+                if self.reconciler._has_material_order_state_change(paper_order_row, reconciled):
+                    print(
+                        f"[execution-worker] synced paper_order_id={paper_order_id} "
+                        f"broker_order_id={broker_order_id} order_status={reconciled['order_status']}"
+                    )
+            except Exception as exc:
+                if self._should_log_sync_failure(paper_order_id, exc):
+                    print(
+                        f"[execution-worker] sync failed paper_order_id={paper_order_id} "
+                        f"broker_order_id={broker_order_id} error={exc}"
+                    )
+        return synced_count
 
     def process_position_triggers(
         self,
@@ -135,3 +179,22 @@ class ExecutionWorker:
     @staticmethod
     def _get_request_id(request_row) -> str:
         return str(request_row["request_id"])
+
+    def _should_log_sync_failure(self, paper_order_id: str, error: Exception) -> bool:
+        signature = self._sync_failure_signature(error)
+        now_ts = self._sync_failure_now()
+        prior = self._sync_failure_log_state.get(paper_order_id)
+        if prior is not None:
+            prior_signature, prior_logged_ts = prior
+            if prior_signature == signature and (now_ts - prior_logged_ts) < self.SYNC_FAILURE_LOG_THROTTLE_SECONDS:
+                return False
+        self._sync_failure_log_state[paper_order_id] = (signature, now_ts)
+        return True
+
+    @staticmethod
+    def _sync_failure_signature(error: Exception) -> str:
+        return f"{error.__class__.__name__}:{error}"
+
+    @staticmethod
+    def _sync_failure_now() -> float:
+        return time.monotonic()

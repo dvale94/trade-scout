@@ -996,6 +996,150 @@ class ExecutionWorkerTest(unittest.TestCase):
             )
         )
 
+    def test_sync_open_paper_orders_throttles_repeated_identical_failure_logs(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-sync-fail-throttle",
+                request_id="req-sync-fail-throttle",
+                client_order_id="req-sync-fail-throttle",
+                broker_order_id="broker-sync-fail-throttle",
+                order_status="ACCEPTED",
+                broker_status_raw="accepted",
+            )
+            with patch(
+                "trade_scout.execution.reconciler.fetch_broker_order_by_id",
+                side_effect=RuntimeError("Read timed out"),
+            ), patch.object(
+                self.worker,
+                "_sync_failure_now",
+                side_effect=[100.0, 110.0],
+            ), patch("builtins.print") as print_mock:
+                self.worker.sync_open_paper_orders(conn, limit=10)
+                self.worker.sync_open_paper_orders(conn, limit=10)
+        finally:
+            conn.close()
+
+        failure_logs = [
+            str(call.args[0])
+            for call in print_mock.call_args_list
+            if call.args and "[execution-worker] sync failed paper_order_id=po-sync-fail-throttle" in str(call.args[0])
+        ]
+        self.assertEqual(1, len(failure_logs))
+
+    def test_sync_open_paper_orders_logs_same_failure_again_after_throttle_window(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-sync-fail-window",
+                request_id="req-sync-fail-window",
+                client_order_id="req-sync-fail-window",
+                broker_order_id="broker-sync-fail-window",
+                order_status="ACCEPTED",
+                broker_status_raw="accepted",
+            )
+            with patch(
+                "trade_scout.execution.reconciler.fetch_broker_order_by_id",
+                side_effect=RuntimeError("Read timed out"),
+            ), patch.object(
+                self.worker,
+                "_sync_failure_now",
+                side_effect=[100.0, 161.0],
+            ), patch("builtins.print") as print_mock:
+                self.worker.sync_open_paper_orders(conn, limit=10)
+                self.worker.sync_open_paper_orders(conn, limit=10)
+        finally:
+            conn.close()
+
+        failure_logs = [
+            str(call.args[0])
+            for call in print_mock.call_args_list
+            if call.args and "[execution-worker] sync failed paper_order_id=po-sync-fail-window" in str(call.args[0])
+        ]
+        self.assertEqual(2, len(failure_logs))
+
+    def test_sync_open_paper_orders_logs_again_when_failure_signature_changes(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-sync-fail-signature",
+                request_id="req-sync-fail-signature",
+                client_order_id="req-sync-fail-signature",
+                broker_order_id="broker-sync-fail-signature",
+                order_status="ACCEPTED",
+                broker_status_raw="accepted",
+            )
+            with patch(
+                "trade_scout.execution.reconciler.fetch_broker_order_by_id",
+                side_effect=[RuntimeError("Read timed out"), RuntimeError("Connection timed out")],
+            ), patch.object(
+                self.worker,
+                "_sync_failure_now",
+                side_effect=[100.0, 110.0],
+            ), patch("builtins.print") as print_mock:
+                self.worker.sync_open_paper_orders(conn, limit=10)
+                self.worker.sync_open_paper_orders(conn, limit=10)
+        finally:
+            conn.close()
+
+        failure_logs = [
+            str(call.args[0])
+            for call in print_mock.call_args_list
+            if call.args and "[execution-worker] sync failed paper_order_id=po-sync-fail-signature" in str(call.args[0])
+        ]
+        self.assertEqual(2, len(failure_logs))
+
+    def test_sync_open_paper_orders_clears_failure_throttle_after_recovery(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-sync-fail-recover",
+                request_id="req-sync-fail-recover",
+                client_order_id="req-sync-fail-recover",
+                broker_order_id="broker-sync-fail-recover",
+                order_status="ACCEPTED",
+                broker_status_raw="accepted",
+            )
+            with patch(
+                "trade_scout.execution.reconciler.fetch_broker_order_by_id",
+                side_effect=[
+                    RuntimeError("Read timed out"),
+                    self._broker_result(
+                        "broker-sync-fail-recover",
+                        broker_status_raw="accepted",
+                        accepted_ts_utc="2026-03-25T14:00:01+00:00",
+                        raw_response_json='{"id":"broker-sync-fail-recover","status":"accepted"}',
+                    ),
+                    RuntimeError("Read timed out"),
+                ],
+            ), patch.object(
+                self.worker,
+                "_sync_failure_now",
+                side_effect=[100.0, 110.0],
+            ), patch("builtins.print") as print_mock:
+                self.worker.sync_open_paper_orders(conn, limit=10)
+                self.worker.sync_open_paper_orders(conn, limit=10)
+                self.worker.sync_open_paper_orders(conn, limit=10)
+        finally:
+            conn.close()
+
+        failure_logs = [
+            str(call.args[0])
+            for call in print_mock.call_args_list
+            if call.args and "[execution-worker] sync failed paper_order_id=po-sync-fail-recover" in str(call.args[0])
+        ]
+        recovery_logs = [
+            str(call.args[0])
+            for call in print_mock.call_args_list
+            if call.args and "[execution-worker] sync recovered paper_order_id=po-sync-fail-recover" in str(call.args[0])
+        ]
+        self.assertEqual(2, len(failure_logs))
+        self.assertEqual(1, len(recovery_logs))
+
     def test_filled_order_ingests_one_entry_fill_and_updates_plan_summary(self) -> None:
         conn = get_connection(self.db_path)
         try:
