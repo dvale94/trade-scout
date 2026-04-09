@@ -142,6 +142,7 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertIn("tp2_target_qty", position_columns)
         self.assertIn("tp1_filled_qty", position_columns)
         self.assertIn("tp2_filled_qty", position_columns)
+        self.assertIn("stop_filled_qty", position_columns)
         self.assertIn("last_action_error", position_columns)
 
         self.assertIn("policy_id", policy_definition_columns)
@@ -3551,6 +3552,7 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual(0.4, fill_row["fill_qty"])
         self.assertEqual(115.0, fill_row["fill_px"])
         self.assertEqual(0.4, position_row["tp2_filled_qty"])
+        self.assertEqual(0.0, position_row["stop_filled_qty"])
         self.assertEqual(0.0, position_row["remaining_qty"])
         self.assertEqual(PaperPositionStatus.CLOSED.value, position_row["position_status"])
         self.assertEqual(PaperPositionActionStatus.NONE.value, position_row["pending_action_status"])
@@ -3648,11 +3650,13 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual(115.0, fill_row["fill_px"])
         self.assertEqual(1, fill_count)
         self.assertEqual(0.1, partial_row["tp2_filled_qty"])
+        self.assertEqual(0.0, partial_row["stop_filled_qty"])
         self.assertEqual(0.3, partial_row["remaining_qty"])
         self.assertEqual(PaperPositionActionStatus.WAIT_TP2_FILL.value, partial_row["pending_action_status"])
         self.assertEqual("po-tp2-partial", partial_row["active_tp2_paper_order_id"])
         self.assertEqual(PaperPositionStatus.PARTIAL.value, partial_row["position_status"])
         self.assertEqual(0.1, repeated_row["tp2_filled_qty"])
+        self.assertEqual(0.0, repeated_row["stop_filled_qty"])
         self.assertEqual(0.3, repeated_row["remaining_qty"])
         self.assertEqual(PaperPositionActionStatus.WAIT_TP2_FILL.value, repeated_row["pending_action_status"])
 
@@ -3736,6 +3740,7 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual(0.8, fill_row["fill_qty"])
         self.assertEqual(95.0, fill_row["fill_px"])
         self.assertEqual(1, fill_count)
+        self.assertEqual(0.8, position_row["stop_filled_qty"])
         self.assertEqual(0.0, position_row["remaining_qty"])
         self.assertEqual(PaperPositionStatus.CLOSED.value, position_row["position_status"])
         self.assertEqual(PaperPositionActionStatus.NONE.value, position_row["pending_action_status"])
@@ -3907,11 +3912,111 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual(1, fill_count)
         self.assertEqual(0.4, position_row["tp1_filled_qty"])
         self.assertEqual(0.0, position_row["tp2_filled_qty"])
+        self.assertEqual(0.4, position_row["stop_filled_qty"])
         self.assertEqual(0.0, position_row["remaining_qty"])
         self.assertEqual(PaperPositionStatus.CLOSED.value, position_row["position_status"])
         self.assertEqual(PaperPositionActionStatus.NONE.value, position_row["pending_action_status"])
         self.assertIsNone(position_row["active_stop_paper_order_id"])
         self.assertEqual("2026-03-25T20:30:00+00:00", position_row["closed_ts_utc"])
+
+    def test_stop_partial_fill_recomputes_remaining_qty_from_total_fill_truth(self) -> None:
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-stop-partial")
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-stop-partial",
+                request_id="req-stop-partial",
+                client_order_id="stop:plan-req-stop-partial",
+                broker_order_id="broker-stop-partial",
+                order_status="SUBMITTED",
+                order_role="STOP",
+                order_type="stop_limit",
+                qty=0.8,
+                notional=None,
+                limit_price=95.0,
+                stop_price=95.0,
+                broker_status_raw="new",
+                side="SHORT",
+                reduce_only=1,
+            )
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET position_status = ?, entry_filled_qty = ?, remaining_qty = ?, pending_action_status = ?,
+                    active_stop_paper_order_id = ?, stop_qty = ?, stop_price = ?, stop_limit_price = ?, opened_ts_utc = ?
+                WHERE request_id = ?
+                """,
+                (
+                    "OPEN",
+                    0.8,
+                    0.8,
+                    "NONE",
+                    "po-stop-partial",
+                    0.8,
+                    95.0,
+                    95.0,
+                    "2026-03-25T18:55:00+00:00",
+                    "req-stop-partial",
+                ),
+            )
+            conn.commit()
+            stop_order_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+                ("po-stop-partial",),
+            ).fetchone()
+
+            self.worker.reconcile_paper_order(
+                conn,
+                stop_order_row,
+                self._broker_result(
+                    "broker-stop-partial",
+                    broker_status_raw="partially_filled",
+                    filled_ts_utc="2026-03-25T19:00:00+00:00",
+                    filled_qty=0.25,
+                    filled_avg_price=95.0,
+                ),
+            )
+            partial_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-stop-partial",),
+            ).fetchone()
+
+            second_stop_order_row = conn.execute(
+                "SELECT * FROM paper_orders WHERE paper_order_id = ?",
+                ("po-stop-partial",),
+            ).fetchone()
+            self.worker.reconcile_paper_order(
+                conn,
+                second_stop_order_row,
+                self._broker_result(
+                    "broker-stop-partial",
+                    broker_status_raw="partially_filled",
+                    filled_ts_utc="2026-03-25T19:00:00+00:00",
+                    filled_qty=0.25,
+                    filled_avg_price=95.0,
+                ),
+            )
+            fill_row = get_paper_fill_by_order_id_and_role(conn, "po-stop-partial", "STOP")
+            fill_count = conn.execute(
+                "SELECT COUNT(*) AS n FROM paper_fills WHERE paper_order_id = ? AND fill_role = ?",
+                ("po-stop-partial", "STOP"),
+            ).fetchone()["n"]
+            repeated_row = conn.execute(
+                "SELECT * FROM paper_positions WHERE request_id = ?",
+                ("req-stop-partial",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertIsNotNone(fill_row)
+        self.assertEqual(0.25, fill_row["fill_qty"])
+        self.assertEqual(1, fill_count)
+        self.assertEqual(0.25, partial_row["stop_filled_qty"])
+        self.assertEqual(0.55, partial_row["remaining_qty"])
+        self.assertEqual(PaperPositionStatus.OPEN.value, partial_row["position_status"])
+        self.assertEqual(0.25, repeated_row["stop_filled_qty"])
+        self.assertEqual(0.55, repeated_row["remaining_qty"])
 
     def test_wait_tp2_fill_remains_when_tp2_has_no_fill_yet(self) -> None:
         conn = get_connection(self.db_path)

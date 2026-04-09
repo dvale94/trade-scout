@@ -225,6 +225,7 @@ def init_db(db_path: str) -> None:
                 tp2_target_qty REAL,
                 tp1_filled_qty REAL NOT NULL DEFAULT 0,
                 tp2_filled_qty REAL NOT NULL DEFAULT 0,
+                stop_filled_qty REAL NOT NULL DEFAULT 0,
                 last_action_error TEXT,
                 created_ts_utc TEXT NOT NULL,
                 updated_ts_utc TEXT NOT NULL,
@@ -422,6 +423,7 @@ def _ensure_paper_positions_columns(conn: sqlite3.Connection) -> None:
         "tp2_target_qty": "REAL",
         "tp1_filled_qty": "REAL NOT NULL DEFAULT 0",
         "tp2_filled_qty": "REAL NOT NULL DEFAULT 0",
+        "stop_filled_qty": "REAL NOT NULL DEFAULT 0",
         "last_action_error": "TEXT",
     }
     for column_name, column_def in additive_columns.items():
@@ -1004,11 +1006,12 @@ def ensure_paper_position(
                 tp2_target_qty,
                 tp1_filled_qty,
                 tp2_filled_qty,
+                stop_filled_qty,
                 last_action_error,
                 created_ts_utc,
                 updated_ts_utc,
                 schema_version
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 position_id,
@@ -1036,6 +1039,7 @@ def ensure_paper_position(
                 None,
                 None,
                 None,
+                0.0,
                 0.0,
                 0.0,
                 None,
@@ -1426,6 +1430,7 @@ def update_paper_position_from_entry_fill(
             entry_avg_fill_px = ?,
             opened_ts_utc = ?,
             remaining_qty = ?,
+            stop_filled_qty = COALESCE(stop_filled_qty, 0),
             updated_ts_utc = ?
         WHERE plan_id = ?
         """,
@@ -1585,10 +1590,11 @@ def apply_tp1_fill_to_position(
 
     entry_filled_qty = float(position_row["entry_filled_qty"] or 0.0)
     tp2_filled_qty = float(position_row["tp2_filled_qty"] or 0.0)
+    stop_filled_qty = float(position_row["stop_filled_qty"] or 0.0)
     bounded_tp1_filled_qty = max(0.0, min(tp1_filled_qty, entry_filled_qty))
     recomputed_remaining_qty = max(
         0.0,
-        round(entry_filled_qty - bounded_tp1_filled_qty - tp2_filled_qty, 8),
+        round(entry_filled_qty - bounded_tp1_filled_qty - tp2_filled_qty - stop_filled_qty, 8),
     )
 
     current_status = str(position_row["position_status"])
@@ -1645,10 +1651,11 @@ def apply_tp2_fill_to_position(
 
     entry_filled_qty = float(position_row["entry_filled_qty"] or 0.0)
     tp1_filled_qty = float(position_row["tp1_filled_qty"] or 0.0)
+    stop_filled_qty = float(position_row["stop_filled_qty"] or 0.0)
     bounded_tp2_filled_qty = max(0.0, min(tp2_filled_qty, entry_filled_qty))
     recomputed_remaining_qty = max(
         0.0,
-        round(entry_filled_qty - tp1_filled_qty - bounded_tp2_filled_qty, 8),
+        round(entry_filled_qty - tp1_filled_qty - bounded_tp2_filled_qty - stop_filled_qty, 8),
     )
 
     current_status = str(position_row["position_status"])
@@ -1714,12 +1721,15 @@ def apply_stop_fill_to_position(
     entry_filled_qty = float(position_row["entry_filled_qty"] or 0.0)
     tp1_filled_qty = float(position_row["tp1_filled_qty"] or 0.0)
     tp2_filled_qty = float(position_row["tp2_filled_qty"] or 0.0)
-    current_remaining_qty = max(
+    max_stop_fillable_qty = max(
         0.0,
         round(entry_filled_qty - tp1_filled_qty - tp2_filled_qty, 8),
     )
-    bounded_stop_filled_qty = max(0.0, min(stop_filled_qty, current_remaining_qty))
-    recomputed_remaining_qty = current_remaining_qty
+    bounded_stop_filled_qty = max(0.0, min(stop_filled_qty, max_stop_fillable_qty))
+    recomputed_remaining_qty = max(
+        0.0,
+        round(entry_filled_qty - tp1_filled_qty - tp2_filled_qty - bounded_stop_filled_qty, 8),
+    )
 
     current_status = str(position_row["position_status"])
     next_status = current_status
@@ -1742,7 +1752,8 @@ def apply_stop_fill_to_position(
     conn.execute(
         """
         UPDATE paper_positions
-        SET remaining_qty = ?,
+        SET stop_filled_qty = ?,
+            remaining_qty = ?,
             position_status = ?,
             pending_action_status = ?,
             active_stop_paper_order_id = ?,
@@ -1751,6 +1762,7 @@ def apply_stop_fill_to_position(
         WHERE plan_id = ?
         """,
         (
+            bounded_stop_filled_qty,
             recomputed_remaining_qty,
             next_status,
             next_pending_action_status,
