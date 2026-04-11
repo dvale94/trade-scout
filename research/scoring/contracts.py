@@ -172,6 +172,8 @@ DEFAULT_SCORING_CONTRACT = ScoringContract(
         "feature_set_version",
         "score_recipe_version",
         "score_recipe_mode",
+        "score_bucket_version",
+        "shadow_score_status",
         "pred_expected_r",
         "pred_win_prob",
         "pred_expected_mfe",

@@ -10,6 +10,7 @@ class RuntimeShadowScoreConfig:
     feature_set_version: str
     score_recipe_version: str
     score_recipe_mode: str
+    score_bucket_version: str = "shadow_score_buckets_v1"
     enabled: bool = True
     expected_r_intercept: float | None = None
     expected_r_weights: dict[str, float] | None = None
@@ -21,6 +22,8 @@ class RuntimeShadowScoreOutput:
     feature_set_version: str
     score_recipe_version: str
     score_recipe_mode: str
+    score_bucket_version: str
+    shadow_score_status: str
     pred_expected_r: float | None
     pred_win_prob: float | None
     pred_expected_mfe: float | None
@@ -33,6 +36,8 @@ class RuntimeShadowScoreOutput:
             "feature_set_version": self.feature_set_version,
             "score_recipe_version": self.score_recipe_version,
             "score_recipe_mode": self.score_recipe_mode,
+            "score_bucket_version": self.score_bucket_version,
+            "shadow_score_status": self.shadow_score_status,
             "pred_expected_r": self.pred_expected_r,
             "pred_win_prob": self.pred_win_prob,
             "pred_expected_mfe": self.pred_expected_mfe,

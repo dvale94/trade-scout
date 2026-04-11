@@ -244,6 +244,8 @@ class AlertPipelinePolicyIntegrationTest(unittest.TestCase):
                     feature_set_version="score_features_v1",
                     score_recipe_version="score_recipe_expected_r_v1",
                     score_recipe_mode="expected_r_only",
+                    score_bucket_version="shadow_score_buckets_v1",
+                    shadow_score_status="SCORED",
                     pred_expected_r=0.42,
                     pred_win_prob=None,
                     pred_expected_mfe=None,
@@ -265,6 +267,7 @@ class AlertPipelinePolicyIntegrationTest(unittest.TestCase):
         self.assertEqual(1, len(context_rows))
         self.assertEqual(0.42, context_rows[0].score_shadow)
         self.assertEqual("expected_r_only", context_rows[0].score_recipe_mode)
+        self.assertEqual("SCORED", context_rows[0].shadow_score_status)
         self.assertFalse(hasattr(intent_rows[0], "score_shadow"))
         self.assertTrue(side_effects["notify"].called)
         self.assertEqual(1, len(context.watch_mgr.added))
@@ -282,6 +285,7 @@ class AlertPipelinePolicyIntegrationTest(unittest.TestCase):
 
         context_rows = [call.args[0] for call in side_effects["log_context"].call_args_list if call.args]
         self.assertIsNone(context_rows[0].score_shadow)
+        self.assertEqual("ERROR", context_rows[0].shadow_score_status)
         self.assertTrue(side_effects["notify"].called)
         self.assertEqual(1, len(context.watch_mgr.added))
         self.assertTrue(
@@ -308,6 +312,7 @@ class AlertPipelinePolicyIntegrationTest(unittest.TestCase):
 
         context_rows = [call.args[0] for call in side_effects["log_context"].call_args_list if call.args]
         self.assertEqual("shadow_score_disabled", context_rows[0].score_model_version)
+        self.assertEqual("DISABLED", context_rows[0].shadow_score_status)
         self.assertIsNone(context_rows[0].score_shadow)
         self.assertTrue(side_effects["notify"].called)
         self.assertEqual(1, len(context.watch_mgr.added))
@@ -319,6 +324,76 @@ class AlertPipelinePolicyIntegrationTest(unittest.TestCase):
                 if call.args
             )
         )
+
+    def test_unsupported_shadow_recipe_mode_degrades_without_breaking_alert_flow(self) -> None:
+        with patch.dict("os.environ", {"SHADOW_SCORE_RECIPE_MODE": "blended"}), patch("builtins.print") as print_mock:
+            pipeline, context = self._make_pipeline()
+
+        with self._patch_alert_side_effects() as side_effects, patch(
+            "trade_scout.alert_pipeline.uuid4",
+            side_effect=["provisional-1", "alert-1"],
+        ):
+            pipeline.process(**self._process_kwargs())
+
+        context_row = side_effects["log_context"].call_args.args[0]
+        self.assertEqual("DISABLED", context_row.shadow_score_status)
+        self.assertIsNone(context_row.score_shadow)
+        self.assertTrue(side_effects["notify"].called)
+        self.assertEqual(1, len(context.watch_mgr.added))
+        self.assertTrue(
+            any(
+                "unsupported SHADOW_SCORE_RECIPE_MODE='blended'"
+                in str(call.args[0])
+                for call in print_mock.call_args_list
+                if call.args
+            )
+        )
+
+    def test_different_shadow_scores_do_not_change_live_alert_behavior(self) -> None:
+        live_results = []
+
+        for idx, score_shadow in enumerate((0.1, 0.9), start=1):
+            pipeline, context = self._make_pipeline(
+                shadow_scorer=SimpleNamespace(
+                    score=lambda intent_row, context_row, value=score_shadow: RuntimeShadowScoreOutput(
+                        score_model_version="shadow_score_v1_expected_r_only",
+                        feature_set_version="score_features_v1",
+                        score_recipe_version="score_recipe_expected_r_v1",
+                        score_recipe_mode="expected_r_only",
+                        score_bucket_version="shadow_score_buckets_v1",
+                        shadow_score_status="SCORED",
+                        pred_expected_r=value,
+                        pred_win_prob=None,
+                        pred_expected_mfe=None,
+                        score_shadow=value,
+                        score_shadow_bucket="LOW_POSITIVE" if value < 0.25 else "HIGH_POSITIVE",
+                    )
+                )
+            )
+
+            with self._patch_alert_side_effects() as side_effects, patch(
+                "trade_scout.alert_pipeline.uuid4",
+                side_effect=[f"provisional-{idx}", f"alert-{idx}"],
+            ):
+                pipeline.process(**self._process_kwargs())
+
+            live_results.append(
+                {
+                    "notified": side_effects["notify"].called,
+                    "watch_count": len(context.watch_mgr.added),
+                    "watch_score": context.watch_mgr.added[0].score,
+                    "intent_status": side_effects["log_intent"].call_args.args[0].alert_status,
+                    "shadow_score": side_effects["log_context"].call_args.args[0].score_shadow,
+                }
+            )
+
+        self.assertEqual(0.1, live_results[0]["shadow_score"])
+        self.assertEqual(0.9, live_results[1]["shadow_score"])
+        for result in live_results:
+            self.assertTrue(result["notified"])
+            self.assertEqual(1, result["watch_count"])
+            self.assertEqual(8.2, result["watch_score"])
+            self.assertEqual("ALERT_CREATED", result["intent_status"])
 
     def test_no_active_policy_log_includes_reason_policy_name_and_mode(self) -> None:
         pipeline, _ = self._make_pipeline()

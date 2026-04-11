@@ -19,6 +19,7 @@ from .policy.models import PolicyConfig
 from .policy.repository import PolicyRepository
 from .runtime_context import EnabledStrategy, RuntimeContext
 from .scoring import RuntimeShadowScoreConfig, RuntimeShadowScorer, active_shadow_score_config
+from .scoring.scorer import SHADOW_SCORE_STATUS_ERROR
 from .strategies.types import SetupCandidate
 from .strategy import Candidate
 from .execution.models import ExecutionRequest, ExecutionStatus
@@ -109,6 +110,7 @@ class AlertPipeline:
                     feature_set_version="score_features_v1",
                     score_recipe_version="score_recipe_disabled",
                     score_recipe_mode="disabled",
+                    score_bucket_version="shadow_score_buckets_v1",
                     enabled=False,
                 )
             )
@@ -194,12 +196,13 @@ class AlertPipeline:
             output = self.shadow_scorer.score(intent_row, context_row)
         except Exception as exc:
             print(f"[shadow-score] error alert_id={alert_id} mode=SHADOW stage=score error={exc}")
-            return context_row
+            return replace(context_row, shadow_score_status=SHADOW_SCORE_STATUS_ERROR)
 
         print(
             f"[shadow-score] evaluated alert_id={alert_id} "
             f"score_model_version={output.score_model_version} "
-            f"score_recipe_mode={output.score_recipe_mode} mode=SHADOW"
+            f"score_recipe_mode={output.score_recipe_mode} "
+            f"status={output.shadow_score_status} has_score={output.score_shadow is not None} mode=SHADOW"
         )
         return replace(context_row, **output.to_context_updates())
 

@@ -151,6 +151,8 @@ class AlertContextRow:
     feature_set_version: str | None = None
     score_recipe_version: str | None = None
     score_recipe_mode: str | None = None
+    score_bucket_version: str | None = None
+    shadow_score_status: str | None = None
     pred_expected_r: float | None = None
     pred_win_prob: float | None = None
     pred_expected_mfe: float | None = None
@@ -217,6 +219,8 @@ class AlertContextRow:
             "feature_set_version": self.feature_set_version,
             "score_recipe_version": self.score_recipe_version,
             "score_recipe_mode": self.score_recipe_mode,
+            "score_bucket_version": self.score_bucket_version,
+            "shadow_score_status": self.shadow_score_status,
             "pred_expected_r": self.pred_expected_r,
             "pred_win_prob": self.pred_win_prob,
             "pred_expected_mfe": self.pred_expected_mfe,

@@ -5,7 +5,12 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from trade_scout.scoring import RuntimeShadowScorer
-from trade_scout.scoring.features import build_shadow_score_features
+from trade_scout.scoring.buckets import shadow_score_bucket
+from trade_scout.scoring.features import (
+    RUNTIME_SHADOW_SCORE_FEATURE_COLUMNS,
+    build_shadow_score_features,
+    validate_runtime_feature_keys,
+)
 from trade_scout.scoring.models import RuntimeShadowScoreConfig
 from trade_scout.scoring.registry import active_shadow_score_config
 
@@ -37,6 +42,22 @@ class RuntimeShadowScoringTest(unittest.TestCase):
         self.assertEqual(-0.5, config.expected_r_intercept)
         self.assertEqual({"score": 0.1, "risk_pct": 2.0}, config.expected_r_weights)
 
+    def test_unsupported_runtime_recipe_mode_is_rejected_by_config(self) -> None:
+        with patch.dict("os.environ", {"SHADOW_SCORE_RECIPE_MODE": "blended"}):
+            with self.assertRaisesRegex(ValueError, "unsupported SHADOW_SCORE_RECIPE_MODE"):
+                active_shadow_score_config()
+
+    def test_unsupported_runtime_recipe_mode_is_rejected_by_scorer(self) -> None:
+        config = RuntimeShadowScoreConfig(
+            score_model_version="shadow_score_v1_blended",
+            feature_set_version="score_features_v1",
+            score_recipe_version="score_recipe_blended_v1",
+            score_recipe_mode="blended",
+        )
+
+        with self.assertRaisesRegex(ValueError, "unsupported runtime shadow score recipe mode"):
+            RuntimeShadowScorer(config)
+
     def test_expected_r_only_output_shape_with_missing_artifact_is_null_safe(self) -> None:
         scorer = RuntimeShadowScorer(
             RuntimeShadowScoreConfig(
@@ -50,9 +71,26 @@ class RuntimeShadowScoringTest(unittest.TestCase):
         output = scorer.score(self._intent(), self._context())
 
         self.assertEqual("shadow_score_v1_expected_r_only", output.score_model_version)
+        self.assertEqual("UNCONFIGURED", output.shadow_score_status)
         self.assertIsNone(output.pred_expected_r)
         self.assertIsNone(output.score_shadow)
         self.assertIsNone(output.score_shadow_bucket)
+
+    def test_disabled_output_is_distinct_from_unconfigured(self) -> None:
+        scorer = RuntimeShadowScorer(
+            RuntimeShadowScoreConfig(
+                score_model_version="shadow_score_disabled",
+                feature_set_version="score_features_v1",
+                score_recipe_version="score_recipe_disabled",
+                score_recipe_mode="disabled",
+                enabled=False,
+            )
+        )
+
+        output = scorer.score(self._intent(), self._context())
+
+        self.assertEqual("DISABLED", output.shadow_score_status)
+        self.assertIsNone(output.score_shadow)
 
     def test_expected_r_only_computes_from_configured_weights(self) -> None:
         scorer = RuntimeShadowScorer(
@@ -70,7 +108,23 @@ class RuntimeShadowScoringTest(unittest.TestCase):
 
         self.assertAlmostEqual(1.234059, output.pred_expected_r)
         self.assertEqual(output.pred_expected_r, output.score_shadow)
+        self.assertEqual("SCORED", output.shadow_score_status)
         self.assertEqual("HIGH_POSITIVE", output.score_shadow_bucket)
+
+    def test_shadow_score_buckets_are_explicit_and_stable(self) -> None:
+        cases = [
+            (None, None),
+            (-0.01, "NEGATIVE"),
+            (0.0, "LOW_POSITIVE"),
+            (0.2499, "LOW_POSITIVE"),
+            (0.25, "MEDIUM_POSITIVE"),
+            (0.7499, "MEDIUM_POSITIVE"),
+            (0.75, "HIGH_POSITIVE"),
+        ]
+
+        for score, expected_bucket in cases:
+            with self.subTest(score=score):
+                self.assertEqual(expected_bucket, shadow_score_bucket(score))
 
     def test_feature_builder_uses_alert_time_fields_only_and_handles_missing(self) -> None:
         features = build_shadow_score_features(self._intent(risk_usd=None), self._context(anchor_regime=None))
@@ -80,6 +134,14 @@ class RuntimeShadowScoringTest(unittest.TestCase):
         self.assertIsNone(features["risk_usd"])
         self.assertIsNone(features["anchor_regime"])
         self.assertAlmostEqual((101.0 - 95.0) / 101.0, features["risk_pct"])
+        self.assertEqual(set(RUNTIME_SHADOW_SCORE_FEATURE_COLUMNS), set(features))
+
+    def test_runtime_feature_parity_guard_detects_drift(self) -> None:
+        features = build_shadow_score_features(self._intent(), self._context())
+        features.pop("score")
+
+        with self.assertRaisesRegex(ValueError, "runtime shadow score feature drift"):
+            validate_runtime_feature_keys(features)
 
     def _intent(self, **overrides):
         values = {

@@ -2,6 +2,64 @@ from __future__ import annotations
 
 from typing import Any
 
+RUNTIME_SCORE_FEATURE_SET_VERSION = "score_features_v1"
+
+RUNTIME_SHADOW_SCORE_FEATURE_COLUMNS = (
+    "score",
+    "signal_px",
+    "entry_low",
+    "entry_high",
+    "stop_px",
+    "t1_px",
+    "t2_px",
+    "timeframe_min",
+    "timeout_seconds",
+    "stop_distance",
+    "t1_R",
+    "t2_R",
+    "risk_usd",
+    "qty",
+    "signal_hour_utc",
+    "atr",
+    "ma20",
+    "ma50",
+    "ma200",
+    "breakout_level",
+    "breakout_distance_atr",
+    "ma20_distance_atr",
+    "ma50_distance_atr",
+    "ma200_distance_atr",
+    "ma20_slope_pct",
+    "ma50_slope_pct",
+    "range_pct",
+    "close_location_in_bar",
+    "entry_zone_width_pct",
+    "anchor_close",
+    "anchor_ma50",
+    "anchor_ma200",
+    "vol_z",
+    "extended_atr",
+    "symbol",
+    "side",
+    "market_type",
+    "strategy_profile",
+    "strategy_id",
+    "strategy_version",
+    "setup_family",
+    "tier",
+    "signal_px_type",
+    "risk_model",
+    "qty_model",
+    "anchor_symbol",
+    "anchor_regime",
+    "market_regime",
+    "volatility_regime",
+    "anchor_trend_1h",
+    "anchor_trend_4h",
+    "anchor_trend_1d",
+    "risk_pct",
+)
+
 
 def _float_or_none(value: Any) -> float | None:
     try:
@@ -68,7 +126,17 @@ def build_shadow_score_features(intent_row: Any, context_row: Any) -> dict[str, 
     }
 
     fields["risk_pct"] = _risk_pct(fields.get("entry_high"), fields.get("stop_px"))
+    validate_runtime_feature_keys(fields)
     return fields
+
+
+def validate_runtime_feature_keys(features: dict[str, object]) -> None:
+    expected = set(RUNTIME_SHADOW_SCORE_FEATURE_COLUMNS)
+    actual = set(features)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        extra = sorted(actual - expected)
+        raise ValueError(f"runtime shadow score feature drift missing={missing} extra={extra}")
 
 
 def _risk_pct(entry_high: object, stop_px: object) -> float | None:
