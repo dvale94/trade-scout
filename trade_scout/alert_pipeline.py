@@ -18,6 +18,8 @@ from .policy.evaluator import evaluate_policy
 from .policy.models import PolicyConfig
 from .policy.repository import PolicyRepository
 from .runtime_context import EnabledStrategy, RuntimeContext
+from .scoring import RuntimeShadowScoreConfig, RuntimeShadowScorer, active_shadow_score_config
+from .scoring.scorer import SHADOW_SCORE_STATUS_ERROR
 from .strategies.types import SetupCandidate
 from .strategy import Candidate
 from .execution.models import ExecutionRequest, ExecutionStatus
@@ -80,11 +82,13 @@ class AlertPipeline:
         *,
         policy_repository: PolicyRepository | None = None,
         policy_name: str = POLICY_NAME,
+        shadow_scorer: RuntimeShadowScorer | None = None,
     ):
         self.context = context
         self.policy_repository = policy_repository or PolicyRepository(config.EXECUTION_DB_PATH)
         self.execution_db_path = getattr(self.policy_repository, "db_path", config.EXECUTION_DB_PATH)
         self.policy_name = policy_name
+        self.shadow_scorer = shadow_scorer or self._build_shadow_scorer()
         self._policy_runtime_ready = False
         try:
             self.policy_repository.init_db()
@@ -93,6 +97,22 @@ class AlertPipeline:
             print(
                 f"[policy] error alert_id=UNKNOWN stage=init_db "
                 f"policy_name={self.policy_name} mode=SHADOW error={exc}"
+            )
+
+    def _build_shadow_scorer(self) -> RuntimeShadowScorer:
+        try:
+            return RuntimeShadowScorer(active_shadow_score_config())
+        except Exception as exc:
+            print(f"[shadow-score] error alert_id=UNKNOWN mode=SHADOW stage=config error={exc}")
+            return RuntimeShadowScorer(
+                RuntimeShadowScoreConfig(
+                    score_model_version="shadow_score_disabled",
+                    feature_set_version="score_features_v1",
+                    score_recipe_version="score_recipe_disabled",
+                    score_recipe_mode="disabled",
+                    score_bucket_version="shadow_score_buckets_v1",
+                    enabled=False,
+                )
             )
 
     def _log_intent_and_context(self, symbol: str, core_row, context_row) -> None:
@@ -169,6 +189,22 @@ class AlertPipeline:
             f"[policy] error alert_id={alert_id} stage={stage} "
             f"policy_name={self.policy_name} mode=SHADOW error={error}"
         )
+
+    def _apply_shadow_score(self, intent_row, context_row):
+        alert_id = str(intent_row.alert_id)
+        try:
+            output = self.shadow_scorer.score(intent_row, context_row)
+        except Exception as exc:
+            print(f"[shadow-score] error alert_id={alert_id} mode=SHADOW stage=score error={exc}")
+            return replace(context_row, shadow_score_status=SHADOW_SCORE_STATUS_ERROR)
+
+        print(
+            f"[shadow-score] evaluated alert_id={alert_id} "
+            f"score_model_version={output.score_model_version} "
+            f"score_recipe_mode={output.score_recipe_mode} "
+            f"status={output.shadow_score_status} has_score={output.score_shadow is not None} mode=SHADOW"
+        )
+        return replace(context_row, **output.to_context_updates())
 
     def _should_auto_create_execution_request(self, *, symbol: str) -> bool:
         mode = _normalized_auto_execution_mode(config.AUTO_EXECUTION_MODE)
@@ -325,6 +361,8 @@ class AlertPipeline:
                 )
                 self._log_intent_and_context(symbol, intent_row, alert_context_row)
                 return
+
+            alert_context_row = self._apply_shadow_score(intent_row, alert_context_row)
 
             self._process_policy_shadow(intent_row, alert_context_row)
 
