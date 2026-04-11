@@ -4,3 +4,4 @@ ipykernel>=6.0
 pandas==2.2.3
 duckdb>=0.10.0
 python-dotenv==1.0.1
+scikit-learn>=1.4.0

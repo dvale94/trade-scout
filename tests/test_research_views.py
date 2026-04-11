@@ -30,13 +30,17 @@ class ResearchViewsTest(unittest.TestCase):
             """
             CREATE TABLE alerts_intents (
               alert_id VARCHAR,
+              symbol VARCHAR,
+              side VARCHAR,
               market_type VARCHAR,
               strategy_profile VARCHAR,
               strategy_version VARCHAR,
               strategy_id VARCHAR,
               setup_family VARCHAR,
               strategy_params_hash VARCHAR,
+              config_hash VARCHAR,
               tier VARCHAR,
+              signal_ts_utc VARCHAR,
               alert_status VARCHAR
             )
             """
