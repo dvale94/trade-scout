@@ -92,6 +92,25 @@ class ScoringResearchTest(unittest.TestCase):
         self.assertEqual(out["score_recipe_version"].unique().tolist(), ["score_recipe_blended_v1"])
         self.assertTrue(out["score_shadow"].notna().all())
 
+    def test_prediction_output_preserves_timezone_aware_signal_timestamp(self):
+        frame = pd.DataFrame(
+            {
+                "alert_id": ["a1"],
+                "signal_ts_utc": pd.to_datetime(["2026-01-01T00:00:00Z"], utc=True),
+            }
+        )
+
+        out = build_prediction_output(
+            frame,
+            score_model_version="shadow_score_v1",
+            feature_set_version="score_features_v1",
+            pred_expected_r=pd.Series([0.2]),
+        )
+
+        merged = frame.merge(out, on=["alert_id", "signal_ts_utc"], how="left", validate="1:1")
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(str(out["signal_ts_utc"].dtype), str(frame["signal_ts_utc"].dtype))
+
     def test_score_recipe_composition_modes_are_explicit(self):
         expected_r = pd.Series([0.2, 0.4])
         win_prob = pd.Series([0.6, 0.8])

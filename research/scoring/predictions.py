@@ -43,7 +43,7 @@ def build_prediction_output(
     """Build version-aware shadow prediction output rows."""
     out = pd.DataFrame(index=frame.index)
     out["alert_id"] = frame["alert_id"].values if "alert_id" in frame.columns else pd.NA
-    out["signal_ts_utc"] = frame["signal_ts_utc"].values if "signal_ts_utc" in frame.columns else pd.NA
+    out["signal_ts_utc"] = frame["signal_ts_utc"] if "signal_ts_utc" in frame.columns else pd.NA
     out["score_model_version"] = score_model_version
     out["feature_set_version"] = feature_set_version
     out["score_recipe_version"] = score_recipe.recipe_version
