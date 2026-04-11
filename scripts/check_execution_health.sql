@@ -10,6 +10,10 @@
 -- - The broken remaining_qty invariant check below derives STOP quantity from
 --   paper_fills so it remains usable on older DB snapshots that do not have
 --   paper_positions.stop_filled_qty.
+-- - Dust checks use the default execution residual dust notional threshold of
+--   1.0 unless you edit the params CTE below to match your environment.
+-- - Dust notional is estimated as:
+--   residual_qty * max(entry_avg_fill_px, stop_price, stop_limit_price).
 -- - The Python wrapper prints a compact PASS/WARN/FAIL summary.
 
 .headers on
@@ -26,17 +30,125 @@ SELECT
 FROM paper_positions
 WHERE position_status = 'ERROR';
 
--- 2. Closed positions with leftover quantity
+-- 2a. Acceptable closed dust residuals.
+-- Informational only: these are CLOSED positions with nonzero remaining_qty
+-- whose estimated residual notional is at or below the dust threshold.
+WITH params AS (
+    SELECT 1.0 AS dust_notional_threshold
+),
+closed_residuals AS (
+    SELECT
+        p.*,
+        MAX(
+            COALESCE(p.entry_avg_fill_px, 0),
+            COALESCE(p.stop_price, 0),
+            COALESCE(p.stop_limit_price, 0)
+        ) AS reference_price_estimate,
+        ABS(COALESCE(p.remaining_qty, 0)) * MAX(
+            COALESCE(p.entry_avg_fill_px, 0),
+            COALESCE(p.stop_price, 0),
+            COALESCE(p.stop_limit_price, 0)
+        ) AS remaining_notional_estimate
+    FROM paper_positions p
+    WHERE p.position_status = 'CLOSED'
+      AND ABS(COALESCE(p.remaining_qty, 0)) > 0.00000001
+)
 SELECT
-    'closed_with_leftover_qty' AS check_name,
-    *
-FROM paper_positions
-WHERE position_status = 'CLOSED'
-  AND ABS(COALESCE(remaining_qty, 0)) > 0.00000001;
+    'acceptable_closed_dust_residuals' AS check_name,
+    cr.*
+FROM closed_residuals cr
+CROSS JOIN params
+WHERE cr.remaining_notional_estimate <= params.dust_notional_threshold;
 
--- 3. Broken remaining_qty invariant.
+-- 2b. Unexpected closed residuals above dust threshold.
+WITH params AS (
+    SELECT 1.0 AS dust_notional_threshold
+),
+closed_residuals AS (
+    SELECT
+        p.*,
+        MAX(
+            COALESCE(p.entry_avg_fill_px, 0),
+            COALESCE(p.stop_price, 0),
+            COALESCE(p.stop_limit_price, 0)
+        ) AS reference_price_estimate,
+        ABS(COALESCE(p.remaining_qty, 0)) * MAX(
+            COALESCE(p.entry_avg_fill_px, 0),
+            COALESCE(p.stop_price, 0),
+            COALESCE(p.stop_limit_price, 0)
+        ) AS remaining_notional_estimate
+    FROM paper_positions p
+    WHERE p.position_status = 'CLOSED'
+      AND ABS(COALESCE(p.remaining_qty, 0)) > 0.00000001
+)
+SELECT
+    'unexpected_closed_positions_with_leftover_qty' AS check_name,
+    cr.*
+FROM closed_residuals cr
+CROSS JOIN params
+WHERE cr.remaining_notional_estimate > params.dust_notional_threshold;
+
+-- 3a. Acceptable dust remaining_qty invariant mismatches.
 -- Uses STOP quantity derived from paper_fills so this remains notebook-safe and
 -- compatible with DB snapshots where paper_positions.stop_filled_qty is absent.
+-- Informational only when the expected residual notional is under threshold.
+WITH params AS (
+    SELECT 1.0 AS dust_notional_threshold
+),
+fill_stop AS (
+    SELECT
+        plan_id,
+        SUM(CASE WHEN fill_role = 'STOP' THEN COALESCE(fill_qty, 0) ELSE 0 END) AS stop_fill_qty
+    FROM paper_fills
+    GROUP BY plan_id
+),
+qty_check AS (
+    SELECT
+        p.position_id,
+        p.plan_id,
+        p.request_id,
+        p.alert_id,
+        p.symbol,
+        p.position_status,
+        p.entry_avg_fill_px,
+        p.stop_price,
+        p.stop_limit_price,
+        p.entry_filled_qty,
+        p.tp1_filled_qty,
+        p.tp2_filled_qty,
+        COALESCE(fs.stop_fill_qty, 0) AS stop_filled_qty_from_fills,
+        p.remaining_qty,
+        MAX(
+            COALESCE(p.entry_filled_qty, 0)
+            - COALESCE(p.tp1_filled_qty, 0)
+            - COALESCE(p.tp2_filled_qty, 0)
+            - COALESCE(fs.stop_fill_qty, 0),
+            0
+        ) AS expected_remaining_qty_from_fills,
+        MAX(
+            COALESCE(p.entry_avg_fill_px, 0),
+            COALESCE(p.stop_price, 0),
+            COALESCE(p.stop_limit_price, 0)
+        ) AS reference_price_estimate
+    FROM paper_positions p
+    LEFT JOIN fill_stop fs
+        ON fs.plan_id = p.plan_id
+),
+qty_check_with_notional AS (
+    SELECT
+        *,
+        ABS(expected_remaining_qty_from_fills) * reference_price_estimate AS expected_remaining_notional_estimate
+    FROM qty_check
+)
+SELECT
+    'acceptable_dust_invariant_mismatches' AS check_name,
+    q.*
+FROM qty_check_with_notional q
+CROSS JOIN params
+WHERE ABS(COALESCE(remaining_qty, 0) - expected_remaining_qty_from_fills) > 0.00000001
+  AND q.expected_remaining_notional_estimate <= params.dust_notional_threshold;
+
+-- 3b. Unexpected remaining_qty invariant failures above dust threshold.
 WITH fill_stop AS (
     SELECT
         plan_id,
@@ -52,6 +164,9 @@ qty_check AS (
         p.alert_id,
         p.symbol,
         p.position_status,
+        p.entry_avg_fill_px,
+        p.stop_price,
+        p.stop_limit_price,
         p.entry_filled_qty,
         p.tp1_filled_qty,
         p.tp2_filled_qty,
@@ -64,15 +179,32 @@ qty_check AS (
             - COALESCE(fs.stop_fill_qty, 0),
             0
         ) AS expected_remaining_qty_from_fills
+        ,
+        MAX(
+            COALESCE(p.entry_avg_fill_px, 0),
+            COALESCE(p.stop_price, 0),
+            COALESCE(p.stop_limit_price, 0)
+        ) AS reference_price_estimate
     FROM paper_positions p
     LEFT JOIN fill_stop fs
         ON fs.plan_id = p.plan_id
+),
+params AS (
+    SELECT 1.0 AS dust_notional_threshold
+),
+qty_check_with_notional AS (
+    SELECT
+        *,
+        ABS(expected_remaining_qty_from_fills) * reference_price_estimate AS expected_remaining_notional_estimate
+    FROM qty_check
 )
 SELECT
-    'broken_remaining_qty_invariant_fill_derived' AS check_name,
-    *
-FROM qty_check
-WHERE ABS(COALESCE(remaining_qty, 0) - expected_remaining_qty_from_fills) > 0.00000001;
+    'unexpected_remaining_qty_invariant_failures' AS check_name,
+    q.*
+FROM qty_check_with_notional q
+CROSS JOIN params
+WHERE ABS(COALESCE(remaining_qty, 0) - expected_remaining_qty_from_fills) > 0.00000001
+  AND q.expected_remaining_notional_estimate > params.dust_notional_threshold;
 
 -- 4. Plans without positions
 SELECT

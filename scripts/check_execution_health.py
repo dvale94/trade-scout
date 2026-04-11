@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,7 @@ from research.execution_analysis import (  # noqa: E402
 
 
 QTY_TOLERANCE = 1e-8
+DEFAULT_RESIDUAL_DUST_NOTIONAL = 1.0
 OLD_REQUEST_MINUTES = 30
 STALE_PENDING_ACTION_MINUTES = 15
 NONTERMINAL_REQUEST_STATUSES = {"PENDING", "CLAIMED", "VALIDATED"}
@@ -44,6 +46,8 @@ class HealthCheck:
 
     @property
     def status(self) -> str:
+        if self.severity == "INFO":
+            return "INFO" if self.count > 0 else "PASS"
         if self.count <= 0:
             return "PASS"
         return self.severity
@@ -65,6 +69,15 @@ def _request_age_minutes(execution_requests: pd.DataFrame) -> pd.Series:
     return (now - requested_ts).dt.total_seconds() / 60.0
 
 
+def residual_dust_notional_threshold() -> float:
+    """Read the execution residual dust notional threshold without mutating runtime state."""
+    raw = os.getenv("EXECUTION_RESIDUAL_DUST_NOTIONAL", str(DEFAULT_RESIDUAL_DUST_NOTIONAL)).strip()
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        return DEFAULT_RESIDUAL_DUST_NOTIONAL
+
+
 def _position_action_age_minutes(paper_positions: pd.DataFrame) -> pd.Series:
     # There is no dedicated action-updated timestamp today, so updated_ts_utc is
     # the best read-only proxy for how long the pending action has been present.
@@ -80,6 +93,20 @@ def _format_counts(df: pd.DataFrame, column: str, *, label_map: dict[str, str] |
     if label_map:
         return ", ".join(f"{label_map.get(key, key)}={int(value)}" for key, value in counts.items())
     return ", ".join(f"{key}={int(value)}" for key, value in counts.items())
+
+
+def _reference_price_estimate(df: pd.DataFrame) -> pd.Series:
+    # The runtime dust policy estimates notional from the best local execution
+    # summary price. This mirrors that analysis-only heuristic:
+    # max(entry_avg_fill_px, stop_price, stop_limit_price).
+    candidates = [
+        _to_numeric(df, "entry_avg_fill_px"),
+        _to_numeric(df, "stop_price"),
+        _to_numeric(df, "stop_limit_price"),
+    ]
+    if not candidates:
+        return pd.Series(0.0, index=df.index, dtype="float64")
+    return pd.concat(candidates, axis=1).max(axis=1).fillna(0.0)
 
 
 def build_health_frames(frames: dict[str, pd.DataFrame]) -> tuple[dict[str, pd.DataFrame], bool]:
@@ -118,6 +145,14 @@ def build_health_frames(frames: dict[str, pd.DataFrame]) -> tuple[dict[str, pd.D
     positions_with_qty["remaining_qty_delta"] = (
         positions_with_qty["remaining_qty_numeric"] - positions_with_qty["expected_remaining_qty"]
     ).abs()
+    positions_with_qty["reference_price_estimate"] = _reference_price_estimate(positions_with_qty)
+    positions_with_qty["remaining_notional_estimate"] = (
+        positions_with_qty["remaining_qty_numeric"].abs() * positions_with_qty["reference_price_estimate"]
+    )
+    positions_with_qty["expected_remaining_notional_estimate"] = (
+        positions_with_qty["expected_remaining_qty"].abs() * positions_with_qty["reference_price_estimate"]
+    )
+    dust_threshold = residual_dust_notional_threshold()
 
     if execution_requests.empty:
         requests_without_plans = execution_requests.copy()
@@ -198,15 +233,33 @@ def build_health_frames(frames: dict[str, pd.DataFrame]) -> tuple[dict[str, pd.D
         nonterminal_requests.get("age_minutes", pd.Series(dtype="float64")) > OLD_REQUEST_MINUTES
     ].copy()
 
+    closed_leftover = positions_with_qty.loc[
+        positions_with_qty["position_status"].astype(str).eq("CLOSED")
+        & (positions_with_qty["remaining_qty_numeric"].abs() > QTY_TOLERANCE)
+    ].copy()
+    acceptable_closed_dust_residuals = closed_leftover.loc[
+        closed_leftover["remaining_notional_estimate"] <= dust_threshold
+    ].copy()
+    unexpected_closed_leftover = closed_leftover.loc[
+        closed_leftover["remaining_notional_estimate"] > dust_threshold
+    ].copy()
+
+    invariant_mismatches = positions_with_qty.loc[
+        positions_with_qty["remaining_qty_delta"] > QTY_TOLERANCE
+    ].copy()
+    acceptable_dust_invariant_mismatches = invariant_mismatches.loc[
+        invariant_mismatches["expected_remaining_notional_estimate"] <= dust_threshold
+    ].copy()
+    unexpected_invariant_failures = invariant_mismatches.loc[
+        invariant_mismatches["expected_remaining_notional_estimate"] > dust_threshold
+    ].copy()
+
     health_frames = {
         "error_positions": paper_positions.loc[paper_positions["position_status"].astype(str).eq("ERROR")].copy(),
-        "closed_with_leftover_qty": paper_positions.loc[
-            paper_positions["position_status"].astype(str).eq("CLOSED")
-            & (_to_numeric(paper_positions, "remaining_qty").abs() > QTY_TOLERANCE)
-        ].copy(),
-        "broken_remaining_qty": positions_with_qty.loc[
-            positions_with_qty["remaining_qty_delta"] > QTY_TOLERANCE
-        ].copy(),
+        "unexpected_closed_positions_with_leftover_qty": unexpected_closed_leftover,
+        "acceptable_closed_dust_residuals": acceptable_closed_dust_residuals,
+        "unexpected_remaining_qty_invariant_failures": unexpected_invariant_failures,
+        "acceptable_dust_invariant_mismatches": acceptable_dust_invariant_mismatches,
         "plans_without_positions": plans_without_positions,
         "active_stop_pointer_missing_order": active_stop_missing_order,
         "expected_terminal_requests_without_plans": expected_terminal_requests_without_plans,
@@ -222,8 +275,8 @@ def build_health_frames(frames: dict[str, pd.DataFrame]) -> tuple[dict[str, pd.D
 def build_health_checks(health_frames: dict[str, pd.DataFrame]) -> list[HealthCheck]:
     fail_checks = [
         "error_positions",
-        "closed_with_leftover_qty",
-        "broken_remaining_qty",
+        "unexpected_closed_positions_with_leftover_qty",
+        "unexpected_remaining_qty_invariant_failures",
         "plans_without_positions",
         "active_stop_pointer_missing_order",
     ]
@@ -233,12 +286,18 @@ def build_health_checks(health_frames: dict[str, pd.DataFrame]) -> list[HealthCh
         "suspicious_open_positions_missing_active_stop",
         "old_nonterminal_requests",
     ]
+    info_checks = [
+        "acceptable_closed_dust_residuals",
+        "acceptable_dust_invariant_mismatches",
+    ]
 
     checks: list[HealthCheck] = []
     for name in fail_checks:
         checks.append(HealthCheck(name=name, severity="FAIL", count=int(len(health_frames[name]))))
     for name in warn_checks:
         checks.append(HealthCheck(name=name, severity="WARN", count=int(len(health_frames[name]))))
+    for name in info_checks:
+        checks.append(HealthCheck(name=name, severity="INFO", count=int(len(health_frames[name]))))
     return checks
 
 
@@ -251,6 +310,7 @@ def print_summary(
 ) -> int:
     print(f"Execution DB: {db_path}")
     print(f"paper_positions.stop_filled_qty present: {stop_filled_qty_available}")
+    print(f"residual_dust_notional_threshold: {residual_dust_notional_threshold():.2f}")
     if not stop_filled_qty_available:
         print("Quantity invariant fallback: using STOP fill quantity aggregated from paper_fills")
     print()
