@@ -57,7 +57,11 @@ def _build_preprocessor(
     contract: ScoringContract,
 ) -> Any:
     sk = _require_sklearn()
-    numeric = [col for col in contract.numeric_feature_columns if col in feature_columns]
+    numeric = [
+        col
+        for col in contract.numeric_feature_columns + contract.derived_feature_columns
+        if col in feature_columns
+    ]
     categorical = [col for col in contract.categorical_feature_columns if col in feature_columns]
 
     numeric_pipe = sk["Pipeline"](

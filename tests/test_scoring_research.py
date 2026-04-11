@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 import pandas as pd
 
-from research.scoring.contracts import DEFAULT_SCORING_CONTRACT, available_feature_columns
-from research.scoring.dataset import audit_scoring_dataset_export
+from research.scoring.contracts import DEFAULT_SCORING_CONTRACT, ScoringContract, available_feature_columns
+from research.scoring.dataset import (
+    _build_scoring_modeling_dataset_from_source,
+    audit_scoring_dataset_export,
+    build_scoring_modeling_dataset_with_audit,
+)
 from research.scoring.diagnostics import (
     categorical_cardinality_summary,
     feature_missingness_summary,
@@ -130,6 +135,54 @@ class ScoringResearchTest(unittest.TestCase):
 
         self.assertIn("exit_reason", audit["columns_dropped_for_leakage"])
         self.assertIn("surprise_unapproved", audit["columns_dropped_unknown_unapproved"])
+
+    def test_derived_features_are_exported_and_numeric_coerced(self):
+        contract = ScoringContract(
+            feature_set_version="test_features_v1",
+            metadata_columns=("alert_id", "signal_ts_utc"),
+            numeric_feature_columns=("score",),
+            categorical_feature_columns=(),
+            derived_feature_columns=("derived_signal_strength",),
+            target_columns=("pnl_R", "profitable"),
+            leakage_columns=("exit_reason",),
+            diagnostic_only_columns=(),
+        )
+        source = pd.DataFrame(
+            {
+                "alert_id": ["a1"],
+                "signal_ts_utc": ["2026-01-01T00:00:00Z"],
+                "score": ["7.5"],
+                "derived_signal_strength": ["0.42"],
+                "pnl_R": ["1.2"],
+                "exit_reason": ["T2"],
+            }
+        )
+
+        dataset = _build_scoring_modeling_dataset_from_source(source, contract=contract)
+        constants = numeric_constant_feature_summary(dataset, contract)
+
+        self.assertIn("derived_signal_strength", dataset.columns)
+        self.assertEqual(float(dataset["derived_signal_strength"].iloc[0]), 0.42)
+        self.assertIn("derived_signal_strength", available_feature_columns(dataset, contract))
+        self.assertIn("derived_signal_strength", constants["feature"].tolist())
+        self.assertNotIn("exit_reason", dataset.columns)
+
+    def test_dataset_with_audit_loads_source_once(self):
+        source = pd.DataFrame(
+            {
+                "alert_id": ["a1"],
+                "signal_ts_utc": ["2026-01-01T00:00:00Z"],
+                "score": [7.5],
+                "pnl_R": [1.2],
+            }
+        )
+
+        with patch("research.scoring.dataset._load_authoritative_trade_surface", return_value=source) as loader:
+            dataset, audit = build_scoring_modeling_dataset_with_audit()
+
+        self.assertEqual(loader.call_count, 1)
+        self.assertEqual(dataset["alert_id"].tolist(), ["a1"])
+        self.assertIn("score", audit["exported_columns"])
 
     def test_score_evaluation_returns_bucket_summary(self):
         frame = pd.DataFrame(

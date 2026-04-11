@@ -65,6 +65,14 @@ def build_scoring_modeling_dataset(
     trade/context fields. Outcome-derived fields remain in target columns only.
     """
     frame = _load_authoritative_trade_surface(duckdb_path=duckdb_path, market_type=market_type)
+    return _build_scoring_modeling_dataset_from_source(frame, contract=contract)
+
+
+def _build_scoring_modeling_dataset_from_source(
+    frame: pd.DataFrame,
+    *,
+    contract: ScoringContract = DEFAULT_SCORING_CONTRACT,
+) -> pd.DataFrame:
     if frame.empty:
         return pd.DataFrame(columns=list(contract.metadata_columns + contract.target_columns))
 
@@ -76,7 +84,7 @@ def build_scoring_modeling_dataset(
 
     numeric_cols = [
         col
-        for col in set(contract.numeric_feature_columns + contract.target_columns)
+        for col in set(contract.numeric_feature_columns + contract.derived_feature_columns + contract.target_columns)
         if col in out.columns and col not in {"profitable", "hit_t1", "hit_t2"}
     ]
     out = to_num(out, numeric_cols)
@@ -126,9 +134,5 @@ def build_scoring_modeling_dataset_with_audit(
     contract: ScoringContract = DEFAULT_SCORING_CONTRACT,
 ) -> tuple[pd.DataFrame, dict[str, object]]:
     source = _load_authoritative_trade_surface(duckdb_path=duckdb_path, market_type=market_type)
-    dataset = build_scoring_modeling_dataset(
-        duckdb_path=duckdb_path,
-        market_type=market_type,
-        contract=contract,
-    )
+    dataset = _build_scoring_modeling_dataset_from_source(source, contract=contract)
     return dataset, audit_scoring_dataset_export(source, dataset, contract=contract)
