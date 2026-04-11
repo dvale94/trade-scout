@@ -3,11 +3,15 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from .score_recipes import BLENDED_RECIPE, ScoreRecipe, compose_shadow_score
+
 SCORE_OUTPUT_COLUMNS = (
     "alert_id",
     "signal_ts_utc",
     "score_model_version",
     "feature_set_version",
+    "score_recipe_version",
+    "score_recipe_mode",
     "pred_win_prob",
     "pred_expected_r",
     "pred_expected_mfe",
@@ -30,6 +34,7 @@ def build_prediction_output(
     *,
     score_model_version: str,
     feature_set_version: str,
+    score_recipe: ScoreRecipe = BLENDED_RECIPE,
     pred_win_prob: pd.Series | np.ndarray | None = None,
     pred_expected_r: pd.Series | np.ndarray | None = None,
     pred_expected_mfe: pd.Series | np.ndarray | None = None,
@@ -41,14 +46,19 @@ def build_prediction_output(
     out["signal_ts_utc"] = frame["signal_ts_utc"].values if "signal_ts_utc" in frame.columns else pd.NA
     out["score_model_version"] = score_model_version
     out["feature_set_version"] = feature_set_version
+    out["score_recipe_version"] = score_recipe.recipe_version
+    out["score_recipe_mode"] = score_recipe.mode
     out["pred_win_prob"] = pred_win_prob if pred_win_prob is not None else np.nan
     out["pred_expected_r"] = pred_expected_r if pred_expected_r is not None else np.nan
     out["pred_expected_mfe"] = pred_expected_mfe if pred_expected_mfe is not None else np.nan
 
     if score_shadow is None:
-        expected_r = pd.to_numeric(out["pred_expected_r"], errors="coerce")
-        win_prob = pd.to_numeric(out["pred_win_prob"], errors="coerce")
-        out["score_shadow"] = expected_r.where(expected_r.notna(), win_prob)
+        out["score_shadow"] = compose_shadow_score(
+            pred_expected_r=out["pred_expected_r"],
+            pred_win_prob=out["pred_win_prob"],
+            recipe=score_recipe,
+            index=out.index,
+        )
     else:
         out["score_shadow"] = score_shadow
 

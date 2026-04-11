@@ -7,7 +7,7 @@ import pandas as pd
 from research.research_loader import load_trades_enriched_sql, load_trades_sql
 from research.research_metrics_v3 import to_boolish, to_dt, to_num
 
-from .contracts import DEFAULT_SCORING_CONTRACT, ScoringContract
+from .contracts import DEFAULT_SCORING_CONTRACT, ScoringContract, present_export_columns
 
 
 def _load_authoritative_trade_surface(
@@ -88,9 +88,47 @@ def build_scoring_modeling_dataset(
         if col not in out.columns:
             out[col] = pd.NA
 
-    ordered = []
-    for col in contract.metadata_columns + contract.feature_columns + contract.target_columns:
-        if col in out.columns and col not in ordered:
-            ordered.append(col)
-    extras = [col for col in out.columns if col not in ordered and col not in contract.leakage_columns]
-    return out[ordered + extras].copy()
+    return out[present_export_columns(out, contract)].copy()
+
+
+def audit_scoring_dataset_export(
+    source_frame: pd.DataFrame,
+    exported_frame: pd.DataFrame,
+    *,
+    contract: ScoringContract = DEFAULT_SCORING_CONTRACT,
+) -> dict[str, object]:
+    """Audit strict export decisions for the scoring dataset."""
+    source_columns = list(source_frame.columns)
+    exported_columns = list(exported_frame.columns)
+    exported = set(exported_columns)
+    approved = set(contract.export_columns)
+    leakage = set(contract.leakage_columns)
+    dropped = [col for col in source_columns if col not in exported]
+    return {
+        "feature_set_version": contract.feature_set_version,
+        "source_columns_seen": source_columns,
+        "exported_columns": exported_columns,
+        "dropped_columns": dropped,
+        "columns_dropped_for_leakage": [col for col in dropped if col in leakage],
+        "columns_dropped_unknown_unapproved": [
+            col for col in dropped if col not in approved and col not in leakage
+        ],
+        "missing_expected_export_columns": [
+            col for col in contract.export_columns if col not in exported
+        ],
+    }
+
+
+def build_scoring_modeling_dataset_with_audit(
+    duckdb_path: str | Path | None = None,
+    *,
+    market_type: str | None = None,
+    contract: ScoringContract = DEFAULT_SCORING_CONTRACT,
+) -> tuple[pd.DataFrame, dict[str, object]]:
+    source = _load_authoritative_trade_surface(duckdb_path=duckdb_path, market_type=market_type)
+    dataset = build_scoring_modeling_dataset(
+        duckdb_path=duckdb_path,
+        market_type=market_type,
+        contract=contract,
+    )
+    return dataset, audit_scoring_dataset_export(source, dataset, contract=contract)

@@ -5,9 +5,25 @@ import unittest
 import pandas as pd
 
 from research.scoring.contracts import DEFAULT_SCORING_CONTRACT, available_feature_columns
-from research.scoring.dataset import build_scoring_modeling_dataset
-from research.scoring.evaluation import evaluate_current_score, evaluate_prediction_buckets
+from research.scoring.dataset import audit_scoring_dataset_export
+from research.scoring.diagnostics import (
+    categorical_cardinality_summary,
+    feature_missingness_summary,
+    numeric_constant_feature_summary,
+    train_test_schema_check,
+)
+from research.scoring.evaluation import (
+    evaluate_current_score,
+    evaluate_prediction_buckets,
+    segmented_score_evaluation,
+)
 from research.scoring.predictions import SCORE_OUTPUT_COLUMNS, build_prediction_output
+from research.scoring.score_recipes import (
+    BLENDED_RECIPE,
+    EXPECTED_R_ONLY_RECIPE,
+    WIN_PROB_ONLY_RECIPE,
+    compose_shadow_score,
+)
 from research.scoring.splits import time_train_test_split
 
 
@@ -61,13 +77,59 @@ class ScoringResearchTest(unittest.TestCase):
             frame,
             score_model_version="shadow_score_v1",
             feature_set_version="score_features_v1",
+            score_recipe=BLENDED_RECIPE,
             pred_win_prob=pd.Series([0.55, 0.65]),
             pred_expected_r=pd.Series([0.1, 0.4]),
         )
 
         self.assertEqual(tuple(out.columns), SCORE_OUTPUT_COLUMNS)
         self.assertEqual(out["score_model_version"].unique().tolist(), ["shadow_score_v1"])
+        self.assertEqual(out["score_recipe_version"].unique().tolist(), ["score_recipe_blended_v1"])
         self.assertTrue(out["score_shadow"].notna().all())
+
+    def test_score_recipe_composition_modes_are_explicit(self):
+        expected_r = pd.Series([0.2, 0.4])
+        win_prob = pd.Series([0.6, 0.8])
+
+        self.assertEqual(
+            compose_shadow_score(
+                pred_expected_r=expected_r,
+                pred_win_prob=win_prob,
+                recipe=EXPECTED_R_ONLY_RECIPE,
+            ).tolist(),
+            [0.2, 0.4],
+        )
+        self.assertEqual(
+            compose_shadow_score(
+                pred_expected_r=expected_r,
+                pred_win_prob=win_prob,
+                recipe=WIN_PROB_ONLY_RECIPE,
+            ).tolist(),
+            [0.6, 0.8],
+        )
+        blended = compose_shadow_score(
+            pred_expected_r=expected_r,
+            pred_win_prob=win_prob,
+            recipe=BLENDED_RECIPE,
+        )
+        self.assertEqual(blended.round(4).tolist(), [0.3, 0.7])
+
+    def test_dataset_export_audit_separates_leakage_and_unknown_columns(self):
+        source = pd.DataFrame(
+            {
+                "alert_id": ["a1"],
+                "score": [7.0],
+                "pnl_R": [1.0],
+                "exit_reason": ["T2"],
+                "surprise_unapproved": ["nope"],
+            }
+        )
+        exported = source[["alert_id", "score", "pnl_R"]].copy()
+
+        audit = audit_scoring_dataset_export(source, exported)
+
+        self.assertIn("exit_reason", audit["columns_dropped_for_leakage"])
+        self.assertIn("surprise_unapproved", audit["columns_dropped_unknown_unapproved"])
 
     def test_score_evaluation_returns_bucket_summary(self):
         frame = pd.DataFrame(
@@ -84,6 +146,28 @@ class ScoringResearchTest(unittest.TestCase):
         self.assertFalse(baseline["bucket_summary"].empty)
         self.assertFalse(shadow["bucket_summary"].empty)
         self.assertIn("win_rate", baseline["bucket_summary"].columns)
+
+    def test_diagnostics_and_segmented_evaluation_return_notebook_ready_frames(self):
+        frame = pd.DataFrame(
+            {
+                "score": [1.0, 1.0, 1.0],
+                "symbol": ["BTC/USD", "ETH/USD", "BTC/USD"],
+                "pnl_R": [1.0, -1.0, 0.5],
+                "score_shadow": [0.8, 0.2, 0.7],
+            }
+        )
+
+        missing = feature_missingness_summary(frame)
+        constants = numeric_constant_feature_summary(frame)
+        cardinality = categorical_cardinality_summary(frame)
+        segments = segmented_score_evaluation(frame, segment_col="symbol")
+        schema = train_test_schema_check(frame.iloc[:2], frame.iloc[2:])
+
+        self.assertFalse(missing.empty)
+        self.assertTrue(constants.loc[constants["feature"].eq("score"), "is_constant"].iloc[0])
+        self.assertFalse(cardinality.empty)
+        self.assertFalse(segments.empty)
+        self.assertIn("schema_match", schema.columns)
 
 
 if __name__ == "__main__":

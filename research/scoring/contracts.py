@@ -18,12 +18,27 @@ class ScoringContract:
     metadata_columns: tuple[str, ...]
     numeric_feature_columns: tuple[str, ...]
     categorical_feature_columns: tuple[str, ...]
+    derived_feature_columns: tuple[str, ...]
     target_columns: tuple[str, ...]
     leakage_columns: tuple[str, ...]
+    diagnostic_only_columns: tuple[str, ...]
 
     @property
     def feature_columns(self) -> tuple[str, ...]:
-        return self.numeric_feature_columns + self.categorical_feature_columns
+        return self.numeric_feature_columns + self.categorical_feature_columns + self.derived_feature_columns
+
+    @property
+    def export_columns(self) -> tuple[str, ...]:
+        columns: list[str] = []
+        for col in (
+            self.metadata_columns
+            + self.feature_columns
+            + self.target_columns
+            + self.diagnostic_only_columns
+        ):
+            if col not in columns:
+                columns.append(col)
+        return tuple(columns)
 
 
 DEFAULT_SCORING_CONTRACT = ScoringContract(
@@ -103,6 +118,7 @@ DEFAULT_SCORING_CONTRACT = ScoringContract(
         "anchor_trend_4h",
         "anchor_trend_1d",
     ),
+    derived_feature_columns=(),
     target_columns=(
         "pnl_R",
         "profitable",
@@ -140,6 +156,19 @@ DEFAULT_SCORING_CONTRACT = ScoringContract(
         "t2_exit",
         "hit_t1_only",
     ),
+    diagnostic_only_columns=(
+        "alert_status",
+        "skip_reason",
+        "error_message",
+        "schema_version",
+        "alert_context_schema_version",
+        "signal_date",
+        "signal_day_of_week",
+        "bar_start_ts_utc",
+        "bar_end_ts_utc",
+        "reasons",
+        "strategy_params_json",
+    ),
 )
 
 
@@ -152,6 +181,50 @@ def available_feature_columns(
     return [col for col in contract.feature_columns if col in present]
 
 
+def missing_feature_columns(
+    frame: pd.DataFrame,
+    contract: ScoringContract = DEFAULT_SCORING_CONTRACT,
+) -> list[str]:
+    return missing_contract_columns(frame, contract.feature_columns)
+
+
+def present_export_columns(
+    frame: pd.DataFrame,
+    contract: ScoringContract = DEFAULT_SCORING_CONTRACT,
+) -> list[str]:
+    present = set(frame.columns)
+    return [col for col in contract.export_columns if col in present]
+
+
 def missing_contract_columns(frame: pd.DataFrame, columns: Sequence[str]) -> list[str]:
     present = set(frame.columns)
     return [col for col in columns if col not in present]
+
+
+def contract_coverage_summary(
+    frame: pd.DataFrame,
+    contract: ScoringContract = DEFAULT_SCORING_CONTRACT,
+) -> pd.DataFrame:
+    groups = [
+        ("metadata", contract.metadata_columns),
+        ("numeric_feature", contract.numeric_feature_columns),
+        ("categorical_feature", contract.categorical_feature_columns),
+        ("derived_feature", contract.derived_feature_columns),
+        ("target", contract.target_columns),
+        ("diagnostic_only", contract.diagnostic_only_columns),
+        ("leakage", contract.leakage_columns),
+    ]
+    rows: list[dict] = []
+    present = set(frame.columns)
+    for group_name, columns in groups:
+        for col in columns:
+            rows.append(
+                {
+                    "column": col,
+                    "contract_group": group_name,
+                    "present": col in present,
+                    "non_null_rows": int(frame[col].notna().sum()) if col in present else 0,
+                    "coverage_pct": float(frame[col].notna().mean()) if col in present and len(frame) else 0.0,
+                }
+            )
+    return pd.DataFrame(rows)

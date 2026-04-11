@@ -165,3 +165,109 @@ def compare_shadow_to_baseline(
             }
         )
     return pd.DataFrame(rows)
+
+
+def evaluate_train_test_score(
+    train: pd.DataFrame,
+    test: pd.DataFrame,
+    *,
+    score_col: str,
+    outcome_col: str = "pnl_R",
+    buckets: int = 5,
+) -> dict[str, object]:
+    train_eval = evaluate_prediction_buckets(
+        train,
+        prediction_col=score_col,
+        outcome_col=outcome_col,
+        buckets=buckets,
+    )
+    test_eval = evaluate_prediction_buckets(
+        test,
+        prediction_col=score_col,
+        outcome_col=outcome_col,
+        buckets=buckets,
+    )
+    return {
+        "train": train_eval,
+        "test": test_eval,
+        "train_vs_test": pd.DataFrame(
+            [
+                {
+                    "split": "train",
+                    **train_eval.get("monotonicity", {}),
+                },
+                {
+                    "split": "test",
+                    **test_eval.get("monotonicity", {}),
+                },
+            ]
+        ),
+    }
+
+
+def segmented_score_evaluation(
+    frame: pd.DataFrame,
+    *,
+    segment_col: str,
+    score_col: str = "score_shadow",
+    outcome_col: str = "pnl_R",
+    min_count: int = 10,
+) -> pd.DataFrame:
+    if frame.empty or segment_col not in frame.columns or score_col not in frame.columns:
+        return pd.DataFrame()
+    df = _valid_outcome_rows(frame, outcome_col)
+    if df.empty:
+        return pd.DataFrame()
+    df[score_col] = pd.to_numeric(df[score_col], errors="coerce")
+    df = df[df[score_col].notna()].copy()
+    rows: list[dict] = []
+    for value, group in df.groupby(segment_col, dropna=False):
+        outcome = pd.to_numeric(group[outcome_col], errors="coerce").dropna()
+        if outcome.empty:
+            continue
+        rows.append(
+            {
+                segment_col: value,
+                "count": int(len(outcome)),
+                "expectancy_R": float(outcome.mean()),
+                "win_rate": float((outcome > 0).mean()),
+                "avg_score": float(pd.to_numeric(group[score_col], errors="coerce").mean()),
+                "small_sample_flag": bool(len(outcome) < min_count),
+            }
+        )
+    return pd.DataFrame(rows).sort_values(["count", "expectancy_R"], ascending=[False, False])
+
+
+def promotion_readiness_summary(
+    *,
+    baseline_eval: dict[str, object],
+    candidate_eval: dict[str, object],
+    min_test_rows: int = 30,
+) -> pd.DataFrame:
+    comparison = compare_shadow_to_baseline(baseline_eval, candidate_eval)
+    if comparison.empty:
+        return pd.DataFrame()
+    wide = comparison.set_index("score_source")
+    candidate = wide.loc["shadow_score"] if "shadow_score" in wide.index else pd.Series(dtype="float64")
+    baseline = wide.loc["current_score"] if "current_score" in wide.index else pd.Series(dtype="float64")
+    candidate_top = candidate.get("top_bucket_expectancy_R", np.nan)
+    baseline_top = baseline.get("top_bucket_expectancy_R", np.nan)
+    top_delta = candidate_top - baseline_top if pd.notna(candidate_top) and pd.notna(baseline_top) else np.nan
+
+    top_bottom = candidate_eval.get("top_bottom")
+    test_rows = 0
+    if isinstance(top_bottom, pd.DataFrame) and not top_bottom.empty:
+        full = top_bottom[top_bottom.iloc[:, 0].astype(str).eq("full_universe")]
+        if not full.empty:
+            test_rows = int(full["count"].iloc[0])
+
+    return pd.DataFrame(
+        [
+            {
+                "candidate_top_vs_current_top_delta_R": top_delta,
+                "test_rows": test_rows,
+                "small_sample_flag": bool(test_rows < min_test_rows),
+                "candidate_beats_current_top_bucket": bool(pd.notna(top_delta) and top_delta > 0),
+            }
+        ]
+    )
