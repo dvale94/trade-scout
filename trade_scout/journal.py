@@ -100,6 +100,15 @@ ALERT_CONTEXT_FIELDS = [
     "setup_family",
     "strategy_params_json",
     "strategy_params_hash",
+    "score_model_version",
+    "feature_set_version",
+    "score_recipe_version",
+    "score_recipe_mode",
+    "pred_expected_r",
+    "pred_win_prob",
+    "pred_expected_mfe",
+    "score_shadow",
+    "score_shadow_bucket",
 ]
 
 OUTCOME_FIELDS = [

@@ -168,6 +168,15 @@ DEFAULT_SCORING_CONTRACT = ScoringContract(
         "bar_end_ts_utc",
         "reasons",
         "strategy_params_json",
+        "score_model_version",
+        "feature_set_version",
+        "score_recipe_version",
+        "score_recipe_mode",
+        "pred_expected_r",
+        "pred_win_prob",
+        "pred_expected_mfe",
+        "score_shadow",
+        "score_shadow_bucket",
     ),
 )
 

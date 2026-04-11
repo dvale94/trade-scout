@@ -147,6 +147,15 @@ class AlertContextRow:
     setup_family: str | None = None
     strategy_params_json: str | None = None
     strategy_params_hash: str | None = None
+    score_model_version: str | None = None
+    feature_set_version: str | None = None
+    score_recipe_version: str | None = None
+    score_recipe_mode: str | None = None
+    pred_expected_r: float | None = None
+    pred_win_prob: float | None = None
+    pred_expected_mfe: float | None = None
+    score_shadow: float | None = None
+    score_shadow_bucket: str | None = None
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -204,6 +213,15 @@ class AlertContextRow:
             "setup_family": self.setup_family,
             "strategy_params_json": self.strategy_params_json,
             "strategy_params_hash": self.strategy_params_hash,
+            "score_model_version": self.score_model_version,
+            "feature_set_version": self.feature_set_version,
+            "score_recipe_version": self.score_recipe_version,
+            "score_recipe_mode": self.score_recipe_mode,
+            "pred_expected_r": self.pred_expected_r,
+            "pred_win_prob": self.pred_win_prob,
+            "pred_expected_mfe": self.pred_expected_mfe,
+            "score_shadow": self.score_shadow,
+            "score_shadow_bucket": self.score_shadow_bucket,
         }
 
 
