@@ -60,6 +60,9 @@ SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", "").split(",") if s.s
 # Logging directory
 LOG_DIR = os.getenv("LOG_DIR", "logs").strip()
 
+# Optional analytics tag for identifying collection windows in alert_context.
+EXPERIMENT_TAG = os.getenv("EXPERIMENT_TAG", "").strip() or None
+
 # Execution subsystem
 EXECUTION_ENABLED = os.getenv("EXECUTION_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
 EXECUTION_DB_PATH = os.getenv("EXECUTION_DB_PATH", "./execution.db").strip()

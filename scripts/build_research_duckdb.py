@@ -230,6 +230,7 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
               COALESCE({raw_value_expr('', context_cols, 'setup_family', "'legacy'")}, 'legacy') AS setup_family,
               {raw_select_expr('', context_cols, 'strategy_params_json')},
               {raw_select_expr('', context_cols, 'strategy_params_hash')},
+              {raw_select_expr('', context_cols, 'experiment_tag')},
               {raw_select_expr('', context_cols, 'config_hash')},
               {raw_select_expr('', context_cols, 'signal_ts_utc')},
               {raw_int_select_expr('', context_cols, 'signal_hour_utc')},
@@ -361,6 +362,7 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
                 SELECT
                   t.*,
                   {raw_value_expr('c', context_cols, 'schema_version')} AS alert_context_schema_version,
+                  {raw_value_expr('c', context_cols, 'experiment_tag')} AS experiment_tag,
                   COALESCE(TRY_CAST({raw_value_expr('c', context_cols, 'signal_hour_utc')} AS INTEGER), EXTRACT(HOUR FROM TRY_CAST(t.signal_ts_utc AS TIMESTAMP))) AS signal_hour_utc,
                   COALESCE({raw_value_expr('c', context_cols, 'signal_day_of_week')}, STRFTIME(TRY_CAST(t.signal_ts_utc AS TIMESTAMP), '%a')) AS signal_day_of_week,
                   {raw_value_expr('c', context_cols, 'bar_start_ts_utc')} AS bar_start_ts_utc,
@@ -435,6 +437,7 @@ def create_views(con: duckdb.DuckDBPyConnection, csvs: dict[str, Path]) -> None:
                 SELECT
                   t.*,
                   NULL AS alert_context_schema_version,
+                  NULL AS experiment_tag,
                   EXTRACT(HOUR FROM TRY_CAST(t.signal_ts_utc AS TIMESTAMP)) AS signal_hour_utc,
                   STRFTIME(TRY_CAST(t.signal_ts_utc AS TIMESTAMP), '%a') AS signal_day_of_week,
                   NULL AS bar_start_ts_utc,

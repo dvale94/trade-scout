@@ -117,6 +117,7 @@ def make_alert_context_row(
         setup_family=strategy_metadata.setup_family,
         strategy_params_json=strategy_metadata.strategy_params_json,
         strategy_params_hash=strategy_metadata.strategy_params_hash,
+        experiment_tag=config.EXPERIMENT_TAG,
     )
 
 

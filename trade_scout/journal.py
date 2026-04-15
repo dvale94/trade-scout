@@ -100,6 +100,7 @@ ALERT_CONTEXT_FIELDS = [
     "setup_family",
     "strategy_params_json",
     "strategy_params_hash",
+    "experiment_tag",
     "score_model_version",
     "feature_set_version",
     "score_recipe_version",

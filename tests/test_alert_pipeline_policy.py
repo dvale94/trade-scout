@@ -272,6 +272,40 @@ class AlertPipelinePolicyIntegrationTest(unittest.TestCase):
         self.assertTrue(side_effects["notify"].called)
         self.assertEqual(1, len(context.watch_mgr.added))
 
+    def test_experiment_tag_is_added_to_alert_context_when_configured(self) -> None:
+        pipeline, context = self._make_pipeline()
+
+        with self._patch_alert_side_effects() as side_effects, patch(
+            "trade_scout.journal_builders.config.EXPERIMENT_TAG",
+            "vacation_baseline_v1",
+        ), patch(
+            "trade_scout.alert_pipeline.uuid4",
+            side_effect=["provisional-1", "alert-1"],
+        ):
+            pipeline.process(**self._process_kwargs())
+
+        context_row = side_effects["log_context"].call_args.args[0]
+        intent_row = side_effects["log_intent"].call_args.args[0]
+        self.assertEqual("vacation_baseline_v1", context_row.experiment_tag)
+        self.assertFalse(hasattr(intent_row, "experiment_tag"))
+        self.assertEqual(1, len(context.watch_mgr.added))
+
+    def test_experiment_tag_unset_remains_null_and_backward_compatible(self) -> None:
+        pipeline, context = self._make_pipeline()
+
+        with self._patch_alert_side_effects() as side_effects, patch(
+            "trade_scout.journal_builders.config.EXPERIMENT_TAG",
+            None,
+        ), patch(
+            "trade_scout.alert_pipeline.uuid4",
+            side_effect=["provisional-1", "alert-1"],
+        ):
+            pipeline.process(**self._process_kwargs())
+
+        context_row = side_effects["log_context"].call_args.args[0]
+        self.assertIsNone(context_row.experiment_tag)
+        self.assertEqual(1, len(context.watch_mgr.added))
+
     def test_shadow_score_failure_does_not_break_alert_flow(self) -> None:
         pipeline, context = self._make_pipeline(
             shadow_scorer=SimpleNamespace(score=MagicMock(side_effect=RuntimeError("score boom")))

@@ -162,6 +162,7 @@ DEFAULT_SCORING_CONTRACT = ScoringContract(
         "error_message",
         "schema_version",
         "alert_context_schema_version",
+        "experiment_tag",
         "signal_date",
         "signal_day_of_week",
         "bar_start_ts_utc",
