@@ -85,6 +85,27 @@ class PolicyEvaluatorTest(unittest.TestCase):
             decision.reasons,
         )
 
+    def test_min_score_passes(self) -> None:
+        decision = evaluate_policy(
+            self._intent(),
+            self._context(score=7.6),
+            self._policy_config(filters={"min_score": 7.5}),
+        )
+
+        self.assertEqual("ALLOW", decision.decision)
+        self.assertEqual("min_score", decision.criteria_results[0].criterion_name)
+        self.assertTrue(decision.criteria_results[0].passed)
+
+    def test_min_score_blocks(self) -> None:
+        decision = evaluate_policy(
+            self._intent(),
+            self._context(score=6.2),
+            self._policy_config(filters={"min_score": 6.5}),
+        )
+
+        self.assertEqual("BLOCK", decision.decision)
+        self.assertIn("score 6.2000 below required minimum 6.5000", decision.reasons)
+
     def test_allowed_symbols_passes(self) -> None:
         decision = evaluate_policy(
             self._intent(symbol="AAPL"),

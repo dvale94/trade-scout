@@ -64,6 +64,16 @@ class PolicyRepository:
     ) -> PolicyDefinitionRow | None:
         return get_active_policy(conn, policy_name, at_ts_utc, mode=mode)
 
+    def get_active_policies(
+        self,
+        conn: sqlite3.Connection,
+        policy_names: list[str],
+        at_ts_utc: str,
+        *,
+        mode: str = "SHADOW",
+    ) -> list[PolicyDefinitionRow]:
+        return get_active_policies(conn, policy_names, at_ts_utc, mode=mode)
+
     def activate_policy(
         self,
         conn: sqlite3.Connection,
@@ -273,6 +283,28 @@ def get_active_policy(
         (policy_name, mode, at_ts_utc, at_ts_utc),
     ).fetchone()
     return _policy_definition_row_from_db(row)
+
+
+def get_active_policies(
+    conn: sqlite3.Connection,
+    policy_names: list[str],
+    at_ts_utc: str,
+    *,
+    mode: str = "SHADOW",
+) -> list[PolicyDefinitionRow]:
+    """Return the latest active policy for each requested policy_name/mode."""
+    _require_nonempty_str(at_ts_utc, "at_ts_utc")
+    _validate_mode(mode)
+    normalized_names = [_require_nonempty_str(name, "policy_name") for name in policy_names]
+    if not normalized_names:
+        return []
+
+    rows: list[PolicyDefinitionRow] = []
+    for policy_name in normalized_names:
+        active = get_active_policy(conn, policy_name, at_ts_utc, mode=mode)
+        if active is not None:
+            rows.append(active)
+    return rows
 
 
 def activate_policy(

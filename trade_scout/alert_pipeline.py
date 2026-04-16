@@ -17,6 +17,7 @@ from .journal_builders import (
 from .policy.evaluator import evaluate_policy
 from .policy.models import PolicyConfig
 from .policy.repository import PolicyRepository
+from .policy.shadow_variants import seed_shadow_policy_variants
 from .runtime_context import EnabledStrategy, RuntimeContext
 from .scoring import RuntimeShadowScoreConfig, RuntimeShadowScorer, active_shadow_score_config
 from .scoring.scorer import SHADOW_SCORE_STATUS_ERROR
@@ -89,9 +90,12 @@ class AlertPipeline:
         self.execution_db_path = getattr(self.policy_repository, "db_path", config.EXECUTION_DB_PATH)
         self.policy_name = policy_name
         self.shadow_scorer = shadow_scorer or self._build_shadow_scorer()
+        self.shadow_policy_variant_names = list(config.SHADOW_POLICY_VARIANT_NAMES)
         self._policy_runtime_ready = False
         try:
             self.policy_repository.init_db()
+            if self.shadow_policy_variant_names:
+                seed_shadow_policy_variants(self.policy_repository, self.shadow_policy_variant_names)
             self._policy_runtime_ready = True
         except Exception as exc:
             print(
@@ -134,10 +138,11 @@ class AlertPipeline:
             return
 
         try:
+            policy_names = [self.policy_name, *self.shadow_policy_variant_names]
             try:
-                active_policy = self.policy_repository.get_active_policy(
+                active_policies = self.policy_repository.get_active_policies(
                     conn,
-                    self.policy_name,
+                    policy_names,
                     str(intent_row.signal_ts_utc),
                     mode="SHADOW",
                 )
@@ -145,49 +150,57 @@ class AlertPipeline:
                 self._log_policy_error(alert_id=alert_id, stage="get_active_policy", error=exc)
                 return
 
-            if active_policy is None:
+            if not active_policies:
                 print(
                     f"[policy] skipped alert_id={alert_id} reason=no_active_policy "
                     f"policy_name={self.policy_name} mode=SHADOW"
                 )
                 return
 
-            try:
-                policy_config = _policy_config_from_definition_row(active_policy)
-            except Exception as exc:
-                self._log_policy_error(alert_id=alert_id, stage="parse_config", error=exc)
-                return
+            for active_policy in active_policies:
+                try:
+                    policy_config = _policy_config_from_definition_row(active_policy)
+                except Exception as exc:
+                    self._log_policy_error(alert_id=alert_id, stage="parse_config", error=exc, policy_name=active_policy.policy_name)
+                    continue
 
-            try:
-                decision = evaluate_policy(
-                    intent_row,
-                    context_row,
-                    policy_config,
-                    mode="SHADOW",
+                try:
+                    decision = evaluate_policy(
+                        intent_row,
+                        context_row,
+                        policy_config,
+                        mode="SHADOW",
+                    )
+                except Exception as exc:
+                    self._log_policy_error(alert_id=alert_id, stage="evaluate", error=exc, policy_name=active_policy.policy_name)
+                    continue
+
+                try:
+                    decision_row = decision.to_row(active_policy.policy_id)
+                    persisted = self.policy_repository.insert_policy_decision(conn, decision_row)
+                except Exception as exc:
+                    self._log_policy_error(alert_id=alert_id, stage="persist", error=exc, policy_name=active_policy.policy_name)
+                    continue
+
+                print(
+                    f"[policy] evaluated alert_id={alert_id} decision={persisted.decision} "
+                    f"policy_name={persisted.policy_name} policy_version={persisted.policy_version} "
+                    f"mode=SHADOW"
                 )
-            except Exception as exc:
-                self._log_policy_error(alert_id=alert_id, stage="evaluate", error=exc)
-                return
-
-            try:
-                decision_row = decision.to_row(active_policy.policy_id)
-                persisted = self.policy_repository.insert_policy_decision(conn, decision_row)
-            except Exception as exc:
-                self._log_policy_error(alert_id=alert_id, stage="persist", error=exc)
-                return
         finally:
             conn.close()
 
-        print(
-            f"[policy] evaluated alert_id={alert_id} decision={persisted.decision} "
-            f"policy_name={persisted.policy_name} policy_version={persisted.policy_version} "
-            f"mode=SHADOW"
-        )
-
-    def _log_policy_error(self, *, alert_id: str, stage: str, error: Exception) -> None:
+    def _log_policy_error(
+        self,
+        *,
+        alert_id: str,
+        stage: str,
+        error: Exception,
+        policy_name: str | None = None,
+    ) -> None:
         print(
             f"[policy] error alert_id={alert_id} stage={stage} "
-            f"policy_name={self.policy_name} mode=SHADOW error={error}"
+            f"policy_name={policy_name or self.policy_name} mode=SHADOW error={error}"
         )
 
     def _apply_shadow_score(self, intent_row, context_row):
