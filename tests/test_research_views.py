@@ -77,10 +77,18 @@ class ResearchViewsTest(unittest.TestCase):
         alert_funnel_columns = {
             row[1] for row in self.con.execute("PRAGMA table_info('alert_funnel')").fetchall()
         }
+        alert_context_columns = {
+            row[1] for row in self.con.execute("PRAGMA table_info('alert_context')").fetchall()
+        }
+        trades_enriched_columns = {
+            row[1] for row in self.con.execute("PRAGMA table_info('trades_enriched')").fetchall()
+        }
 
         for column in ("strategy_id", "strategy_version", "setup_family", "strategy_params_hash"):
             self.assertIn(column, strategy_summary_columns)
             self.assertIn(column, alert_funnel_columns)
+        self.assertIn("experiment_tag", alert_context_columns)
+        self.assertIn("experiment_tag", trades_enriched_columns)
 
 
 if __name__ == "__main__":

@@ -147,6 +147,7 @@ class AlertContextRow:
     setup_family: str | None = None
     strategy_params_json: str | None = None
     strategy_params_hash: str | None = None
+    experiment_tag: str | None = None
     score_model_version: str | None = None
     feature_set_version: str | None = None
     score_recipe_version: str | None = None
@@ -215,6 +216,7 @@ class AlertContextRow:
             "setup_family": self.setup_family,
             "strategy_params_json": self.strategy_params_json,
             "strategy_params_hash": self.strategy_params_hash,
+            "experiment_tag": self.experiment_tag,
             "score_model_version": self.score_model_version,
             "feature_set_version": self.feature_set_version,
             "score_recipe_version": self.score_recipe_version,

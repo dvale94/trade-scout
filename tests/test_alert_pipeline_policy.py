@@ -167,6 +167,190 @@ class AlertPipelinePolicyIntegrationTest(unittest.TestCase):
         self.assertEqual(0, row_count)
         self.assertEqual(1, len(context.watch_mgr.added))
 
+    def test_startup_logs_collection_config_summary(self) -> None:
+        with patch("trade_scout.alert_pipeline.config.EXPERIMENT_TAG", "vacation_baseline_v1"), patch(
+            "trade_scout.alert_pipeline.config.SHADOW_POLICY_VARIANT_NAMES",
+            ["shadow_score_gte_8_0", "shadow_score_gte_7_5"],
+        ), patch("builtins.print") as print_mock:
+            self._make_pipeline()
+
+        self.assertTrue(
+            any(
+                "[startup] collection_config experiment_tag=vacation_baseline_v1 "
+                "shadow_policy_variant_names=shadow_score_gte_8_0,shadow_score_gte_7_5 "
+                "policy_runtime_ready=True"
+                in str(call.args[0])
+                for call in print_mock.call_args_list
+                if call.args
+            )
+        )
+
+    def test_multiple_shadow_policy_variants_persist_one_decision_each(self) -> None:
+        with patch(
+            "trade_scout.alert_pipeline.config.SHADOW_POLICY_VARIANT_NAMES",
+            [
+                "shadow_score_gte_8_0",
+                "shadow_score_gte_7_5",
+                "shadow_block_score_lt_6_5",
+                "shadow_score_gte_8_0_bear",
+            ],
+        ):
+            pipeline, context = self._make_pipeline()
+
+        with self._patch_alert_side_effects(), patch(
+            "trade_scout.alert_pipeline.uuid4",
+            side_effect=["provisional-1", "alert-1"],
+        ):
+            pipeline.process(**self._process_kwargs(anchor_regime="bear"))
+
+        conn = get_connection(self.db_path)
+        try:
+            rows = conn.execute(
+                """
+                SELECT policy_name, decision
+                FROM policy_decisions
+                WHERE alert_id = ?
+                ORDER BY policy_name
+                """,
+                ("alert-1",),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        self.assertEqual(
+            {
+                "shadow_block_score_lt_6_5": "ALLOW",
+                "shadow_score_gte_7_5": "ALLOW",
+                "shadow_score_gte_8_0": "ALLOW",
+                "shadow_score_gte_8_0_bear": "ALLOW",
+            },
+            {row["policy_name"]: row["decision"] for row in rows},
+        )
+        self.assertEqual(1, len(context.watch_mgr.added))
+
+    def test_shadow_policy_block_does_not_block_live_alert_flow(self) -> None:
+        with patch(
+            "trade_scout.alert_pipeline.config.SHADOW_POLICY_VARIANT_NAMES",
+            ["shadow_score_gte_8_0", "shadow_block_score_lt_6_5"],
+        ):
+            pipeline, context = self._make_pipeline()
+
+        with self._patch_alert_side_effects() as side_effects, patch(
+            "trade_scout.alert_pipeline.uuid4",
+            side_effect=["provisional-1", "alert-1"],
+        ):
+            pipeline.process(**self._process_kwargs(score=6.2, anchor_regime="bear"))
+
+        conn = get_connection(self.db_path)
+        try:
+            rows = conn.execute(
+                "SELECT policy_name, decision FROM policy_decisions WHERE alert_id = ? ORDER BY policy_name",
+                ("alert-1",),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        self.assertEqual(
+            {
+                "shadow_block_score_lt_6_5": "BLOCK",
+                "shadow_score_gte_8_0": "BLOCK",
+            },
+            {row["policy_name"]: row["decision"] for row in rows},
+        )
+        self.assertTrue(side_effects["notify"].called)
+        self.assertEqual(1, len(context.watch_mgr.added))
+        self.assertEqual("ALERT_CREATED", side_effects["log_intent"].call_args.args[0].alert_status)
+
+    def test_one_shadow_policy_persist_failure_does_not_block_other_variants(self) -> None:
+        with patch(
+            "trade_scout.alert_pipeline.config.SHADOW_POLICY_VARIANT_NAMES",
+            ["shadow_score_gte_8_0", "shadow_score_gte_7_5", "shadow_block_score_lt_6_5"],
+        ):
+            pipeline, context = self._make_pipeline()
+
+        original_insert = self.policy_repository.insert_policy_decision
+
+        def insert_side_effect(conn, row):
+            if row.policy_name == "shadow_score_gte_7_5":
+                raise sqlite3.OperationalError("variant persist boom")
+            return original_insert(conn, row)
+
+        with self._patch_alert_side_effects() as side_effects, patch.object(
+            self.policy_repository,
+            "insert_policy_decision",
+            side_effect=insert_side_effect,
+        ), patch(
+            "trade_scout.alert_pipeline.uuid4",
+            side_effect=["provisional-1", "alert-1"],
+        ), patch("builtins.print") as print_mock:
+            pipeline.process(**self._process_kwargs(anchor_regime="bear"))
+
+        conn = get_connection(self.db_path)
+        try:
+            policy_names = [
+                row["policy_name"]
+                for row in conn.execute(
+                    "SELECT policy_name FROM policy_decisions WHERE alert_id = ? ORDER BY policy_name",
+                    ("alert-1",),
+                ).fetchall()
+            ]
+        finally:
+            conn.close()
+
+        self.assertEqual(["shadow_block_score_lt_6_5", "shadow_score_gte_8_0"], policy_names)
+        self.assertTrue(side_effects["notify"].called)
+        self.assertEqual(1, len(context.watch_mgr.added))
+        self.assertTrue(
+            any(
+                "[policy] error alert_id=alert-1 stage=persist policy_name=shadow_score_gte_7_5"
+                in str(call.args[0])
+                for call in print_mock.call_args_list
+                if call.args
+            )
+        )
+
+    def test_shadow_policy_variants_differentiate_low_score_alert(self) -> None:
+        with patch(
+            "trade_scout.alert_pipeline.config.SHADOW_POLICY_VARIANT_NAMES",
+            [
+                "shadow_score_gte_8_0",
+                "shadow_score_gte_7_5",
+                "shadow_block_score_lt_6_5",
+                "shadow_score_gte_8_0_bear",
+            ],
+        ):
+            pipeline, _ = self._make_pipeline()
+
+        with self._patch_alert_side_effects(), patch(
+            "trade_scout.alert_pipeline.uuid4",
+            side_effect=["provisional-1", "alert-1"],
+        ):
+            pipeline.process(**self._process_kwargs(score=6.2, anchor_regime="bear"))
+
+        conn = get_connection(self.db_path)
+        try:
+            rows = conn.execute(
+                """
+                SELECT policy_name, decision
+                FROM policy_decisions
+                WHERE alert_id = ?
+                ORDER BY policy_name
+                """,
+                ("alert-1",),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        self.assertEqual(
+            {
+                "shadow_block_score_lt_6_5": "BLOCK",
+                "shadow_score_gte_7_5": "BLOCK",
+                "shadow_score_gte_8_0": "BLOCK",
+                "shadow_score_gte_8_0_bear": "BLOCK",
+            },
+            {row["policy_name"]: row["decision"] for row in rows},
+        )
+
     def test_evaluator_failure_does_not_break_alert_flow(self) -> None:
         self._activate_shadow_policy(filters={"allowed_symbols": ["AAPL"]})
         pipeline, context = self._make_pipeline()
@@ -270,6 +454,40 @@ class AlertPipelinePolicyIntegrationTest(unittest.TestCase):
         self.assertEqual("SCORED", context_rows[0].shadow_score_status)
         self.assertFalse(hasattr(intent_rows[0], "score_shadow"))
         self.assertTrue(side_effects["notify"].called)
+        self.assertEqual(1, len(context.watch_mgr.added))
+
+    def test_experiment_tag_is_added_to_alert_context_when_configured(self) -> None:
+        pipeline, context = self._make_pipeline()
+
+        with self._patch_alert_side_effects() as side_effects, patch(
+            "trade_scout.journal_builders.config.EXPERIMENT_TAG",
+            "vacation_baseline_v1",
+        ), patch(
+            "trade_scout.alert_pipeline.uuid4",
+            side_effect=["provisional-1", "alert-1"],
+        ):
+            pipeline.process(**self._process_kwargs())
+
+        context_row = side_effects["log_context"].call_args.args[0]
+        intent_row = side_effects["log_intent"].call_args.args[0]
+        self.assertEqual("vacation_baseline_v1", context_row.experiment_tag)
+        self.assertFalse(hasattr(intent_row, "experiment_tag"))
+        self.assertEqual(1, len(context.watch_mgr.added))
+
+    def test_experiment_tag_unset_remains_null_and_backward_compatible(self) -> None:
+        pipeline, context = self._make_pipeline()
+
+        with self._patch_alert_side_effects() as side_effects, patch(
+            "trade_scout.journal_builders.config.EXPERIMENT_TAG",
+            None,
+        ), patch(
+            "trade_scout.alert_pipeline.uuid4",
+            side_effect=["provisional-1", "alert-1"],
+        ):
+            pipeline.process(**self._process_kwargs())
+
+        context_row = side_effects["log_context"].call_args.args[0]
+        self.assertIsNone(context_row.experiment_tag)
         self.assertEqual(1, len(context.watch_mgr.added))
 
     def test_shadow_score_failure_does_not_break_alert_flow(self) -> None:
@@ -506,7 +724,7 @@ class AlertPipelinePolicyIntegrationTest(unittest.TestCase):
             shadow_scorer=shadow_scorer,
         ), context
 
-    def _process_kwargs(self):
+    def _process_kwargs(self, *, score=8.2, anchor_regime="bull"):
         strategy = SimpleNamespace(
             build_trade_plan=lambda symbol, profile, setup_candidate: SimpleNamespace(
                 timeframe_min=profile.timeframe_min,
@@ -531,7 +749,7 @@ class AlertPipelinePolicyIntegrationTest(unittest.TestCase):
             "now": datetime(2026, 4, 5, 12, 0, tzinfo=timezone.utc),
             "ts": datetime(2026, 4, 5, 12, 0, tzinfo=timezone.utc),
             "setup_candidate": SimpleNamespace(
-                score=8.2,
+                score=score,
                 reasons=["strong breakout"],
                 tier="A",
             ),
@@ -551,7 +769,7 @@ class AlertPipelinePolicyIntegrationTest(unittest.TestCase):
                 "range_pct": 1.0,
                 "close_location_in_bar": 0.9,
                 "anchor_symbol": "SPY",
-                "anchor_regime": "bull",
+                "anchor_regime": anchor_regime,
                 "anchor_close": 500.0,
                 "anchor_ma50": 495.0,
                 "anchor_ma200": 480.0,

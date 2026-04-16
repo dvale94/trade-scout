@@ -64,7 +64,9 @@ def evaluate_policy(
         policy_config.filters.get("allowed_anchor_regimes")
     )
     if allowed_anchor_regimes:
-        passed = feature_snapshot.anchor_regime in allowed_anchor_regimes
+        passed = _normalized_casefold(feature_snapshot.anchor_regime) in {
+            _normalized_casefold(regime) for regime in allowed_anchor_regimes
+        }
         criteria_results.append(
             PolicyCriterionResult(
                 criterion_name="allowed_anchor_regimes",
@@ -97,6 +99,20 @@ def evaluate_policy(
             reasons.append(
                 f"score_bucket '{feature_snapshot.score_bucket}' below required minimum '{min_score_bucket}'"
             )
+
+    min_score = _normalized_optional_float(policy_config.filters.get("min_score"))
+    if min_score is not None:
+        passed = feature_snapshot.score >= min_score
+        criteria_results.append(
+            PolicyCriterionResult(
+                criterion_name="min_score",
+                passed=passed,
+                actual_value=feature_snapshot.score,
+                expected_value=min_score,
+            )
+        )
+        if not passed:
+            reasons.append(f"score {feature_snapshot.score:.4f} below required minimum {min_score:.4f}")
 
     allowed_symbols = _normalized_filter_values(policy_config.filters.get("allowed_symbols"))
     if allowed_symbols:
@@ -179,3 +195,16 @@ def _normalized_optional_str(value: object) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _normalized_casefold(value: object) -> str:
+    return str(value).strip().casefold()
+
+
+def _normalized_optional_float(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("policy numeric filter values must be numbers") from exc

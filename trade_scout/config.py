@@ -60,6 +60,9 @@ SYMBOLS = [s.strip().upper() for s in os.getenv("SYMBOLS", "").split(",") if s.s
 # Logging directory
 LOG_DIR = os.getenv("LOG_DIR", "logs").strip()
 
+# Optional analytics tag for identifying collection windows in alert_context.
+EXPERIMENT_TAG = os.getenv("EXPERIMENT_TAG", "").strip() or None
+
 # Execution subsystem
 EXECUTION_ENABLED = os.getenv("EXECUTION_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
 EXECUTION_DB_PATH = os.getenv("EXECUTION_DB_PATH", "./execution.db").strip()
@@ -70,6 +73,7 @@ EXECUTION_WORKER_ID = os.getenv("EXECUTION_WORKER_ID", "execution-worker-1").str
 EXECUTION_ORDER_NOTIONAL = _float_env("EXECUTION_ORDER_NOTIONAL", "25")
 AUTO_EXECUTION_MODE = _auto_execution_mode_env("AUTO_EXECUTION_MODE")
 AUTO_EXECUTION_SYMBOLS = {symbol.upper() for symbol in _csv_env("AUTO_EXECUTION_SYMBOLS")}
+SHADOW_POLICY_VARIANT_NAMES = _csv_env("SHADOW_POLICY_VARIANT_NAMES")
 
 # Strategy loading
 ENABLED_STRATEGY_IDS = _csv_env("ENABLED_STRATEGY_IDS") or ["long_breakout_continuation"]
