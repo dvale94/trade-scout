@@ -102,6 +102,7 @@ class AlertPipeline:
                 f"[policy] error alert_id=UNKNOWN stage=init_db "
                 f"policy_name={self.policy_name} mode=SHADOW error={exc}"
             )
+        self._log_collection_config()
 
     def _build_shadow_scorer(self) -> RuntimeShadowScorer:
         try:
@@ -118,6 +119,15 @@ class AlertPipeline:
                     enabled=False,
                 )
             )
+
+    def _log_collection_config(self) -> None:
+        variant_names = ",".join(self.shadow_policy_variant_names) or "<none>"
+        experiment_tag = config.EXPERIMENT_TAG or "<unset>"
+        print(
+            f"[startup] collection_config experiment_tag={experiment_tag} "
+            f"shadow_policy_variant_names={variant_names} "
+            f"policy_runtime_ready={self._policy_runtime_ready}"
+        )
 
     def _log_intent_and_context(self, symbol: str, core_row, context_row) -> None:
         journal.log_alert_intent(core_row)

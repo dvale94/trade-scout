@@ -52,6 +52,17 @@ class PolicyEvaluatorTest(unittest.TestCase):
         self.assertEqual("ALLOW", decision.decision)
         self.assertTrue(decision.criteria_results[0].passed)
 
+    def test_allowed_anchor_regimes_are_case_insensitive(self) -> None:
+        decision = evaluate_policy(
+            self._intent(),
+            self._context(anchor_regime="BEAR"),
+            self._policy_config(filters={"allowed_anchor_regimes": ["bear"]}),
+        )
+
+        self.assertEqual("ALLOW", decision.decision)
+        self.assertTrue(decision.criteria_results[0].passed)
+        self.assertEqual("BEAR", decision.criteria_results[0].actual_value)
+
     def test_allowed_anchor_regimes_blocks(self) -> None:
         decision = evaluate_policy(
             self._intent(),

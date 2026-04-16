@@ -167,6 +167,24 @@ class AlertPipelinePolicyIntegrationTest(unittest.TestCase):
         self.assertEqual(0, row_count)
         self.assertEqual(1, len(context.watch_mgr.added))
 
+    def test_startup_logs_collection_config_summary(self) -> None:
+        with patch("trade_scout.alert_pipeline.config.EXPERIMENT_TAG", "vacation_baseline_v1"), patch(
+            "trade_scout.alert_pipeline.config.SHADOW_POLICY_VARIANT_NAMES",
+            ["shadow_score_gte_8_0", "shadow_score_gte_7_5"],
+        ), patch("builtins.print") as print_mock:
+            self._make_pipeline()
+
+        self.assertTrue(
+            any(
+                "[startup] collection_config experiment_tag=vacation_baseline_v1 "
+                "shadow_policy_variant_names=shadow_score_gte_8_0,shadow_score_gte_7_5 "
+                "policy_runtime_ready=True"
+                in str(call.args[0])
+                for call in print_mock.call_args_list
+                if call.args
+            )
+        )
+
     def test_multiple_shadow_policy_variants_persist_one_decision_each(self) -> None:
         with patch(
             "trade_scout.alert_pipeline.config.SHADOW_POLICY_VARIANT_NAMES",

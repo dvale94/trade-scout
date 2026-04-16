@@ -64,7 +64,9 @@ def evaluate_policy(
         policy_config.filters.get("allowed_anchor_regimes")
     )
     if allowed_anchor_regimes:
-        passed = feature_snapshot.anchor_regime in allowed_anchor_regimes
+        passed = _normalized_casefold(feature_snapshot.anchor_regime) in {
+            _normalized_casefold(regime) for regime in allowed_anchor_regimes
+        }
         criteria_results.append(
             PolicyCriterionResult(
                 criterion_name="allowed_anchor_regimes",
@@ -193,6 +195,10 @@ def _normalized_optional_str(value: object) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _normalized_casefold(value: object) -> str:
+    return str(value).strip().casefold()
 
 
 def _normalized_optional_float(value: object) -> float | None:
