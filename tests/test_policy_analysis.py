@@ -7,6 +7,8 @@ import types
 import unittest
 from pathlib import Path
 
+import pandas as pd
+
 if "dotenv" not in sys.modules:
     dotenv_stub = types.ModuleType("dotenv")
     dotenv_stub.load_dotenv = lambda *args, **kwargs: None
@@ -21,12 +23,14 @@ if "requests" not in sys.modules:
     sys.modules["requests"] = requests_stub
 
 from research.policy_analysis import (
+    compare_policy_variant_allow_block,
     counts_by_decision,
     flatten_policy_criteria_results,
     flatten_policy_decision_reasons,
     flatten_policy_feature_snapshot,
     join_ready_policy_decisions,
     load_policy_decisions,
+    summarize_policy_variant_performance,
     top_failed_criteria,
 )
 from trade_scout.execution.queue import get_connection, init_db, utc_now_iso
@@ -118,6 +122,67 @@ class PolicyAnalysisTest(unittest.TestCase):
         self.assertIn("score_bucket", joined.columns)
         self.assertEqual("BLOCK", joined[joined["alert_id"] == "alert-2"].iloc[0]["decision"])
 
+    def test_summarize_policy_variant_performance_returns_expected_metrics(self) -> None:
+        trades = self._toy_trades()
+        decisions = self._toy_decisions()
+
+        summary = summarize_policy_variant_performance(
+            trades,
+            decisions,
+            experiment_tag="vacation_baseline_v1",
+        )
+
+        allow_row = summary[summary["decision"] == "ALLOW"].iloc[0]
+        block_row = summary[summary["decision"] == "BLOCK"].iloc[0]
+
+        self.assertEqual(2, allow_row["trade_count"])
+        self.assertAlmostEqual(2.0 / 3.0, allow_row["share_of_policy_trades"])
+        self.assertAlmostEqual(0.5, allow_row["win_rate"])
+        self.assertAlmostEqual(0.5, allow_row["expectancy_R"])
+        self.assertAlmostEqual(0.5, allow_row["median_R"])
+        self.assertAlmostEqual(1.0, allow_row["total_R"])
+        self.assertAlmostEqual(1.7, allow_row["avg_mfe_R"])
+        self.assertAlmostEqual(-0.8, allow_row["avg_mae_R"])
+        self.assertAlmostEqual(2.0, allow_row["profit_factor"])
+        self.assertEqual(2, allow_row["closed_trade_count"])
+
+        self.assertEqual(1, block_row["trade_count"])
+        self.assertAlmostEqual(1.0 / 3.0, block_row["share_of_policy_trades"])
+        self.assertAlmostEqual(0.0, block_row["win_rate"])
+        self.assertAlmostEqual(-1.0, block_row["expectancy_R"])
+
+    def test_compare_policy_variant_allow_block_returns_expected_deltas(self) -> None:
+        trades = self._toy_trades()
+        decisions = self._toy_decisions()
+
+        comparison = compare_policy_variant_allow_block(
+            trades,
+            decisions,
+            experiment_tag="vacation_baseline_v1",
+        )
+        row = comparison.iloc[0]
+
+        self.assertEqual(2, row["allow_count"])
+        self.assertEqual(1, row["block_count"])
+        self.assertAlmostEqual(1.0 / 3.0, row["block_rate"])
+        self.assertAlmostEqual(0.5, row["allow_expectancy_R"])
+        self.assertAlmostEqual(-1.0, row["block_expectancy_R"])
+        self.assertAlmostEqual(0.5 - 0.0, row["expectancy_delta_R"])
+        self.assertAlmostEqual(1.5, row["blocked_vs_allowed_delta_R"])
+        self.assertAlmostEqual(0.0, row["winners_removed_pct"])
+        self.assertAlmostEqual(0.5, row["losers_removed_pct"])
+
+    def test_policy_variant_helpers_handle_missing_optional_columns(self) -> None:
+        trades = self._toy_trades().drop(columns=["mfe_R", "mae_R", "closed_trade"])
+        decisions = self._toy_decisions()
+
+        summary = summarize_policy_variant_performance(trades, decisions)
+        allow_row = summary[summary["decision"] == "ALLOW"].iloc[0]
+
+        self.assertTrue(pd.isna(allow_row["avg_mfe_R"]))
+        self.assertTrue(pd.isna(allow_row["avg_mae_R"]))
+        self.assertEqual(2, allow_row["closed_trade_count"])
+
     def _decision_row_one(self) -> PolicyDecisionRow:
         return PolicyDecisionRow(
             policy_decision_id="decision-1",
@@ -166,4 +231,67 @@ class PolicyAnalysisTest(unittest.TestCase):
             ),
             execution_candidate=0,
             request_id=None,
+        )
+
+    @staticmethod
+    def _toy_trades() -> "pd.DataFrame":
+        import pandas as pd
+
+        return pd.DataFrame(
+            [
+                {
+                    "alert_id": "alert-1",
+                    "experiment_tag": "vacation_baseline_v1",
+                    "pnl_R": 2.0,
+                    "mfe_R": 3.0,
+                    "mae_R": -0.5,
+                    "closed_trade": 1,
+                },
+                {
+                    "alert_id": "alert-2",
+                    "experiment_tag": "vacation_baseline_v1",
+                    "pnl_R": -1.0,
+                    "mfe_R": 1.5,
+                    "mae_R": -1.2,
+                    "closed_trade": 1,
+                },
+                {
+                    "alert_id": "alert-3",
+                    "experiment_tag": "vacation_baseline_v1",
+                    "pnl_R": -1.0,
+                    "mfe_R": 0.4,
+                    "mae_R": -1.1,
+                    "closed_trade": 1,
+                },
+            ]
+        )
+
+    @staticmethod
+    def _toy_decisions() -> "pd.DataFrame":
+        import pandas as pd
+
+        return pd.DataFrame(
+            [
+                {
+                    "alert_id": "alert-1",
+                    "policy_name": "variant_a",
+                    "policy_version": "vacation_baseline_v1",
+                    "mode": "SHADOW",
+                    "decision": "ALLOW",
+                },
+                {
+                    "alert_id": "alert-2",
+                    "policy_name": "variant_a",
+                    "policy_version": "vacation_baseline_v1",
+                    "mode": "SHADOW",
+                    "decision": "BLOCK",
+                },
+                {
+                    "alert_id": "alert-3",
+                    "policy_name": "variant_a",
+                    "policy_version": "vacation_baseline_v1",
+                    "mode": "SHADOW",
+                    "decision": "ALLOW",
+                },
+            ]
         )

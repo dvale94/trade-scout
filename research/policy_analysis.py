@@ -9,6 +9,8 @@ from typing import Any
 import pandas as pd
 from dotenv import load_dotenv
 
+from research.metrics import summarize_trade_performance
+
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(_REPO_ROOT / ".env")
@@ -280,6 +282,208 @@ def summarize_policy_shadow(decisions: pd.DataFrame) -> dict[str, pd.DataFrame]:
     }
 
 
+def summarize_policy_variant_performance(
+    trades_enriched: pd.DataFrame,
+    policy_decisions: pd.DataFrame,
+    *,
+    experiment_tag: str | None = None,
+    policy_version: str | None = None,
+    min_trades: int = 1,
+) -> pd.DataFrame:
+    """
+    Summarize shadow-policy trade performance by policy variant and decision.
+
+    Example notebook usage:
+    summary = summarize_policy_variant_performance(
+        trades_enriched,
+        policy_decisions,
+        experiment_tag="vacation_baseline_v1",
+    )
+    """
+    joined = _join_policy_trades(
+        trades_enriched,
+        policy_decisions,
+        experiment_tag=experiment_tag,
+        policy_version=policy_version,
+    )
+    if joined.empty:
+        return pd.DataFrame(
+            columns=[
+                "policy_name",
+                "policy_version",
+                "mode",
+                "decision",
+                "trade_count",
+                "share_of_policy_trades",
+                "win_rate",
+                "expectancy_R",
+                "median_R",
+                "total_R",
+                "avg_mfe_R",
+                "avg_mae_R",
+                "profit_factor",
+                "closed_trade_count",
+            ]
+        )
+
+    rows: list[dict[str, Any]] = []
+    for group_key, group_df in joined.groupby(
+        ["policy_name", "policy_version", "mode", "decision"],
+        observed=False,
+        dropna=False,
+    ):
+        policy_name, grouped_policy_version, mode, decision = group_key
+        trade_count = int(len(group_df))
+        if trade_count < min_trades:
+            continue
+
+        performance = summarize_trade_performance(group_df)
+        closed_trade_mask = _closed_trade_mask(group_df)
+        closed_trade_count = int(closed_trade_mask.sum())
+        pnl = _numeric_series(group_df, "pnl_R").dropna()
+        mfe = _numeric_series(group_df, "mfe_R").dropna()
+        mae = _numeric_series(group_df, "mae_R").dropna()
+
+        policy_group_df = joined.loc[
+            joined["policy_name"].fillna("UNKNOWN").astype(str).eq(str(policy_name))
+            & joined["policy_version"].fillna("UNKNOWN").astype(str).eq(str(grouped_policy_version))
+            & joined["mode"].fillna("UNKNOWN").astype(str).eq(str(mode))
+        ]
+        policy_total_trade_count = int(len(policy_group_df))
+
+        rows.append(
+            {
+                "policy_name": policy_name,
+                "policy_version": grouped_policy_version,
+                "mode": mode,
+                "decision": decision,
+                "trade_count": trade_count,
+                "share_of_policy_trades": (
+                    float(trade_count / policy_total_trade_count) if policy_total_trade_count else None
+                ),
+                "win_rate": performance["win_rate"],
+                "expectancy_R": performance["expectancy_R"],
+                "median_R": float(pnl.median()) if not pnl.empty else None,
+                "total_R": float(pnl.sum()) if not pnl.empty else None,
+                "avg_mfe_R": float(mfe.mean()) if not mfe.empty else None,
+                "avg_mae_R": float(mae.mean()) if not mae.empty else None,
+                "profit_factor": performance["profit_factor"],
+                "closed_trade_count": closed_trade_count,
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame()
+    return (
+        pd.DataFrame(rows)
+        .sort_values(
+            ["policy_name", "policy_version", "mode", "decision"],
+            ascending=[True, True, True, True],
+            na_position="last",
+        )
+        .reset_index(drop=True)
+    )
+
+
+def compare_policy_variant_allow_block(
+    trades_enriched: pd.DataFrame,
+    policy_decisions: pd.DataFrame,
+    *,
+    experiment_tag: str | None = None,
+    policy_version: str | None = None,
+    min_trades: int = 1,
+) -> pd.DataFrame:
+    """
+    Compare ALLOW vs BLOCK behavior for each policy variant.
+    """
+    joined = _join_policy_trades(
+        trades_enriched,
+        policy_decisions,
+        experiment_tag=experiment_tag,
+        policy_version=policy_version,
+    )
+    if joined.empty:
+        return pd.DataFrame(
+            columns=[
+                "policy_name",
+                "policy_version",
+                "mode",
+                "allow_count",
+                "block_count",
+                "block_rate",
+                "allow_expectancy_R",
+                "block_expectancy_R",
+                "expectancy_delta_R",
+                "blocked_vs_allowed_delta_R",
+                "winners_removed_pct",
+                "losers_removed_pct",
+            ]
+        )
+
+    rows: list[dict[str, Any]] = []
+    for group_key, group_df in joined.groupby(
+        ["policy_name", "policy_version", "mode"],
+        observed=False,
+        dropna=False,
+    ):
+        policy_name, grouped_policy_version, mode = group_key
+        total_count = int(len(group_df))
+        if total_count < min_trades:
+            continue
+
+        allow_df = group_df.loc[group_df["decision"].fillna("").astype(str).eq("ALLOW")].copy()
+        block_df = group_df.loc[group_df["decision"].fillna("").astype(str).eq("BLOCK")].copy()
+        overall_pnl = _numeric_series(group_df, "pnl_R").dropna()
+        allow_pnl = _numeric_series(allow_df, "pnl_R").dropna()
+        block_pnl = _numeric_series(block_df, "pnl_R").dropna()
+
+        overall_expectancy = float(overall_pnl.mean()) if not overall_pnl.empty else None
+        allow_expectancy = float(allow_pnl.mean()) if not allow_pnl.empty else None
+        block_expectancy = float(block_pnl.mean()) if not block_pnl.empty else None
+
+        overall_winners = int((overall_pnl > 0).sum()) if not overall_pnl.empty else 0
+        overall_losers = int((overall_pnl < 0).sum()) if not overall_pnl.empty else 0
+        blocked_winners = int((block_pnl > 0).sum()) if not block_pnl.empty else 0
+        blocked_losers = int((block_pnl < 0).sum()) if not block_pnl.empty else 0
+
+        rows.append(
+            {
+                "policy_name": policy_name,
+                "policy_version": grouped_policy_version,
+                "mode": mode,
+                "allow_count": int(len(allow_df)),
+                "block_count": int(len(block_df)),
+                "block_rate": (float(len(block_df) / total_count) if total_count else None),
+                "allow_expectancy_R": allow_expectancy,
+                "block_expectancy_R": block_expectancy,
+                "expectancy_delta_R": (
+                    float(allow_expectancy - overall_expectancy)
+                    if allow_expectancy is not None and overall_expectancy is not None
+                    else None
+                ),
+                "blocked_vs_allowed_delta_R": (
+                    float(allow_expectancy - block_expectancy)
+                    if allow_expectancy is not None and block_expectancy is not None
+                    else None
+                ),
+                "winners_removed_pct": (
+                    float(blocked_winners / overall_winners) if overall_winners > 0 else None
+                ),
+                "losers_removed_pct": (
+                    float(blocked_losers / overall_losers) if overall_losers > 0 else None
+                ),
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame()
+    return (
+        pd.DataFrame(rows)
+        .sort_values(["policy_name", "policy_version", "mode"], ascending=[True, True, True])
+        .reset_index(drop=True)
+    )
+
+
 def _value_counts_frame(df: pd.DataFrame, column: str) -> pd.DataFrame:
     if df.empty or column not in df.columns:
         return pd.DataFrame(columns=[column, "count"])
@@ -290,6 +494,55 @@ def _value_counts_frame(df: pd.DataFrame, column: str) -> pd.DataFrame:
         .rename_axis(column)
         .reset_index(name="count")
     )
+
+
+def _join_policy_trades(
+    trades_enriched: pd.DataFrame,
+    policy_decisions: pd.DataFrame,
+    *,
+    experiment_tag: str | None,
+    policy_version: str | None,
+) -> pd.DataFrame:
+    if trades_enriched.empty or policy_decisions.empty:
+        return pd.DataFrame()
+
+    trades = trades_enriched.copy()
+    decisions = policy_decisions.copy()
+    if experiment_tag is not None and "experiment_tag" in trades.columns:
+        trades = trades.loc[trades["experiment_tag"].astype(str).eq(experiment_tag)].copy()
+    if policy_version is not None and "policy_version" in decisions.columns:
+        decisions = decisions.loc[decisions["policy_version"].astype(str).eq(policy_version)].copy()
+    if trades.empty or decisions.empty or "alert_id" not in trades.columns or "alert_id" not in decisions.columns:
+        return pd.DataFrame()
+
+    joined = decisions.merge(
+        trades,
+        on="alert_id",
+        how="inner",
+        suffixes=("_policy", ""),
+    )
+    return joined.reset_index(drop=True)
+
+
+def _numeric_series(df: pd.DataFrame, column: str) -> pd.Series:
+    if df.empty or column not in df.columns:
+        return pd.Series(dtype="float64")
+    return pd.to_numeric(df[column], errors="coerce")
+
+
+def _closed_trade_mask(df: pd.DataFrame) -> pd.Series:
+    if df.empty:
+        return pd.Series(dtype="bool")
+    if "closed_trade" in df.columns:
+        raw = df["closed_trade"]
+        if raw.dtype == bool:
+            return raw.fillna(False)
+        numeric = pd.to_numeric(raw, errors="coerce")
+        if numeric.notna().any():
+            return numeric.fillna(0).astype(int).ne(0)
+        text = raw.fillna("").astype(str).str.strip().str.upper()
+        return text.isin({"TRUE", "T", "YES", "Y", "1"})
+    return _numeric_series(df, "pnl_R").notna()
 
 
 def _parse_json_object(value: Any) -> dict[str, Any]:
