@@ -25,6 +25,7 @@ TARGET_COLUMN_CANDIDATES = [
     "mae_R",
     "mae_r",
 ]
+DECOMPOSITION_MODES = {"fixed", "quantile"}
 
 
 def safe_col(df: pd.DataFrame, col: str, default: Any = None) -> pd.Series:
@@ -34,7 +35,12 @@ def safe_col(df: pd.DataFrame, col: str, default: Any = None) -> pd.Series:
     return pd.Series(default, index=df.index)
 
 
-def derive_decomposition_features(df: pd.DataFrame) -> pd.DataFrame:
+def derive_decomposition_features(
+    df: pd.DataFrame,
+    *,
+    decomposition_mode: str = "fixed",
+    quantile_count: int = 3,
+) -> pd.DataFrame:
     """
     Derive null-safe intermediate research features for setup decomposition.
 
@@ -42,6 +48,7 @@ def derive_decomposition_features(df: pd.DataFrame) -> pd.DataFrame:
     columns when deriving subtype inputs.
     """
     out = df.copy()
+    resolved_mode = _normalize_decomposition_mode(decomposition_mode)
 
     breakout_distance = _numeric_col(out, "breakout_distance_atr")
     ma20_distance = _abs_numeric_col(out, "ma20_distance_atr")
@@ -71,11 +78,37 @@ def derive_decomposition_features(df: pd.DataFrame) -> pd.DataFrame:
     out["trend_stack_down"] = ma20.lt(ma50) & ma50.lt(ma200)
     out["short_term_slope_up"] = ma20_slope.gt(0)
     out["intermediate_slope_up"] = ma50_slope.gt(0)
+    out["decomposition_mode"] = resolved_mode
+
+    if resolved_mode == "quantile":
+        out["breakout_quality_quantile"] = derive_quantile_buckets(
+            out,
+            "breakout_distance_atr_num",
+            labels=["tight", "clean", "extended"],
+            quantile_count=quantile_count,
+        )
+        out["pullback_structure_quantile"] = derive_quantile_buckets(
+            out,
+            "ma20_distance_atr_abs",
+            labels=["shallow", "moderate", "deep"],
+            quantile_count=quantile_count,
+        )
+        out["liquidity_volume_context_quantile"] = derive_quantile_buckets(
+            out,
+            "vol_z_num",
+            labels=["thin_relative_volume", "normal_relative_volume", "high_relative_volume"],
+            quantile_count=quantile_count,
+        )
 
     return out
 
 
-def assign_setup_subtypes(df: pd.DataFrame) -> pd.DataFrame:
+def assign_setup_subtypes(
+    df: pd.DataFrame,
+    *,
+    decomposition_mode: str = "fixed",
+    quantile_count: int = 3,
+) -> pd.DataFrame:
     """
     Add deterministic research subtype labels without using outcome columns.
 
@@ -83,7 +116,12 @@ def assign_setup_subtypes(df: pd.DataFrame) -> pd.DataFrame:
     be used for post-hoc research without leaking trade outcomes into the setup
     taxonomy.
     """
-    out = derive_decomposition_features(df)
+    resolved_mode = _normalize_decomposition_mode(decomposition_mode)
+    out = derive_decomposition_features(
+        df,
+        decomposition_mode=resolved_mode,
+        quantile_count=quantile_count,
+    )
 
     breakout_distance = _numeric_col(out, "breakout_distance_atr_num")
     ma20_distance = _numeric_col(out, "ma20_distance_atr_abs")
@@ -96,21 +134,27 @@ def assign_setup_subtypes(df: pd.DataFrame) -> pd.DataFrame:
     short_term_slope_up = _bool_col(out, "short_term_slope_up")
     intermediate_slope_up = _bool_col(out, "intermediate_slope_up")
 
-    out["breakout_quality"] = UNKNOWN
-    # tight/clean/extended are breakout-distance buckets, not outcome grades.
-    out.loc[breakout_distance.lt(0), "breakout_quality"] = "below_breakout_level"
-    out.loc[breakout_distance.between(0, 0.35, inclusive="both"), "breakout_quality"] = "tight"
-    out.loc[breakout_distance.gt(0.35) & breakout_distance.le(0.8), "breakout_quality"] = "clean"
-    out.loc[breakout_distance.gt(0.8), "breakout_quality"] = "extended"
+    if resolved_mode == "quantile":
+        out["breakout_quality"] = safe_col(out, "breakout_quality_quantile", default=UNKNOWN).fillna(UNKNOWN)
+        out.loc[breakout_distance.lt(0), "breakout_quality"] = "below_breakout_level"
 
-    out["pullback_structure"] = UNKNOWN
-    # shallow/moderate/deep are MA-distance pullback proxies.
-    out.loc[ma20_distance.le(0.35) & ma50_distance.le(0.9), "pullback_structure"] = "shallow"
-    out.loc[
-        ma20_distance.gt(0.35) & ma20_distance.le(0.8) & ma50_distance.le(1.2),
-        "pullback_structure",
-    ] = "moderate"
-    out.loc[ma50_distance.gt(1.2), "pullback_structure"] = "deep"
+        out["pullback_structure"] = safe_col(out, "pullback_structure_quantile", default=UNKNOWN).fillna(UNKNOWN)
+    else:
+        out["breakout_quality"] = UNKNOWN
+        # tight/clean/extended are breakout-distance buckets, not outcome grades.
+        out.loc[breakout_distance.lt(0), "breakout_quality"] = "below_breakout_level"
+        out.loc[breakout_distance.between(0, 0.35, inclusive="both"), "breakout_quality"] = "tight"
+        out.loc[breakout_distance.gt(0.35) & breakout_distance.le(0.8), "breakout_quality"] = "clean"
+        out.loc[breakout_distance.gt(0.8), "breakout_quality"] = "extended"
+
+        out["pullback_structure"] = UNKNOWN
+        # shallow/moderate/deep are MA-distance pullback proxies.
+        out.loc[ma20_distance.le(0.35) & ma50_distance.le(0.9), "pullback_structure"] = "shallow"
+        out.loc[
+            ma20_distance.gt(0.35) & ma20_distance.le(0.8) & ma50_distance.le(1.2),
+            "pullback_structure",
+        ] = "moderate"
+        out.loc[ma50_distance.gt(1.2), "pullback_structure"] = "deep"
 
     out["volatility_context"] = UNKNOWN
     out.loc[(vol_z.ge(1.0)) | (extended_atr.ge(1.25)), "volatility_context"] = "high_volatility"
@@ -134,13 +178,18 @@ def assign_setup_subtypes(df: pd.DataFrame) -> pd.DataFrame:
         "trend_context",
     ] = "mixed_trend"
 
-    out["liquidity_volume_context"] = UNKNOWN
-    out.loc[vol_z.ge(1.0), "liquidity_volume_context"] = "high_relative_volume"
-    out.loc[vol_z.le(-0.75), "liquidity_volume_context"] = "thin_relative_volume"
-    out.loc[
-        out["liquidity_volume_context"].eq(UNKNOWN) & vol_z.notna(),
-        "liquidity_volume_context",
-    ] = "normal_relative_volume"
+    if resolved_mode == "quantile":
+        out["liquidity_volume_context"] = (
+            safe_col(out, "liquidity_volume_context_quantile", default=UNKNOWN).fillna(UNKNOWN)
+        )
+    else:
+        out["liquidity_volume_context"] = UNKNOWN
+        out.loc[vol_z.ge(1.0), "liquidity_volume_context"] = "high_relative_volume"
+        out.loc[vol_z.le(-0.75), "liquidity_volume_context"] = "thin_relative_volume"
+        out.loc[
+            out["liquidity_volume_context"].eq(UNKNOWN) & vol_z.notna(),
+            "liquidity_volume_context",
+        ] = "normal_relative_volume"
 
     # setup_family here is a derived research label, not the original runtime setup_family.
     out["setup_family"] = UNCLASSIFIED
@@ -167,9 +216,19 @@ def assign_setup_subtypes(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def summarize_subtype_expectancy(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
+def summarize_subtype_expectancy(
+    df: pd.DataFrame,
+    group_cols: list[str],
+    *,
+    decomposition_mode: str = "fixed",
+    quantile_count: int = 3,
+) -> pd.DataFrame:
     """Summarize grouped expectancy metrics using already-recorded outcome fields."""
-    prepared = assign_setup_subtypes(df)
+    prepared = assign_setup_subtypes(
+        df,
+        decomposition_mode=decomposition_mode,
+        quantile_count=quantile_count,
+    )
     grouped = _with_group_columns(prepared, group_cols)
     if grouped.empty:
         return pd.DataFrame(columns=[*group_cols, "n"])
@@ -204,9 +263,19 @@ def summarize_subtype_expectancy(df: pd.DataFrame, group_cols: list[str]) -> pd.
     return pd.DataFrame(rows).sort_values(group_cols).reset_index(drop=True)
 
 
-def summarize_exit_efficiency(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:
+def summarize_exit_efficiency(
+    df: pd.DataFrame,
+    group_cols: list[str],
+    *,
+    decomposition_mode: str = "fixed",
+    quantile_count: int = 3,
+) -> pd.DataFrame:
     """Estimate realized-vs-MFE monetization efficiency where summary fields exist."""
-    prepared = assign_setup_subtypes(df)
+    prepared = assign_setup_subtypes(
+        df,
+        decomposition_mode=decomposition_mode,
+        quantile_count=quantile_count,
+    )
     grouped = _with_group_columns(prepared, group_cols)
     if grouped.empty:
         return pd.DataFrame(columns=[*group_cols, "n"])
@@ -233,6 +302,39 @@ def summarize_exit_efficiency(df: pd.DataFrame, group_cols: list[str]) -> pd.Dat
 
 def _numeric_col(df: pd.DataFrame, col: str) -> pd.Series:
     return pd.to_numeric(safe_col(df, col, default=None), errors="coerce")
+
+
+def derive_quantile_buckets(
+    df: pd.DataFrame,
+    column: str,
+    *,
+    labels: list[str],
+    quantile_count: int = 3,
+    default: str = UNKNOWN,
+) -> pd.Series:
+    """
+    Derive explainable percentile buckets for a numeric feature.
+
+    This is research-only helper logic layered on top of fixed thresholds so we
+    can compare balanced decompositions without changing the default taxonomy.
+    """
+    values = _numeric_col(df, column)
+    out = pd.Series(default, index=df.index, dtype="object")
+    valid = values.dropna()
+    if valid.empty or quantile_count <= 1 or len(labels) != quantile_count:
+        return out
+
+    distinct_count = int(valid.nunique(dropna=True))
+    if distinct_count < quantile_count:
+        return out
+
+    ranked = valid.rank(method="first")
+    try:
+        bucketed = pd.qcut(ranked, q=quantile_count, labels=labels)
+    except ValueError:
+        return out
+    out.loc[bucketed.index] = bucketed.astype(str)
+    return out
 
 
 def _abs_numeric_col(df: pd.DataFrame, col: str) -> pd.Series:
@@ -282,3 +384,10 @@ def _group_key_values(group_key: Any, group_col_count: int) -> tuple[Any, ...]:
             return (group_key[0],)
         return (group_key,)
     return tuple(group_key)
+
+
+def _normalize_decomposition_mode(mode: str) -> str:
+    normalized = str(mode).strip().lower()
+    if normalized not in DECOMPOSITION_MODES:
+        return "fixed"
+    return normalized

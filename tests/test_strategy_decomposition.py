@@ -6,6 +6,7 @@ import pandas as pd
 
 from research.strategy_decomposition import (
     assign_setup_subtypes,
+    derive_quantile_buckets,
     safe_col,
     summarize_exit_efficiency,
     summarize_subtype_expectancy,
@@ -105,6 +106,48 @@ class StrategyDecompositionTest(unittest.TestCase):
         self.assertEqual(2, efficiency.iloc[0]["n"])
         self.assertAlmostEqual(-0.125, efficiency.iloc[0]["mean_exit_efficiency"])
         self.assertAlmostEqual(-0.125, efficiency.iloc[0]["median_exit_efficiency"])
+
+    def test_quantile_bucket_helper_produces_balanced_terciles(self) -> None:
+        trades = pd.DataFrame({"breakout_distance_atr_num": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]})
+
+        buckets = derive_quantile_buckets(
+            trades,
+            "breakout_distance_atr_num",
+            labels=["tight", "clean", "extended"],
+        )
+
+        counts = buckets.value_counts().to_dict()
+        self.assertEqual(2, counts["tight"])
+        self.assertEqual(2, counts["clean"])
+        self.assertEqual(2, counts["extended"])
+
+    def test_assign_setup_subtypes_supports_quantile_mode(self) -> None:
+        trades = pd.DataFrame(
+            [
+                {"alert_id": "a1", "breakout_distance_atr": 0.1, "ma20_distance_atr": 0.1, "vol_z": -1.0},
+                {"alert_id": "a2", "breakout_distance_atr": 0.2, "ma20_distance_atr": 0.2, "vol_z": -0.4},
+                {"alert_id": "a3", "breakout_distance_atr": 0.3, "ma20_distance_atr": 0.3, "vol_z": 0.0},
+                {"alert_id": "a4", "breakout_distance_atr": 0.4, "ma20_distance_atr": 0.4, "vol_z": 0.4},
+                {"alert_id": "a5", "breakout_distance_atr": 0.5, "ma20_distance_atr": 0.5, "vol_z": 1.0},
+                {"alert_id": "a6", "breakout_distance_atr": 0.6, "ma20_distance_atr": 0.6, "vol_z": 1.2},
+            ]
+        )
+
+        result = assign_setup_subtypes(trades, decomposition_mode="quantile")
+
+        self.assertEqual(["tight", "tight", "clean", "clean", "extended", "extended"], list(result["breakout_quality"]))
+        self.assertEqual(["shallow", "shallow", "moderate", "moderate", "deep", "deep"], list(result["pullback_structure"]))
+        self.assertEqual(
+            [
+                "thin_relative_volume",
+                "thin_relative_volume",
+                "normal_relative_volume",
+                "normal_relative_volume",
+                "high_relative_volume",
+                "high_relative_volume",
+            ],
+            list(result["liquidity_volume_context"]),
+        )
 
 
 if __name__ == "__main__":
