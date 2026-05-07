@@ -766,6 +766,55 @@ def get_paper_position_by_request_id(
     ).fetchone()
 
 
+def get_active_same_symbol_exposure(
+    conn: sqlite3.Connection,
+    *,
+    symbol: str,
+    exclude_plan_id: str,
+    exclude_request_id: str,
+) -> list[sqlite3.Row]:
+    rows = conn.execute(
+        """
+        SELECT
+            p.*,
+            r.status AS request_status
+        FROM paper_positions p
+        LEFT JOIN execution_requests r
+          ON r.request_id = p.request_id
+        WHERE p.symbol = ?
+          AND p.position_status IN (?, ?, ?, ?)
+          AND p.plan_id != ?
+          AND p.request_id != ?
+          AND NOT (
+            p.position_status = ?
+            AND COALESCE(r.status, '') IN (?, ?, ?)
+            AND NOT EXISTS (
+                SELECT 1
+                FROM paper_orders po
+                WHERE po.plan_id = p.plan_id
+                  AND po.order_role = ?
+            )
+          )
+        ORDER BY p.updated_ts_utc ASC, p.created_ts_utc ASC
+        """,
+        (
+            symbol,
+            PaperPositionStatus.PENDING_ENTRY.value,
+            PaperPositionStatus.OPEN.value,
+            PaperPositionStatus.PARTIAL.value,
+            PaperPositionStatus.CLOSING.value,
+            exclude_plan_id,
+            exclude_request_id,
+            PaperPositionStatus.PENDING_ENTRY.value,
+            ExecutionStatus.FAILED.value,
+            ExecutionStatus.REJECTED.value,
+            ExecutionStatus.EXPIRED.value,
+            PaperOrderRole.ENTRY.value,
+        ),
+    ).fetchall()
+    return list(rows)
+
+
 def get_positions_with_pending_actions(
     conn: sqlite3.Connection, limit: int = 50
 ) -> list[sqlite3.Row]:

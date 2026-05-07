@@ -565,6 +565,206 @@ class ExecutionWorkerTest(unittest.TestCase):
         self.assertEqual("BROKER_REJECT_OTHER", request_row["broker_reject_category"])
         self.assertIsNone(request_row["broker_reject_code"])
 
+    def test_active_open_same_symbol_position_blocks_new_entry_before_submit(self) -> None:
+        self._insert_pending_request(request_id="req-blocked-open", alert_id="alert-blocked-open")
+        self._insert_pending_request(request_id="req-existing-open", alert_id="alert-existing-open")
+
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-existing-open")
+            conn.execute(
+                "UPDATE execution_requests SET status = ? WHERE request_id = ?",
+                (ExecutionStatus.SUBMITTED.value, "req-existing-open"),
+            )
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET position_status = ?, remaining_qty = ?, entry_filled_qty = ?, updated_ts_utc = ?
+                WHERE request_id = ?
+                """,
+                ("OPEN", 0.5, 0.5, "2026-03-25T14:05:00+00:00", "req-existing-open"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        with patch(
+            "trade_scout.execution.service.find_existing_broker_order",
+            return_value=None,
+        ), patch(
+            "trade_scout.execution.service.submit_validated_order",
+            side_effect=AssertionError("submit_validated_order should not be called"),
+        ):
+            self.worker.run_once()
+
+        conn = get_connection(self.db_path)
+        try:
+            request_row = conn.execute(
+                "SELECT * FROM execution_requests WHERE request_id = ?",
+                ("req-blocked-open",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(ExecutionStatus.REJECTED.value, request_row["status"])
+        self.assertEqual("SAME_SYMBOL_ACTIVE_EXPOSURE", request_row["rejection_code"])
+        self.assertIn("symbol=AAPL", request_row["rejection_reason"])
+        self.assertIn("plan-req-existing-open:req-existing-open:OPEN", request_row["rejection_reason"])
+
+    def test_active_partial_same_symbol_position_blocks_new_entry_before_submit(self) -> None:
+        self._insert_pending_request(request_id="req-blocked-partial", alert_id="alert-blocked-partial")
+        self._insert_pending_request(request_id="req-existing-partial", alert_id="alert-existing-partial")
+
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-existing-partial")
+            conn.execute(
+                "UPDATE execution_requests SET status = ? WHERE request_id = ?",
+                (ExecutionStatus.SUBMITTED.value, "req-existing-partial"),
+            )
+            conn.execute(
+                """
+                UPDATE paper_positions
+                SET position_status = ?, remaining_qty = ?, entry_filled_qty = ?, updated_ts_utc = ?
+                WHERE request_id = ?
+                """,
+                ("PARTIAL", 0.25, 0.5, "2026-03-25T14:05:00+00:00", "req-existing-partial"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        with patch(
+            "trade_scout.execution.service.find_existing_broker_order",
+            return_value=None,
+        ), patch(
+            "trade_scout.execution.service.submit_validated_order",
+            side_effect=AssertionError("submit_validated_order should not be called"),
+        ):
+            self.worker.run_once()
+
+        conn = get_connection(self.db_path)
+        try:
+            request_row = conn.execute(
+                "SELECT * FROM execution_requests WHERE request_id = ?",
+                ("req-blocked-partial",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(ExecutionStatus.REJECTED.value, request_row["status"])
+        self.assertEqual("SAME_SYMBOL_ACTIVE_EXPOSURE", request_row["rejection_code"])
+        self.assertIn("plan-req-existing-partial:req-existing-partial:PARTIAL", request_row["rejection_reason"])
+
+    def test_terminal_failed_pending_entry_without_entry_order_does_not_block_submit(self) -> None:
+        self._insert_pending_request(request_id="req-submit-after-ghost", alert_id="alert-submit-after-ghost")
+        self._insert_pending_request(request_id="req-failed-ghost", alert_id="alert-failed-ghost")
+
+        conn = get_connection(self.db_path)
+        try:
+            self._insert_trade_plan_row(conn, request_id="req-failed-ghost")
+            conn.execute(
+                """
+                UPDATE execution_requests
+                SET status = ?, error_code = ?, error_message = ?
+                WHERE request_id = ?
+                """,
+                ("FAILED", "BROKER_SUBMIT_FAILED", "prior failed submit", "req-failed-ghost"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        with patch(
+            "trade_scout.execution.service.find_existing_broker_order",
+            return_value=None,
+        ), patch(
+            "trade_scout.execution.service.submit_validated_order",
+            return_value=self._broker_result("broker-ghost-ok"),
+        ) as submit_mock:
+            self.worker.run_once()
+
+        conn = get_connection(self.db_path)
+        try:
+            request_row = conn.execute(
+                "SELECT * FROM execution_requests WHERE request_id = ?",
+                ("req-submit-after-ghost",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(1, submit_mock.call_count)
+        self.assertEqual(ExecutionStatus.SUBMITTED.value, request_row["status"])
+        self.assertEqual("broker-ghost-ok", request_row["broker_order_id"])
+
+    def test_same_request_existing_entry_order_does_not_block_itself(self) -> None:
+        self._insert_pending_request(request_id="req-self-reuse", alert_id="alert-self-reuse")
+
+        conn = get_connection(self.db_path)
+        try:
+            conn.execute(
+                "UPDATE execution_requests SET status = ? WHERE request_id = ?",
+                (ExecutionStatus.VALIDATED.value, "req-self-reuse"),
+            )
+            self._insert_trade_plan_row(conn, request_id="req-self-reuse")
+            self._insert_paper_order_row(
+                conn,
+                paper_order_id="po-self-reuse",
+                request_id="req-self-reuse",
+                client_order_id="req-self-reuse",
+                broker_order_id="broker-self-reuse",
+                order_status="SUBMITTED",
+            )
+            request_row = conn.execute(
+                "SELECT * FROM execution_requests WHERE request_id = ?",
+                ("req-self-reuse",),
+            ).fetchone()
+            conn.commit()
+
+            with patch(
+                "trade_scout.execution.service.find_existing_broker_order",
+                return_value=None,
+            ), patch(
+                "trade_scout.execution.service.submit_validated_order",
+                side_effect=AssertionError("submit_validated_order should not be called"),
+            ):
+                self.worker.process_validated_request(conn, request_row)
+
+            reloaded_row = conn.execute(
+                "SELECT * FROM execution_requests WHERE request_id = ?",
+                ("req-self-reuse",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(ExecutionStatus.SUBMITTED.value, reloaded_row["status"])
+        self.assertEqual("broker-self-reuse", reloaded_row["broker_order_id"])
+
+    def test_no_conflict_path_still_submits_entry_order(self) -> None:
+        self._insert_pending_request(request_id="req-no-conflict", alert_id="alert-no-conflict")
+
+        with patch(
+            "trade_scout.execution.service.find_existing_broker_order",
+            return_value=None,
+        ), patch(
+            "trade_scout.execution.service.submit_validated_order",
+            return_value=self._broker_result("broker-no-conflict"),
+        ) as submit_mock:
+            self.worker.run_once()
+
+        conn = get_connection(self.db_path)
+        try:
+            request_row = conn.execute(
+                "SELECT * FROM execution_requests WHERE request_id = ?",
+                ("req-no-conflict",),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(1, submit_mock.call_count)
+        self.assertEqual(ExecutionStatus.SUBMITTED.value, request_row["status"])
+        self.assertIsNone(request_row["rejection_code"])
+
     def test_insert_request_preserves_requested_ts_utc(self) -> None:
         requested_ts_utc = "2026-03-25T15:45:30+00:00"
 

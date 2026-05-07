@@ -319,6 +319,24 @@ def print_summary(
         "request_status_counts: "
         f"{_format_counts(frames['execution_requests'], 'status')}"
     )
+    rejected_requests = frames["execution_requests"].loc[
+        frames["execution_requests"]["status"].astype(str).eq("REJECTED")
+    ].copy()
+    failed_requests = frames["execution_requests"].loc[
+        frames["execution_requests"]["status"].astype(str).eq("FAILED")
+    ].copy()
+    print(
+        "rejection_code_counts: "
+        f"{_format_counts(rejected_requests, 'rejection_code')}"
+    )
+    print(
+        "failed_error_code_counts: "
+        f"{_format_counts(failed_requests, 'error_code')}"
+    )
+    print(
+        "failed_broker_reject_category_counts: "
+        f"{_format_counts(failed_requests, 'broker_reject_category')}"
+    )
     print(
         "position_status_counts: "
         f"{_format_counts(frames['paper_positions'], 'position_status')}"

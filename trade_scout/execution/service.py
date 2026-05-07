@@ -179,6 +179,32 @@ class ExecutionService:
                 )
                 return
 
+            symbol = str(trade_plan["symbol"])
+            conflicts = self.repository.get_active_same_symbol_exposure(
+                conn,
+                symbol=symbol,
+                exclude_plan_id=str(trade_plan["plan_id"]),
+                exclude_request_id=request_id,
+            )
+            if conflicts:
+                conflicts_text = self._format_same_symbol_exposure_conflicts(conflicts)
+                reason = (
+                    f"same symbol active exposure symbol={symbol} "
+                    f"conflicts={conflicts_text}"
+                )
+                self.repository.mark_rejected(
+                    conn,
+                    request_id,
+                    code="SAME_SYMBOL_ACTIVE_EXPOSURE",
+                    reason=reason,
+                )
+                print(
+                    f"[execution-worker] skipped request_id={request_id} "
+                    f"symbol={symbol} reason=SAME_SYMBOL_ACTIVE_EXPOSURE "
+                    f"conflicts={conflicts_text}"
+                )
+                return
+
             print(
                 f"[execution-worker] submitting order request_id={request_id} "
                 f"alert_id={alert_id} notional={config.EXECUTION_ORDER_NOTIONAL}"
@@ -549,6 +575,15 @@ class ExecutionService:
             entry_order_id=entry_order_id,
             entry_client_order_id=entry_client_order_id,
         )
+
+    @staticmethod
+    def _format_same_symbol_exposure_conflicts(conflicts: list[Any]) -> str:
+        parts: list[str] = []
+        for row in conflicts:
+            parts.append(
+                f"{row['plan_id']}:{row['request_id']}:{row['position_status']}"
+            )
+        return ",".join(parts)
 
     @staticmethod
     def _get_request_id(request_row) -> str:

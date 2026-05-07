@@ -116,6 +116,21 @@ class ExecutionRepository:
     ) -> sqlite3.Row | None:
         return queue.get_paper_position_by_request_id(conn, request_id)
 
+    def get_active_same_symbol_exposure(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        symbol: str,
+        exclude_plan_id: str,
+        exclude_request_id: str,
+    ) -> list[sqlite3.Row]:
+        return queue.get_active_same_symbol_exposure(
+            conn,
+            symbol=symbol,
+            exclude_plan_id=exclude_plan_id,
+            exclude_request_id=exclude_request_id,
+        )
+
     def get_positions_with_pending_actions(
         self,
         conn: sqlite3.Connection,
