@@ -160,8 +160,6 @@ def build_feature_snapshot(
         )
     if alert_intent.setup_family is None or not str(alert_intent.setup_family).strip():
         raise ValueError("policy evaluation requires alert_intent.setup_family")
-    if alert_context.anchor_regime is None or not str(alert_context.anchor_regime).strip():
-        raise ValueError("policy evaluation requires alert_context.anchor_regime")
     if alert_context.score is None:
         raise ValueError("policy evaluation requires alert_context.score")
     if alert_context.score_bucket is None or not str(alert_context.score_bucket).strip():
@@ -171,7 +169,7 @@ def build_feature_snapshot(
         alert_id=alert_intent.alert_id,
         symbol=alert_intent.symbol,
         setup_family=str(alert_intent.setup_family).strip(),
-        anchor_regime=str(alert_context.anchor_regime).strip(),
+        anchor_regime=_normalized_optional_str(alert_context.anchor_regime) or "UNKNOWN",
         score=float(alert_context.score),
         score_bucket=str(alert_context.score_bucket).strip(),
     )

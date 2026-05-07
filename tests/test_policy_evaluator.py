@@ -73,6 +73,17 @@ class PolicyEvaluatorTest(unittest.TestCase):
         self.assertEqual("BLOCK", decision.decision)
         self.assertIn("anchor_regime 'bear' not allowed", decision.reasons)
 
+    def test_missing_anchor_regime_defaults_to_unknown_without_raising(self) -> None:
+        decision = evaluate_policy(
+            self._intent(),
+            self._context(anchor_regime=None),
+            self._policy_config(filters={"allowed_anchor_regimes": ["bull"]}),
+        )
+
+        self.assertEqual("BLOCK", decision.decision)
+        self.assertIn("anchor_regime 'UNKNOWN' not allowed", decision.reasons)
+        self.assertEqual("UNKNOWN", decision.criteria_results[0].actual_value)
+
     def test_min_score_bucket_passes(self) -> None:
         decision = evaluate_policy(
             self._intent(),
