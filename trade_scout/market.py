@@ -29,7 +29,10 @@ class _SingleOwnerStreamMixin:
         await self._start_ws()
         await self._send_subscribe_msg()
         self._running = True
-        await self._consume()
+        try:
+            await self._consume()
+        finally:
+            self._running = False
 
 
 class GuardedCryptoDataStream(_SingleOwnerStreamMixin, CryptoDataStream):
