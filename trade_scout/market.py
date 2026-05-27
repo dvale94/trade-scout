@@ -1,15 +1,52 @@
+from __future__ import annotations
+
+import asyncio
+
 from alpaca.data.live import CryptoDataStream, StockDataStream
 from alpaca.data.enums import DataFeed
 from . import config
 
 
+class _SingleOwnerStreamMixin:
+    async def _run_forever(self) -> None:
+        """Run one websocket lifecycle and let Trade Scout own retries/cooldowns."""
+        self._loop = asyncio.get_running_loop()
+        while not any(
+            v
+            for k, v in self._handlers.items()
+            if k not in ("cancelErrors", "corrections")
+        ):
+            if not self._stop_stream_queue.empty():
+                self._stop_stream_queue.get(timeout=1)
+                return
+            await asyncio.sleep(0)
+
+        self._should_run = True
+        self._running = False
+        if not self._should_run:
+            return
+
+        await self._start_ws()
+        await self._send_subscribe_msg()
+        self._running = True
+        await self._consume()
+
+
+class GuardedCryptoDataStream(_SingleOwnerStreamMixin, CryptoDataStream):
+    pass
+
+
+class GuardedStockDataStream(_SingleOwnerStreamMixin, StockDataStream):
+    pass
+
+
 def make_stream():
     if config.MARKET_TYPE == "crypto":
-        return CryptoDataStream(config.ALPACA_API_KEY, config.ALPACA_SECRET_KEY)
+        return GuardedCryptoDataStream(config.ALPACA_API_KEY, config.ALPACA_SECRET_KEY)
 
     if config.MARKET_TYPE == "stocks":
         feed = DataFeed.IEX if config.ALPACA_STOCK_FEED == "iex" else DataFeed.SIP
-        return StockDataStream(config.ALPACA_API_KEY, config.ALPACA_SECRET_KEY, feed=feed)
+        return GuardedStockDataStream(config.ALPACA_API_KEY, config.ALPACA_SECRET_KEY, feed=feed)
 
     raise ValueError(f"Unknown MARKET_TYPE: {config.MARKET_TYPE}")
 

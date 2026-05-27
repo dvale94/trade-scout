@@ -256,3 +256,18 @@ class BarProcessorExecutionTriggerTest(unittest.TestCase):
         execution_worker.process_position_triggers.assert_called_once_with(
             price_by_symbol={"BTC/USD": 123.45}
         )
+
+    def test_successful_bar_flow_resets_lifecycle_breaker_without_runtime_counter_driver(self) -> None:
+        context = self._make_context()
+        context.reconnect_attempt = 0
+        lifecycle = MagicMock()
+        lifecycle.circuit_breaker.reconnect_attempt = 3
+        context.websocket_lifecycle = lifecycle
+        execution_worker = MagicMock()
+        execution_worker.process_position_triggers.return_value = 0
+
+        processor = BarProcessor(context, execution_worker=execution_worker)
+        asyncio.run(processor.on_bar(self._make_bar(close=123.45)))
+
+        lifecycle.record_success.assert_called_once_with()
+        self.assertEqual(0, context.reconnect_attempt)

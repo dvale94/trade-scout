@@ -60,13 +60,17 @@ class BarProcessor:
         close_price = float(bar.close)
 
         try:
-            if self.context.reconnect_attempt > 0:
+            websocket_lifecycle = getattr(self.context, "websocket_lifecycle", None)
+            lifecycle_attempt = 0
+            if websocket_lifecycle is not None:
+                lifecycle_attempt = websocket_lifecycle.circuit_breaker.reconnect_attempt
+
+            if lifecycle_attempt > 0 or self.context.reconnect_attempt > 0:
                 print(
-                    f"Websocket stabilized after reconnect attempt {self.context.reconnect_attempt}; "
+                    f"Websocket stabilized after reconnect attempt {max(lifecycle_attempt, self.context.reconnect_attempt)}; "
                     "resetting backoff."
                 )
                 self.context.reconnect_attempt = 0
-                websocket_lifecycle = getattr(self.context, "websocket_lifecycle", None)
                 if websocket_lifecycle is not None:
                     websocket_lifecycle.record_success()
 

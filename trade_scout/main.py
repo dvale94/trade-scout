@@ -144,10 +144,13 @@ def run():
                 time.sleep(remaining)
                 continue
 
-            if runtime.reconnect_attempt > 0:
+            reconnect_attempt = lifecycle.circuit_breaker.reconnect_attempt
+            runtime.reconnect_attempt = reconnect_attempt
+
+            if reconnect_attempt > 0:
                 print(
                     "[websocket] reconnect attempt allowed "
-                    f"retry={runtime.reconnect_attempt} state={lifecycle.current_state()}"
+                    f"retry={reconnect_attempt} state={lifecycle.current_state()}"
                 )
 
             if not lifecycle.try_mark_starting():
@@ -164,10 +167,10 @@ def run():
                 for sym in symbols_to_run:
                     stream.subscribe_bars(processor.on_bar, sym)
 
-                if runtime.reconnect_attempt == 0:
+                if reconnect_attempt == 0:
                     print("Trade Scout running...")
                 else:
-                    print(f"Trade Scout reconnecting (attempt {runtime.reconnect_attempt})...")
+                    print(f"Trade Scout reconnecting (attempt {reconnect_attempt})...")
 
                 lifecycle.mark_running()
                 stream.run()
