@@ -66,6 +66,9 @@ class BarProcessor:
                     "resetting backoff."
                 )
                 self.context.reconnect_attempt = 0
+                websocket_lifecycle = getattr(self.context, "websocket_lifecycle", None)
+                if websocket_lifecycle is not None:
+                    websocket_lifecycle.record_success()
 
             ts = pd.to_datetime(bar.timestamp, utc=True).to_pydatetime()
 

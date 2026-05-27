@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from typing import Any
 
 import pandas as pd
 
@@ -50,3 +51,4 @@ class RuntimeContext:
     watch_mgr: watch.WatchManager
     telemetry: TelemetryTracker
     reconnect_attempt: int = 0
+    websocket_lifecycle: Any | None = None

@@ -16,9 +16,11 @@ from .cooldown import Cooldown
 from .runtime_context import EnabledStrategy, RuntimeContext, compute_config_hash
 from .strategies.registry import build_strategy_metadata, load_enabled_strategies
 from .websocket_control import (
-    WebsocketCircuitBreaker,
+    WebsocketLifecycleGuard,
     classify_websocket_failure,
+    format_websocket_reason,
     release_run_guard,
+    stop_stream_client,
     try_acquire_run_guard,
 )
 
@@ -96,6 +98,7 @@ def run():
             watch_mgr=watch_mgr,
             telemetry=telemetry,
         )
+        runtime.websocket_lifecycle = None
         execution_worker = ExecutionWorker(
             ExecutionWorkerConfig(
                 db_path=config.EXECUTION_DB_PATH,
@@ -127,12 +130,13 @@ def run():
                 f"(db_path={config.EXECUTION_DB_PATH}, worker_id={config.EXECUTION_WORKER_ID})"
             )
 
-        circuit_breaker = WebsocketCircuitBreaker()
+        lifecycle = WebsocketLifecycleGuard()
+        runtime.websocket_lifecycle = lifecycle
 
         while True:
             now_monotonic = time.monotonic()
-            if circuit_breaker.is_cooling_down(now_monotonic):
-                remaining = circuit_breaker.cooldown_remaining_seconds(now_monotonic)
+            if lifecycle.is_cooling_down(now_monotonic):
+                remaining = lifecycle.cooldown_remaining_seconds(now_monotonic)
                 print(
                     "[websocket] cooldown active "
                     f"live_bar_streaming_paused=true remaining_seconds={remaining:.1f}"
@@ -140,10 +144,22 @@ def run():
                 time.sleep(remaining)
                 continue
 
+            if runtime.reconnect_attempt > 0:
+                print(
+                    "[websocket] reconnect attempt allowed "
+                    f"retry={runtime.reconnect_attempt} state={lifecycle.current_state()}"
+                )
+
+            if not lifecycle.try_mark_starting():
+                print("[websocket] startup skipped reason=already_running")
+                time.sleep(1.0)
+                continue
+
             stream = None
             stream_started_monotonic = time.monotonic()
             try:
                 stream = market.make_stream()
+                lifecycle.bind_client(stream)
 
                 for sym in symbols_to_run:
                     stream.subscribe_bars(processor.on_bar, sym)
@@ -153,27 +169,31 @@ def run():
                 else:
                     print(f"Trade Scout reconnecting (attempt {runtime.reconnect_attempt})...")
 
+                lifecycle.mark_running()
                 stream.run()
 
                 reason = classify_websocket_failure(
                     None,
                     immediate_disconnect=(time.monotonic() - stream_started_monotonic) <= IMMEDIATE_DISCONNECT_SECONDS,
                 )
-                delay, cooldown_triggered = circuit_breaker.record_failure(
+                if lifecycle.stop_existing_client():
+                    print("[websocket] stopped existing client before reconnect")
+                delay, cooldown_triggered = lifecycle.record_failure(
                     reason=reason,
                     now_monotonic=time.monotonic(),
                 )
-                runtime.reconnect_attempt = circuit_breaker.reconnect_attempt
+                runtime.reconnect_attempt = lifecycle.circuit_breaker.reconnect_attempt
+                log_reason = format_websocket_reason(reason)
                 if cooldown_triggered:
                     print(
                         "[websocket] entering cooldown "
-                        f"retry={runtime.reconnect_attempt} reason={reason} "
+                        f"retry={runtime.reconnect_attempt} reason={log_reason} "
                         f"cooldown_seconds={delay:.1f} live_bar_streaming_paused=true"
                     )
                 else:
                     print(
                         "[websocket] reconnect scheduled "
-                        f"retry={runtime.reconnect_attempt} reason={reason} delay_seconds={delay:.1f}"
+                        f"retry={runtime.reconnect_attempt} reason={log_reason} delay_seconds={delay:.1f}"
                     )
                 time.sleep(delay)
 
@@ -183,21 +203,24 @@ def run():
 
             except Exception as exc:
                 reason = classify_websocket_failure(exc)
-                delay, cooldown_triggered = circuit_breaker.record_failure(
+                if lifecycle.stop_existing_client():
+                    print("[websocket] stopped existing client before reconnect")
+                delay, cooldown_triggered = lifecycle.record_failure(
                     reason=reason,
                     now_monotonic=time.monotonic(),
                 )
-                runtime.reconnect_attempt = circuit_breaker.reconnect_attempt
+                runtime.reconnect_attempt = lifecycle.circuit_breaker.reconnect_attempt
+                log_reason = format_websocket_reason(reason)
                 if cooldown_triggered:
                     print(
                         "[websocket] entering cooldown "
-                        f"retry={runtime.reconnect_attempt} reason={reason} "
+                        f"retry={runtime.reconnect_attempt} reason={log_reason} "
                         f"cooldown_seconds={delay:.1f} live_bar_streaming_paused=true"
                     )
                 else:
                     print(
                         "[websocket] reconnect scheduled "
-                        f"retry={runtime.reconnect_attempt} reason={reason} "
+                        f"retry={runtime.reconnect_attempt} reason={log_reason} "
                         f"delay_seconds={delay:.1f} error={exc}"
                     )
                 time.sleep(delay)
@@ -205,11 +228,11 @@ def run():
             finally:
                 if stream is not None:
                     try:
-                        close_fn = getattr(stream, "close", None)
-                        if callable(close_fn):
-                            close_fn()
+                        stop_stream_client(stream)
                     except Exception as close_err:
                         print(f"Error while closing websocket stream: {close_err}")
+                if not lifecycle.is_cooling_down(time.monotonic()):
+                    lifecycle.mark_stopped()
     finally:
         release_run_guard()
 
